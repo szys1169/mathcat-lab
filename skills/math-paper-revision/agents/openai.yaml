@@ -1,0 +1,6 @@
+interface:
+  display_name: "数学论文修改"
+  short_description: "先审数学正确性与证明缺口，再安全修改论文写作和 LaTeX"
+  default_prompt: "Use $math-paper-revision to audit and revise this mathematical manuscript without changing unverified mathematics."
+policy:
+  allow_implicit_invocation: true

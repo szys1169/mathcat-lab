@@ -1,0 +1,10 @@
+name = "math_research_verifier"
+version = "0.1.0"
+defaultTargets = ["MathResearchVerifier"]
+
+[[require]]
+name = "mathlib"
+path = ".lake/packages/mathlib"
+
+[[lean_lib]]
+name = "MathResearchVerifier"

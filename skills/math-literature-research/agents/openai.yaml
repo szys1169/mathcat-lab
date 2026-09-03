@@ -1,0 +1,6 @@
+interface:
+  display_name: "数学文献调研"
+  short_description: "检索核验数学问题历史、论文与候选引理定理，并生成综述"
+  default_prompt: "Use $math-literature-research to reconstruct the history, motivation, literature, and useful theorem toolbox for this mathematical problem."
+policy:
+  allow_implicit_invocation: true

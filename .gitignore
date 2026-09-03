@@ -1,0 +1,26 @@
+# Local secrets
+**/.env
+**/.env.local
+
+# Runtime state and generated artifacts
+**/runtime/
+**/runtime-data/*
+!**/runtime-data/.gitkeep
+**/output/
+**/tmp/
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/*.log
+
+# Build and dependency caches
+**/target/
+**/target-*/
+**/node_modules/
+**/.lake/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

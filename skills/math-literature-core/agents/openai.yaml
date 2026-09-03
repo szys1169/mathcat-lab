@@ -1,0 +1,6 @@
+interface:
+  display_name: "数学文献核心"
+  short_description: "共享数学文献来源、引用、证据与复用契约"
+  default_prompt: "Use $math-literature-core to validate and reuse this mathematical literature evidence package."
+policy:
+  allow_implicit_invocation: true

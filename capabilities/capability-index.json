@@ -1,0 +1,81 @@
+{
+  "capabilities": [
+    {
+      "id": "math-literature-research",
+      "root": "math-literature-research",
+      "skill": "../../skills/math-literature-research/SKILL.md",
+      "adapter": "../../skills/math-literature-research/SKILL.md",
+      "dsh_reference": "../../skills/math-literature-core/SKILL.md",
+      "label": "文献调研喵",
+      "description": "核验问题历史、论文与候选引理定理喵",
+      "icon": "cat-library",
+      "order": 1
+    },
+    {
+      "id": "rethlas-research",
+      "root": "rethlas-research",
+      "skill": "../../skills/rethlas-research/SKILL.md",
+      "adapter": "../../skills/rethlas-research/SKILL.md",
+      "dsh_reference": "../../skills/rethlas-research/references/integration-contract.md",
+      "label": "研究喵",
+      "description": "选择智能体研究数学问题",
+      "icon": "cat-research",
+      "order": 2
+    },
+    {
+      "id": "math-related-work",
+      "root": "math-related-work",
+      "skill": "../../skills/math-related-work/SKILL.md",
+      "adapter": "../../skills/math-related-work/SKILL.md",
+      "dsh_reference": "../../skills/math-literature-core/SKILL.md",
+      "label": "相关工作喵",
+      "description": "复用文献证据包并生成论文相关工作喵",
+      "icon": "cat-citations",
+      "order": 3
+    },
+    {
+      "id": "math-paper-writing",
+      "root": "math-paper-writing",
+      "skill": "../../skills/math-paper-writing/SKILL.md",
+      "adapter": "../../skills/math-paper-writing/SKILL.md",
+      "dsh_reference": "../../skills/math-paper-writing/SKILL.md",
+      "label": "论文写作喵",
+      "description": "根据已有成果生成论文喵",
+      "icon": "cat-writer",
+      "order": 4
+    },
+    {
+      "id": "math-paper-revision",
+      "root": "math-paper-revision",
+      "skill": "../../skills/math-paper-revision/SKILL.md",
+      "adapter": "../../skills/math-paper-revision/SKILL.md",
+      "dsh_reference": "../../skills/math-paper-revision/SKILL.md",
+      "label": "论文修改喵",
+      "description": "先审数学缺口，再生成安全修订版本喵",
+      "icon": "cat-revision",
+      "order": 5
+    },
+    {
+      "id": "latex-beamer-ppt",
+      "root": "latex-beamer-ppt",
+      "skill": "../../skills/latex-beamer-ppt/SKILL.md",
+      "adapter": "../../skills/latex-beamer-ppt/SKILL.md",
+      "dsh_reference": "../../skills/latex-beamer-ppt/SKILL.md",
+      "label": "PPT 生成喵",
+      "description": "根据已有材料生成演示文稿喵",
+      "icon": "cat-presenter",
+      "order": 6
+    },
+    {
+      "id": "autonomous-math-research",
+      "root": "autonomous-math-research",
+      "skill": "SKILL.md",
+      "adapter": "SKILL.md",
+      "dsh_reference": "SKILL.md",
+      "label": "全自动（不推荐喵）",
+      "description": "自动研究并尝试生成论文喵",
+      "icon": "cat-autonomous",
+      "order": 7
+    }
+  ]
+}

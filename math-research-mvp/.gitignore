@@ -1,0 +1,7 @@
+/target/
+/.env
+/runtime/
+/output/
+*.db
+*.db-shm
+*.db-wal

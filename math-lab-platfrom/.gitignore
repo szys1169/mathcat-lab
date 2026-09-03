@@ -1,0 +1,5 @@
+runtime-data/*
+!runtime-data/.gitkeep
+.env.local
+*.log
+node_modules/

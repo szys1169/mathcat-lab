@@ -1,0 +1,51 @@
+.thinking-details {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid #c9d8d2;
+}
+
+.thinking-details summary {
+  cursor: pointer;
+  color: var(--green);
+  font-size: 12px;
+  font-weight: 700;
+  user-select: none;
+}
+
+.thinking-details summary span { color: #74847e; font-weight: 400; }
+.thinking-details[open] summary { margin-bottom: 8px; }
+
+.thinking-note { font-size: 11px; color: #74847e; }
+
+.thinking-detail {
+  padding: 7px 9px;
+  border-radius: 8px;
+  background: #ffffffa8;
+  color: #40534c;
+  font: 11px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.thinking-log-link { display: inline-block; margin-top: 7px; color: var(--green); font-size: 12px; }
+
+.context-picker { position: relative; min-width: 0; }
+.context-trigger { display: flex; align-items: center; gap: 7px; min-width: 220px; max-width: 330px; padding: 5px 8px; border: 1px solid #61a2872e; border-radius: 9px; background: #61a28714; color: #52655e; text-align: left; cursor: pointer; }
+.context-trigger:hover,.context-trigger[aria-expanded="true"] { border-color: #b8cbc2; background: #fffdf6c7; box-shadow: 0 2px 7px #24574b1a; }
+.context-cat { width: 18px; height: 18px; flex: none; color: #3e9f85; }
+.context-copy { display: grid; min-width: 0; flex: 1; line-height: 1.12; }
+.context-copy strong,.context-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.context-copy strong { color: #24574b; font-size: 11px; font-weight: 680; }
+.context-copy small { margin-top: 2px; color: #718079; font-size: 9px; }
+.context-chevron { color: #718079; }
+.context-menu { position: absolute; z-index: 110; left: 0; bottom: calc(100% + 9px); width: min(430px, calc(100vw - 32px)); max-height: 330px; overflow: auto; padding: 7px; border: 1px solid #c5d3cd; border-radius: 14px; background: #fffdf6; box-shadow: 0 18px 48px #11151d29; }
+.context-menu[hidden] { display: none; }
+.projectless-cat .cat-icon { width: 19px; height: 19px; }
+.context-option-icon .cat-icon { width: 20px; height: 20px; }
+.brand-cat .brand-accent,.brand-cat .hero-accent { fill: none; stroke: #f0c66b; stroke-width: 3; stroke-linecap: round; }
+.welcome .hero { width: 70px; height: 70px; overflow: visible; border: 1px solid #61a28730; border-radius: 22px; background: #61a2870b; color: #24574b; box-shadow: 0 8px 24px #24574b12; }
+.welcome .hero .cat-icon { width: 52px; height: 52px; stroke-width: 1.45; }
+.brand .brand-mark { overflow: visible; border: 1px solid #61a28730; background: #fffdf64d; color: #24574b; box-shadow: 0 5px 16px #24574b12; }
+.brand .brand-mark .cat-icon { width: 34px; height: 34px; stroke-width: 1.45; }
+.context-option { display: grid; grid-template-columns: 27px minmax(0,1fr) 18px; align-items: center; width: 100%; gap: 8px; padding: 9px; border: 0; border-radius: 10px; background: transparent; color: #31443d; text-align: left; cursor: pointer; }
+.context-option:hover { background: #eef2e9; }.context-option.selected { background: #dcebe4; color: #24574b; }.context-option span:nth-child(2){display:grid;min-width:0;gap:2px}.context-option strong,.context-option small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.context-option small{color:#718079;font-size:10px}.context-option em{color:#3e9f85;font-style:normal;font-weight:700}.context-option-icon{text-align:center}.context-add{margin-top:5px;border-top:1px solid #e0ddd2;border-radius:0 0 10px 10px}

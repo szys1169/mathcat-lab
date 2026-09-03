@@ -1,0 +1,23 @@
+.recommendation-reason {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #e5f1ec;
+  color: #315f52;
+  font-size: 12px;
+}
+
+.choice-option {
+  grid-template-columns: 1fr;
+}
+
+.choice-option small,
+.choice-option code {
+  grid-column: 1;
+}
+
+.header-actions { display: flex; align-items: center; gap: 9px; }
+.cancel-task { border: 1px solid #c87979; border-radius: 9px; padding: 6px 10px; background: #fff5f3; color: #a23e3e; font-weight: 700; }
+.cancel-task:hover { background: #ffe7e3; }
+.file-link { color: #176b58; font-weight: 600; text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 3px; }
+.file-link:hover { color: #0e493d; }

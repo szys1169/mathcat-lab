@@ -1,0 +1,4 @@
+interface:
+  display_name: "数学科研 PPT"
+  short_description: "生成并验收 Beamer PDF、逐页讲稿和 PPTX"
+  default_prompt: "用 $latex-beamer-ppt 把这些材料整理成中文数学科研幻灯片，编译 PDF、逐页检查，并导出带讲稿的 PPTX。"
