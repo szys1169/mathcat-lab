@@ -1,0 +1,4 @@
+interface:
+  display_name: "数学论文写作"
+  short_description: "把已完成结果写成证据充分、衔接自然且首尾闭合的数学论文，可按需补全文献"
+  default_prompt: "Use $math-paper-writing to turn these completed results into a submission-style math paper with evidence-backed significance, literature positioning, narrative bridges, and a closing callback."

@@ -7,6 +7,7 @@ use research_worker_runtime::MockBackend;
 use serde_json::json;
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn unavailable_planner_waits_instead_of_manufacturing_generic_work() {
     let temp = tempfile::tempdir().expect("tempdir");
     let store = SqliteStore::connect("sqlite::memory:", temp.path().join("artifacts"))
@@ -36,7 +37,7 @@ async fn unavailable_planner_waits_instead_of_manufacturing_generic_work() {
                 version: 1,
             },
             Budget {
-                max_rounds: 1,
+                max_rounds: 40,
                 ..Budget::default()
             },
         )
@@ -64,10 +65,25 @@ async fn unavailable_planner_waits_instead_of_manufacturing_generic_work() {
         .await
         .expect("start");
 
-    service
-        .run_one_round(&project.project_id)
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        service.run_project_until_terminal(&project.project_id),
+    )
+    .await
+    .expect("must yield without looping")
+    .expect("degraded round");
+
+    let waiting = store
+        .get_project(&project.project_id)
         .await
-        .expect("degraded round");
+        .expect("waiting");
+    assert_eq!(waiting.status, research_domain::ProjectStatus::Paused);
+    assert_eq!(waiting.current_round, 1);
+    let health = store
+        .planner_health(&project.project_id)
+        .await
+        .expect("health");
+    assert_eq!(health.consecutive_failures, 1);
 
     assert!(
         store
@@ -101,4 +117,65 @@ async fn unavailable_planner_waits_instead_of_manufacturing_generic_work() {
     assert!(!events.iter().any(|event| {
         event.data.to_string().contains("直接证明") || event.data.to_string().contains("边界反例")
     }));
+
+    assert_cooldown_resume_yields(&store, &service, &project).await;
+}
+
+async fn assert_cooldown_resume_yields(
+    store: &SqliteStore,
+    service: &ResearchService,
+    project: &research_domain::Project,
+) {
+    store
+        .record_planner_failure(&project.project_id, "second real failure")
+        .await
+        .expect("open circuit");
+    let before = store
+        .planner_health(&project.project_id)
+        .await
+        .expect("health");
+    let current = store
+        .get_project(&project.project_id)
+        .await
+        .expect("project");
+    let (resume, _) = store
+        .enqueue_command(
+            &project.project_id,
+            CommandDraft {
+                command_type: "resume_project".into(),
+                target_kind: "project".into(),
+                target_id: project.project_id.clone(),
+                mode: CommandMode::Immediate,
+                payload: json!({}),
+                expected_project_revision: current.revision,
+                idempotency_key: "resume-during-cooldown".into(),
+                reason: "test skipped call".into(),
+                requested_by: "test".into(),
+            },
+        )
+        .await
+        .expect("enqueue resume");
+    store
+        .apply_command(&project.project_id, &resume.command_id)
+        .await
+        .expect("resume");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        service.run_project_until_terminal(&project.project_id),
+    )
+    .await
+    .expect("open circuit must yield")
+    .expect("wait");
+    let after = store
+        .planner_health(&project.project_id)
+        .await
+        .expect("health");
+    assert_eq!(after.consecutive_failures, before.consecutive_failures);
+    assert_eq!(after.cooldown_until, before.cooldown_until);
+    let waiting = store
+        .get_project(&project.project_id)
+        .await
+        .expect("project");
+    assert_eq!(waiting.current_round, 2);
+    assert_eq!(waiting.status, research_domain::ProjectStatus::Paused);
 }

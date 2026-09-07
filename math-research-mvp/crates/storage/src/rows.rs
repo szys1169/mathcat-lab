@@ -3,9 +3,9 @@ use std::str::FromStr;
 use chrono::{DateTime, Utc};
 use research_domain::{
     Artifact, Candidate, CandidateStatus, ExperimentCapsule, Fact, FactStatus, Goal, GoalStatus,
-    HumanCommand, Hypothesis, Project, ProjectStatus, ResearchRound, Route, RouteStatus,
-    SourceRecord, Task, TaskStatus, Uncertainty, UncertaintyStatus, Verification, Worker,
-    WorkerStatus,
+    HumanCommand, Hypothesis, Project, ProjectStatus, ResearchRound, ReviewMode, Route,
+    RouteStatus, SourceRecord, Task, TaskStatus, Uncertainty, UncertaintyStatus, Verification,
+    Worker, WorkerStatus,
 };
 use serde::de::DeserializeOwned;
 use sqlx::{Row, sqlite::SqliteRow};
@@ -59,6 +59,9 @@ pub(crate) fn project(row: &SqliteRow) -> StorageResult<Project> {
         revision: row.try_get("revision")?,
         current_round: row.try_get("current_round")?,
         budget: json(row, "budget_json")?,
+        review_mode: ReviewMode::from_str(row.try_get("review_mode")?)
+            .map_err(StorageError::CorruptData)?,
+        human_route_approval: row.try_get("human_route_approval")?,
         created_at: timestamp(row.try_get("created_at")?)?,
         updated_at: timestamp(row.try_get("updated_at")?)?,
     })

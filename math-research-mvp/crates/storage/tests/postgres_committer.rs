@@ -1,3 +1,5 @@
+#![cfg(feature = "postgres")]
+
 use research_storage::PostgresStateCommitter;
 use serde_json::json;
 

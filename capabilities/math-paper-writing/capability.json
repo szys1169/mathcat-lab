@@ -1,6 +1,6 @@
 {
   "id": "math-paper-writing",
-  "name": "Math Paper Writing",
-  "version": "2026.09.03",
-  "contract_version": "skill-v1"
+  "name": "论文写作",
+  "version": "0.3.3",
+  "contract_version": "1.0"
 }

@@ -40,8 +40,8 @@ async fn accepted_candidate_flows_through_independent_verification_and_solves_go
         json!({
             "rationale_summary":"two independent routes",
             "routes":[
-                {"title":"direct","method_summary":"prove directly","target_goal_ids":[],"required_fact_ids":[],"expected_subgoals":[],"expected_goal_progress":0.9,"uncertainty_reduction":0.4,"human_suggestion_alignment":0.0,"evidence_support":0.5,"route_diversity":0.5,"verifiability":0.9,"novelty":0.2,"failure_similarity_penalty":0.0,"cost_penalty":0.1,"risks":[]},
-                {"title":"attack","method_summary":"look for counterexamples","target_goal_ids":[],"required_fact_ids":[],"expected_subgoals":[],"expected_goal_progress":0.4,"uncertainty_reduction":0.8,"human_suggestion_alignment":0.0,"evidence_support":0.3,"route_diversity":1.0,"verifiability":0.8,"novelty":0.4,"failure_similarity_penalty":0.0,"cost_penalty":0.1,"risks":[]}
+                {"title":"direct","method_summary":"prove directly","approach_kind":"direct_proof","route_role":"primary","user_title":"直接证明：从定义出发","plain_language_summary":"从定义逐步推出目标。","why_this_route":"先测试最短的证明链。","expected_output":"一条可独立核验的证明。","relation_to_goal":"成功即可直接证明主目标。","steps":["展开定义","闭合目标"],"target_goal_ids":[],"required_fact_ids":[],"expected_subgoals":[],"expected_goal_progress":0.9,"uncertainty_reduction":0.4,"human_suggestion_alignment":0.0,"evidence_support":0.5,"route_diversity":0.5,"verifiability":0.9,"novelty":0.2,"failure_similarity_penalty":0.0,"cost_penalty":0.1,"risks":[]},
+                {"title":"attack","method_summary":"look for counterexamples","approach_kind":"counterexample","route_role":"adversarial","user_title":"寻找反例：检查边界对象","plain_language_summary":"系统检查最小与边界对象。","why_this_route":"可以尽早发现命题是否错误。","expected_output":"经过核验的反例或排除记录。","relation_to_goal":"有效反例将直接否定主目标。","steps":["生成候选","逐项核验"],"target_goal_ids":[],"required_fact_ids":[],"expected_subgoals":[],"expected_goal_progress":0.4,"uncertainty_reduction":0.8,"human_suggestion_alignment":0.0,"evidence_support":0.3,"route_diversity":1.0,"verifiability":0.8,"novelty":0.4,"failure_similarity_penalty":0.0,"cost_penalty":0.1,"risks":[]}
             ],
             "assignments":[
                 {"route_index":0,"worker_role":"prover","strategic_role":"central_bridge","addresses_interface_debt":true,"goal_ids":[],"objective":"prove","completion_contract":"candidate or gap","priority":1.0},
@@ -71,8 +71,10 @@ async fn accepted_candidate_flows_through_independent_verification_and_solves_go
                 {"statement":"1+1=2","assumptions":[],"proof_markdown":"By the recursive definition of addition, 1+S(0)=S(1+0)=S(1)=2.","dependency_fact_ids":[],"definitions_introduced":{},"external_source_ids":[],"candidate_type":"theorem","target_goal_ids":[]}
             ]
         }),
+        // Both worker outputs must precede reviewer responses: round verification
+        // now starts only after the concurrent worker batch reaches a safe point.
+        json!({"summary":"no counterexample in the intended arithmetic structure","discoveries":[],"candidates":[],"failures":[],"uncertainties":[],"sources":[],"experiments":[]}),
         json!({"verdict":"accepted","summary":"First independent mathematical review accepts the base-clause computation.","critical_errors":[],"gaps":[],"uncertainties":[],"repair_actions":[],"checked_fact_ids":[],"checked_source_ids":[],"evidence_level":"independent_llm_check"}),
-        json!({"verdict":"accepted","summary":"Second independent mathematical review accepts the base-clause computation.","critical_errors":[],"gaps":[],"uncertainties":[],"repair_actions":[],"checked_fact_ids":[],"checked_source_ids":[],"evidence_level":"independent_llm_check"}),
         json!({"verdict":"accepted","summary":"Adversarial review finds no hidden assumption in the base-clause computation.","critical_errors":[],"gaps":[],"uncertainties":[],"repair_actions":[],"checked_fact_ids":[],"checked_source_ids":[],"evidence_level":"independent_llm_check"}),
         json!({"verdict":"rejected","summary":"The base-clause lemma is valid but does not imply the target 1+1=2.","critical_errors":[],"gaps":[{"location":"goal coverage","type":"partial_result","issue":"Only an intermediate lemma is proved."}],"uncertainties":[],"repair_actions":["Use the lemma in a separate closure candidate for the original goal."],"checked_fact_ids":[],"checked_source_ids":[],"evidence_level":"goal_coverage_review"}),
         json!({"verdict":"accepted","summary":"First independent mathematical review accepts the recursive computation.","critical_errors":[],"gaps":[],"uncertainties":[],"repair_actions":[],"checked_fact_ids":[],"checked_source_ids":[],"evidence_level":"independent_llm_check"}),
@@ -90,7 +92,6 @@ async fn accepted_candidate_flows_through_independent_verification_and_solves_go
         }),
         json!({"relation":"equivalent","rationale":"Both statements assert the same equality in natural numbers.","missing_assumptions":[],"extra_assumptions":[],"confidence":1.0}),
         json!({"candidates":[{"tactic":"norm_num","rationale_summary":"arithmetic normalization","expected_goal_reduction":1.0,"premise_names":[]}],"retrieval_summary":"deterministic arithmetic tactic"}),
-        json!({"summary":"no counterexample in the intended arithmetic structure","discoveries":[],"candidates":[],"failures":[],"uncertainties":[],"sources":[],"experiments":[]}),
     ]);
     let lean_root = temp.path().join("lean-verifier");
     std::fs::create_dir_all(&lean_root).expect("lean root");
@@ -195,6 +196,7 @@ async fn accepted_candidate_flows_through_independent_verification_and_solves_go
         planner_timeout_seconds: 5,
         worker_timeout_seconds: 5,
         verifier_timeout_seconds: 5,
+        ..ResearchConfig::default()
     };
     let service = ResearchService::new_with_verification_backends(
         store.clone(),
@@ -352,6 +354,14 @@ async fn accepted_candidate_flows_through_independent_verification_and_solves_go
     let completed_tool_attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM verification_attempts WHERE case_id=? AND kind IN ('lean_final','lean_after_search','lean_replay','pantograph_proof_search') AND status='completed'")
         .bind(&target_case.case_id).fetch_one(store.pool()).await.expect("completed tool attempts");
     assert_eq!(completed_tool_attempts, 4);
+    let synthetic_start_checkpoints: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM artifacts WHERE project_id=? AND kind='task_checkpoint'",
+    )
+    .bind(&project.project_id)
+    .fetch_one(store.pool())
+    .await
+    .expect("task checkpoint count");
+    assert_eq!(synthetic_start_checkpoints, 0);
 
     let publication_backend = MockBackend::from_responses([json!({
         "status":"ready",

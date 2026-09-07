@@ -34,10 +34,19 @@
           "can_control_tasks": {
             "type": "boolean"
           },
+          "can_create_route": {
+            "type": "boolean"
+          },
           "can_edit_problem": {
             "type": "boolean"
           },
+          "can_force_goal_review": {
+            "type": "boolean"
+          },
           "can_govern_facts": {
+            "type": "boolean"
+          },
+          "can_manage_settings": {
             "type": "boolean"
           },
           "can_propose_route": {
@@ -47,7 +56,10 @@
         "required": [
           "can_edit_problem",
           "can_propose_route",
+          "can_create_route",
           "can_approve_route",
+          "can_force_goal_review",
+          "can_manage_settings",
           "can_control_project",
           "can_control_tasks",
           "can_govern_facts"
@@ -71,6 +83,50 @@
           "data",
           "meta",
           "error"
+        ],
+        "type": "object"
+      },
+      "BoardPlanningSuggestion": {
+        "additionalProperties": false,
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "created_in_round": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "decision": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "effective_round": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "status": {
+            "type": "string"
+          },
+          "suggestion_id": {
+            "type": "string"
+          },
+          "target_route_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "suggestion_id",
+          "content",
+          "target_route_id",
+          "status",
+          "decision",
+          "created_in_round",
+          "effective_round"
         ],
         "type": "object"
       },
@@ -98,6 +154,7 @@
       "Budget": {
         "properties": {
           "max_minutes_per_task": {
+            "maximum": 1440,
             "minimum": 1,
             "type": "integer"
           },
@@ -106,6 +163,7 @@
             "type": "integer"
           },
           "max_parallel_workers": {
+            "maximum": 16,
             "minimum": 1,
             "type": "integer"
           },
@@ -124,6 +182,60 @@
           "max_minutes_per_task",
           "max_model_calls_per_task",
           "max_total_model_calls"
+        ],
+        "type": "object"
+      },
+      "CandidateObligationCoverage": {
+        "additionalProperties": false,
+        "properties": {
+          "candidate_id": {
+            "type": "string"
+          },
+          "coverage_id": {
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "disposition": {
+            "enum": [
+              "supports",
+              "satisfies",
+              "insufficient",
+              "unknown"
+            ],
+            "type": "string"
+          },
+          "fact_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "obligation_id": {
+            "type": "string"
+          },
+          "project_id": {
+            "type": "string"
+          },
+          "rationale": {
+            "type": "string"
+          },
+          "verification_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "coverage_id",
+          "project_id",
+          "candidate_id",
+          "obligation_id",
+          "verification_id",
+          "disposition",
+          "fact_id",
+          "rationale",
+          "created_at"
         ],
         "type": "object"
       },
@@ -193,13 +305,8 @@
         "required": [
           "task_id",
           "route_id",
-          "target_goal_ids",
           "statement",
-          "assumptions",
           "proof_markdown",
-          "dependency_fact_ids",
-          "definitions_introduced",
-          "external_source_ids",
           "candidate_type",
           "task_revision",
           "route_cancellation_epoch"
@@ -228,6 +335,13 @@
       "CompleteLeaseRequest": {
         "additionalProperties": false,
         "properties": {
+          "incorporated_steer_ids": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "lease_epoch": {
             "format": "int64",
             "type": "integer"
@@ -248,6 +362,43 @@
           "node_epoch",
           "lease_epoch",
           "output"
+        ],
+        "type": "object"
+      },
+      "ConfirmProblemDraftRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "acknowledge_material_warnings": {
+            "default": false,
+            "type": "boolean"
+          },
+          "document": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ProblemDocument"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "expected_document_hash": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "expected_revision": {
+            "format": "int64",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "start": {
+            "default": true,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "expected_revision",
+          "expected_document_hash"
         ],
         "type": "object"
       },
@@ -297,6 +448,7 @@
           },
           "human_route_approval": {
             "default": false,
+            "description": "Legacy compatibility flag; review_mode takes precedence when supplied.",
             "type": "boolean"
           },
           "name": {
@@ -306,6 +458,18 @@
           "problem": {
             "minLength": 1,
             "type": "string"
+          },
+          "review_mode": {
+            "enum": [
+              "automatic",
+              "balanced",
+              "strict",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "success_criteria": {
             "type": [
@@ -368,6 +532,104 @@
         ],
         "type": "object"
       },
+      "GenerateProblemDraftRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "context_dir": {
+            "default": ".",
+            "type": "string"
+          },
+          "prompt": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "prompt"
+        ],
+        "type": "object"
+      },
+      "HumanRouteCreateRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "approach_kind": {
+            "type": "string"
+          },
+          "completion_contract": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "expected_revision": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "known_risks": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "method_summary": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "objective": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "plain_language_summary": {
+            "type": "string"
+          },
+          "priority": {
+            "default": 0.9,
+            "maximum": 1,
+            "minimum": 0,
+            "type": "number"
+          },
+          "reason": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "required_fact_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "route_role": {
+            "type": "string"
+          },
+          "steps": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "target_goal_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "title": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "worker_role": {
+            "default": "prover",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_revision",
+          "title",
+          "method_summary",
+          "objective",
+          "completion_contract",
+          "reason"
+        ],
+        "type": "object"
+      },
       "HumanRouteProposalRequest": {
         "additionalProperties": false,
         "properties": {
@@ -410,9 +672,6 @@
           "expected_revision",
           "title",
           "method_summary",
-          "target_goal_ids",
-          "required_fact_ids",
-          "known_risks",
           "reason"
         ],
         "type": "object"
@@ -426,6 +685,28 @@
         },
         "required": [
           "content_hash"
+        ],
+        "type": "object"
+      },
+      "LeaseSteersRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "lease_epoch": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "node_epoch": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "node_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "node_id",
+          "node_epoch",
+          "lease_epoch"
         ],
         "type": "object"
       },
@@ -464,6 +745,435 @@
         ],
         "type": "object"
       },
+      "ObligationEdge": {
+        "additionalProperties": false,
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "edge_id": {
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "depends_on",
+              "refines"
+            ],
+            "type": "string"
+          },
+          "project_id": {
+            "type": "string"
+          },
+          "source_obligation_id": {
+            "type": "string"
+          },
+          "target_obligation_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "edge_id",
+          "project_id",
+          "source_obligation_id",
+          "target_obligation_id",
+          "kind",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "ProblemAssumption": {
+        "additionalProperties": false,
+        "properties": {
+          "provenance": {
+            "enum": [
+              "prompt",
+              "material",
+              "inferred"
+            ],
+            "type": "string"
+          },
+          "statement": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "statement",
+          "provenance"
+        ],
+        "type": "object"
+      },
+      "ProblemDocument": {
+        "additionalProperties": false,
+        "properties": {
+          "assumptions": {
+            "items": {
+              "$ref": "#/components/schemas/ProblemAssumption"
+            },
+            "type": "array"
+          },
+          "budget": {
+            "$ref": "#/components/schemas/Budget"
+          },
+          "budget_rationale": {
+            "type": "string"
+          },
+          "generation_notes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "human_route_approval": {
+            "default": false,
+            "type": "boolean"
+          },
+          "material_references": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "name": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "problem": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "success_criteria": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "target_statement": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "unresolved_questions": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "problem",
+          "target_statement",
+          "success_criteria",
+          "budget",
+          "budget_rationale"
+        ],
+        "type": "object"
+      },
+      "ProblemDraft": {
+        "additionalProperties": false,
+        "properties": {
+          "confirmation_idempotency_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "confirmation_request_hash": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "confirmed_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "confirmed_project_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "creation_idempotency_key": {
+            "type": "string"
+          },
+          "creation_request_hash": {
+            "type": "string"
+          },
+          "document": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ProblemDocument"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "document_hash": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "draft_id": {
+            "type": "string"
+          },
+          "elapsed_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "error_kind": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error_message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "generation_completed_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "input_tokens": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "material_directory": {
+            "type": "string"
+          },
+          "material_manifest_hash": {
+            "type": "string"
+          },
+          "materials": {
+            "items": {
+              "$ref": "#/components/schemas/ProblemMaterial"
+            },
+            "type": "array"
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "output_tokens": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "requested_by": {
+            "type": "string"
+          },
+          "revision": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "start_command_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "enum": [
+              "generating",
+              "awaiting_confirmation",
+              "confirmed",
+              "failed"
+            ],
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "draft_id",
+          "requested_by",
+          "creation_idempotency_key",
+          "creation_request_hash",
+          "prompt",
+          "material_directory",
+          "materials",
+          "status",
+          "revision",
+          "document",
+          "document_hash",
+          "material_manifest_hash",
+          "model",
+          "input_tokens",
+          "output_tokens",
+          "elapsed_ms",
+          "error_kind",
+          "error_message",
+          "confirmation_idempotency_key",
+          "confirmation_request_hash",
+          "confirmed_project_id",
+          "start_command_id",
+          "created_at",
+          "updated_at",
+          "generation_completed_at",
+          "confirmed_at"
+        ],
+        "type": "object"
+      },
+      "ProblemDraftConfirmation": {
+        "additionalProperties": false,
+        "properties": {
+          "draft": {
+            "$ref": "#/components/schemas/ProblemDraft"
+          },
+          "project": {
+            "type": "object"
+          },
+          "replayed": {
+            "type": "boolean"
+          },
+          "start_command": {
+            "type": [
+              "object",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "draft",
+          "project",
+          "start_command",
+          "replayed"
+        ],
+        "type": "object"
+      },
+      "ProblemDraftConfirmationView": {
+        "additionalProperties": false,
+        "properties": {
+          "confirmation": {
+            "$ref": "#/components/schemas/ProblemDraftConfirmation"
+          },
+          "preview_markdown": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "confirmation",
+          "preview_markdown"
+        ],
+        "type": "object"
+      },
+      "ProblemDraftControlRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_revision": {
+            "format": "int64",
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expected_revision"
+        ],
+        "type": "object"
+      },
+      "ProblemDraftControlView": {
+        "additionalProperties": false,
+        "properties": {
+          "draft": {
+            "$ref": "#/components/schemas/ProblemDraft"
+          },
+          "preview_markdown": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "replayed": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "draft",
+          "preview_markdown",
+          "replayed"
+        ],
+        "type": "object"
+      },
+      "ProblemDraftView": {
+        "additionalProperties": false,
+        "properties": {
+          "draft": {
+            "$ref": "#/components/schemas/ProblemDraft"
+          },
+          "preview_markdown": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "draft",
+          "preview_markdown"
+        ],
+        "type": "object"
+      },
+      "ProblemMaterial": {
+        "additionalProperties": false,
+        "properties": {
+          "byte_size": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "included_bytes": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "media_type": {
+            "type": "string"
+          },
+          "relative_path": {
+            "type": "string"
+          },
+          "sha256": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "warning": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "relative_path",
+          "media_type",
+          "byte_size",
+          "included_bytes",
+          "sha256",
+          "status",
+          "warning"
+        ],
+        "type": "object"
+      },
       "ProblemRevisionRequest": {
         "additionalProperties": false,
         "properties": {
@@ -496,10 +1206,8 @@
         "required": [
           "expected_revision",
           "target_statement",
-          "assumptions",
           "success_criteria",
-          "change_reason",
-          "replan"
+          "change_reason"
         ],
         "type": "object"
       },
@@ -555,6 +1263,166 @@
         "required": [
           "kind",
           "content"
+        ],
+        "type": "object"
+      },
+      "ProofObligation": {
+        "additionalProperties": false,
+        "properties": {
+          "completion_criteria": {
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_revision": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "goal_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "necessity": {
+            "enum": [
+              "required",
+              "advisory"
+            ],
+            "type": "string"
+          },
+          "obligation_id": {
+            "type": "string"
+          },
+          "parent_obligation_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "priority": {
+            "type": "number"
+          },
+          "project_id": {
+            "type": "string"
+          },
+          "provenance": {},
+          "satisfied_by_fact_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_bottleneck_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_fingerprint": {
+            "type": "string"
+          },
+          "source_kind": {
+            "type": "string"
+          },
+          "source_verification_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "statement": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "open",
+              "satisfied",
+              "blocked",
+              "obsolete"
+            ],
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "updated_revision": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "obligation_id",
+          "project_id",
+          "goal_id",
+          "parent_obligation_id",
+          "source_kind",
+          "statement",
+          "completion_criteria",
+          "necessity",
+          "status",
+          "priority",
+          "source_verification_id",
+          "source_bottleneck_id",
+          "source_fingerprint",
+          "provenance",
+          "satisfied_by_fact_id",
+          "created_revision",
+          "updated_revision",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "ProofObligationGraph": {
+        "additionalProperties": false,
+        "properties": {
+          "coverage": {
+            "items": {
+              "$ref": "#/components/schemas/CandidateObligationCoverage"
+            },
+            "type": "array"
+          },
+          "edges": {
+            "items": {
+              "$ref": "#/components/schemas/ObligationEdge"
+            },
+            "type": "array"
+          },
+          "obligations": {
+            "items": {
+              "$ref": "#/components/schemas/ProofObligation"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "obligations",
+          "edges",
+          "coverage"
+        ],
+        "type": "object"
+      },
+      "ProofObligationGraphEnvelope": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ProofObligationGraph"
+          },
+          "error": {
+            "type": "null"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/ResponseMeta"
+          }
+        },
+        "required": [
+          "data",
+          "meta",
+          "error"
         ],
         "type": "object"
       },
@@ -701,6 +1569,12 @@
           "mode": {
             "type": "string"
           },
+          "planning_suggestions": {
+            "items": {
+              "$ref": "#/components/schemas/BoardPlanningSuggestion"
+            },
+            "type": "array"
+          },
           "problem": {
             "type": "object"
           },
@@ -720,6 +1594,34 @@
           "schema_version": {
             "const": 1,
             "type": "integer"
+          },
+          "settings": {
+            "properties": {
+              "budget": {
+                "$ref": "#/components/schemas/Budget"
+              },
+              "human_route_approval": {
+                "type": "boolean"
+              },
+              "review_mode": {
+                "enum": [
+                  "automatic",
+                  "balanced",
+                  "strict"
+                ],
+                "type": "string"
+              },
+              "running_task_policy": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "budget",
+              "review_mode",
+              "human_route_approval",
+              "running_task_policy"
+            ],
+            "type": "object"
           },
           "status": {
             "type": "string"
@@ -767,11 +1669,13 @@
           "revision",
           "event_cursor",
           "problem",
+          "settings",
           "summary",
           "routes",
           "goals",
           "claims",
           "failed_routes",
+          "planning_suggestions",
           "human_questions",
           "uncertainties",
           "tasks",
@@ -851,8 +1755,7 @@
         },
         "required": [
           "expected_revision",
-          "content",
-          "target_route_id"
+          "content"
         ],
         "type": "object"
       }
@@ -1988,6 +2891,263 @@
         "summary": "Get formalization semantic contract"
       }
     },
+    "/api/v1/problem-drafts": {
+      "post": {
+        "parameters": [
+          {
+            "description": "Unique key used to deduplicate retried writes.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GenerateProblemDraftRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Error envelope"
+          }
+        },
+        "summary": "Begin generating a reviewable problem document from a prompt and bounded workspace material"
+      }
+    },
+    "/api/v1/problem-drafts/{draft_id}": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "draft_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Error envelope"
+          }
+        },
+        "summary": "Get a generated problem draft for human review"
+      }
+    },
+    "/api/v1/problem-drafts/{draft_id}/commands/cancel": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "draft_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Unique key used to deduplicate retried writes.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProblemDraftControlRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Error envelope"
+          }
+        },
+        "summary": "Cancel the active generation attempt for a problem draft"
+      }
+    },
+    "/api/v1/problem-drafts/{draft_id}/commands/confirm": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "draft_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Unique key used to deduplicate retried writes.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConfirmProblemDraftRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Error envelope"
+          }
+        },
+        "summary": "Confirm a problem document, create its project, and optionally start research"
+      }
+    },
+    "/api/v1/problem-drafts/{draft_id}/commands/retry": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "draft_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Unique key used to deduplicate retried writes.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProblemDraftControlRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Error envelope"
+          }
+        },
+        "summary": "Retry a failed problem draft as a new durable attempt"
+      }
+    },
     "/api/v1/projects": {
       "post": {
         "parameters": [],
@@ -2457,6 +3617,63 @@
         "summary": "Adjust a scoped budget without dropping below consumed usage"
       }
     },
+    "/api/v1/projects/{project_id}/commands/goal-review": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Unique key used to deduplicate retried writes.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CommandRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Error envelope"
+          }
+        },
+        "summary": "Cancel unfinished work and immediately start a focused goal review"
+      }
+    },
     "/api/v1/projects/{project_id}/commands/pause": {
       "post": {
         "parameters": [
@@ -2626,6 +3843,120 @@
           }
         },
         "summary": "Resume project"
+      }
+    },
+    "/api/v1/projects/{project_id}/commands/review-policy": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Unique key used to deduplicate retried writes.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CommandRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Error envelope"
+          }
+        },
+        "summary": "Update the durable human review policy"
+      }
+    },
+    "/api/v1/projects/{project_id}/commands/settings": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Unique key used to deduplicate retried writes.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CommandRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Error envelope"
+          }
+        },
+        "summary": "Atomically update project budget and human review policy"
       }
     },
     "/api/v1/projects/{project_id}/commands/start": {
@@ -3288,6 +4619,43 @@
         "summary": "Get latest report metadata"
       }
     },
+    "/api/v1/projects/{project_id}/obligations": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProofObligationGraphEnvelope"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Error envelope"
+          }
+        },
+        "summary": "Get the proof-obligation graph and candidate coverage ledger"
+      }
+    },
     "/api/v1/projects/{project_id}/planner/health": {
       "get": {
         "parameters": [
@@ -3544,6 +4912,16 @@
             "name": "project_id",
             "required": true,
             "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Unique key used to deduplicate retried writes.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "minLength": 1,
               "type": "string"
             }
           }
@@ -3998,6 +5376,61 @@
           }
         },
         "summary": "List routes"
+      },
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Unique key used to deduplicate retried writes.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HumanRouteCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Error envelope"
+          }
+        },
+        "summary": "Create and immediately schedule an auditable human-authored route"
       }
     },
     "/api/v1/projects/{project_id}/routes/commands/merge": {
@@ -6248,18 +7681,7 @@
     },
     "/api/v1/system/reconciliation/commands/run": {
       "post": {
-        "parameters": [
-          {
-            "description": "Unique key used to deduplicate retried writes.",
-            "in": "header",
-            "name": "Idempotency-Key",
-            "required": true,
-            "schema": {
-              "minLength": 1,
-              "type": "string"
-            }
-          }
-        ],
+        "parameters": [],
         "requestBody": {
           "content": {
             "application/json": {
@@ -6490,6 +7912,58 @@
           }
         ],
         "summary": "Renew an active task lease with epoch checks"
+      }
+    },
+    "/api/v1/task-leases/{lease_id}/steers": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "lease_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LeaseSteersRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Error envelope"
+          }
+        },
+        "security": [
+          {
+            "WorkerToken": []
+          }
+        ],
+        "summary": "Poll pending safe-point steering for an active task lease"
       }
     },
     "/api/v1/tasks/{task_id}/commands/rebuild-context": {

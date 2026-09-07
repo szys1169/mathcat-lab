@@ -1,0 +1,26 @@
+{
+  "product": "MathCat Lab",
+  "version": "2.5.0",
+  "contract": "mathcat-research/v2",
+  "status": "demo_source_snapshot",
+  "created": "2026-09-08",
+  "based_on": "MathCat Lab 2.4.3",
+  "runtime": {
+    "web_port": 4334,
+    "research_port": 8899,
+    "token_file": "runtime/api-token",
+    "database": "runtime/state_v2.sqlite",
+    "research_data": "workspaces"
+  },
+  "validation": {
+    "engineering_regression": "targeted_checks_passed_legacy_regressions_pending",
+    "http_acceptance": "targeted_live_artifact_checks_passed",
+    "browser_acceptance": "targeted_fixture_and_live_checks_passed",
+    "real_research": "short_automatic_and_collaborative_flows_run_not_solved"
+  },
+  "build": {
+    "binary": "math-research-mvp/target/release/mathcat-v2.exe",
+    "status": "built_in_development_environment_binary_not_distributed"
+  },
+  "validation_report": "docs/VALIDATION.md"
+}

@@ -1,25 +1,16 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
-import { writeJsonAtomic, safeId } from "./fs-utils.mjs";
+import { QueuedJsonWriter, safeId } from "./fs-utils.mjs";
 
 export class Store {
-  constructor(runtimeRoot) { this.runtimeRoot = path.resolve(runtimeRoot); this.projectlessRoot = path.join(this.runtimeRoot, "projectless"); this.file = path.join(this.runtimeRoot, "state.json"); this.state = { schemaVersion: 1, workspaces: [], conversations: [] }; this.queue = Promise.resolve(); }
+  constructor(runtimeRoot) { this.runtimeRoot = path.resolve(runtimeRoot); this.projectlessRoot = path.join(this.runtimeRoot, "projectless"); this.file = path.join(this.runtimeRoot, "state.json"); this.state = { schemaVersion: 1, workspaces: [], conversations: [] }; this.writer = new QueuedJsonWriter(this.file); }
   async load() {
     try { this.state = JSON.parse(await fs.readFile(this.file, "utf8")); }
     catch (error) { if (error.code !== "ENOENT") throw error; await this.save(); }
-    let changed = false;
-    for (const conversation of this.state.conversations ?? []) {
-      if (conversation.status === "running") {
-        conversation.status = "failed";
-        conversation.error = "平台重启中断了上一次任务，请重新发送。";
-        changed = true;
-      }
-    }
-    if (changed) await this.save();
     return this;
   }
-  async save() { this.queue = this.queue.then(() => writeJsonAtomic(this.file, this.state)); return this.queue; }
+  async save() { return this.writer.save(this.state); }
   listWorkspaces() { return this.state.workspaces; }
   async addWorkspace({ name, workspacePath }) {
     const resolved = path.resolve(workspacePath); const stat = await fs.stat(resolved); if (!stat.isDirectory()) throw new Error("Workspace must be a directory.");

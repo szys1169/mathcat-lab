@@ -272,3 +272,4 @@ CREATE INDEX IF NOT EXISTS idx_routes_project_status ON routes(project_id, statu
 CREATE INDEX IF NOT EXISTS idx_verifications_project_status ON verifications(project_id, status);
 CREATE INDEX IF NOT EXISTS idx_uncertainties_project_status ON uncertainties(project_id, status);
 CREATE INDEX IF NOT EXISTS idx_artifacts_project_round ON artifacts(project_id, created_in_round);
+

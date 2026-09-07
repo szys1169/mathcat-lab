@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { runProcess } from "./process-runner.mjs";
+import { modelArguments } from './codex-settings.mjs';
 
 function capabilityPrompt(capability, executor) {
   const interaction = `When a task cannot continue because the workspace contains multiple plausible input files, cases, bundles, source packets, manuscripts, or output targets, inspect the candidates instead of asking the user to type a path. Present 2-5 best candidates and end your response with exactly one fenced block in this form:\n\n\`\`\`math-lab-choice\n{"question":"请选择本次任务使用的输入","options":[{"label":"简短名称","value":"完整路径或明确选择值","reason":"为什么它适合"}],"recommendedIndex":0,"recommendationReason":"它明显优于其他候选的具体理由"}\n\`\`\`\n\nOnly include recommendedIndex and recommendationReason when one option has a clear, material, evidence-based advantage over all others. If candidates are close or evidence is insufficient, omit both fields and recommend nothing. Never invent or display numeric scores. Do not continue the task until the user chooses. Do not use this protocol when there is only one safe unambiguous candidate.`;
@@ -41,13 +42,16 @@ async function readCodexProgress(stdoutFile) {
   return { summary: "正在分析工作区和任务要求", detail: "等待 Codex 输出下一个可见执行事件" };
 }
 
-export async function runCodex({ config, workspace, capability, researchAgent, conversation, text, permission, taskDir, signal, onProgress = () => {} }) {
+export async function runCodex({ config, workspace, capability, researchAgent, conversation, text, permission, taskDir, signal, modelSelection, onProgress = () => {} }) {
   onProgress("正在构造 Codex CLI 任务上下文");
   await fs.mkdir(taskDir, { recursive: true }); const output = path.join(taskDir, "assistant-last-message.md");
   const history = conversation.messages.slice(-8).map((item) => `${item.role}: ${item.content}`).join("\n\n");
   const agentPrompt = researchAgent ? `\nSelected research agent: ${researchAgent.name} (${researchAgent.id}). Local root: ${researchAgent.path}. Use this agent through Codex CLI and follow its local documentation; do not silently substitute another research agent.` : "";
   const prompt = `${capabilityPrompt(capability, "codex")}${agentPrompt}\nPermission: ${permission}.\nConversation context:\n${history}\n\nCurrent user request:\n${text}`;
-  const args = ["exec", "--json", "--output-last-message", output, "--cd", workspace.path, "--sandbox", permission === "workspace-write" ? "workspace-write" : "read-only", "--skip-git-repo-check", prompt];
+  const selection=modelSelection??await config.resolveCodexModel?.()??{};
+  if(signal?.aborted)throw new DOMException('Task cancelled by user.','AbortError');
+  const args = ["exec", "--json", "--output-last-message", output, "--cd", workspace.path, "--sandbox", permission === "workspace-write" ? "workspace-write" : "read-only", "--skip-git-repo-check", ...modelArguments(selection), prompt];
+  await fs.writeFile(path.join(taskDir,'model-selection.json'),JSON.stringify({...selection,applied_at:new Date().toISOString(),source:'process_arguments',provider_confirmed:false},null,2));
   onProgress("Codex CLI 已启动，正在分析工作区并执行任务");
   let readingProgress = false;
   const heartbeat = setInterval(async () => { if (readingProgress) return; readingProgress = true; try { onProgress(await readCodexProgress(path.join(taskDir, "codex.stdout.log"))); } finally { readingProgress = false; } }, 2500);
@@ -58,5 +62,5 @@ export async function runCodex({ config, workspace, capability, researchAgent, c
   if (result.aborted) throw new DOMException("Task cancelled by user.", "AbortError");
   const content = await fs.readFile(output, "utf8").catch(() => "");
   if (result.code !== 0) throw new Error(`Codex CLI exited with code ${result.code}. See ${path.join(taskDir, "codex.stderr.log")}`);
-  return { content: content.trim() || "Codex completed without a final text response.", executor: "codex", artifacts: [output, path.join(taskDir, "codex.stdout.log"), path.join(taskDir, "codex.stderr.log")] };
+  return { content: content.trim() || "Codex completed without a final text response.", executor: "codex", model_selection:selection, artifacts: [output, path.join(taskDir, "codex.stdout.log"), path.join(taskDir, "codex.stderr.log"),path.join(taskDir,'model-selection.json')] };
 }

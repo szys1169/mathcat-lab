@@ -1,0 +1,52 @@
+\documentclass[aspectratio=169,11pt]{ctexbeamer}
+\usetheme{default}
+\usefonttheme{professionalfonts}
+\usepackage{amsmath,amssymb,amsthm,mathtools,bm}
+\usepackage{booktabs,graphicx,tikz}
+\definecolor{MathCatTeal}{HTML}{1F6F78}
+\definecolor{MathCatMint}{HTML}{DCEFE8}
+\definecolor{MathCatInk}{HTML}{18343A}
+\setbeamercolor{structure}{fg=MathCatTeal}
+\setbeamercolor{frametitle}{fg=MathCatInk,bg=MathCatMint}
+\setbeamercolor{block title}{fg=white,bg=MathCatTeal}
+\setbeamercolor{block body}{fg=MathCatInk,bg=MathCatMint!45}
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{footline}{%
+  \leavevmode\hbox{%
+    \begin{beamercolorbox}[wd=.82\paperwidth,ht=2.5ex,dp=1.1ex,leftskip=1em]{author in head/foot}%
+      \insertshorttitle
+    \end{beamercolorbox}%
+    \begin{beamercolorbox}[wd=.18\paperwidth,ht=2.5ex,dp=1.1ex,center]{date in head/foot}%
+      \insertframenumber/\inserttotalframenumber
+    \end{beamercolorbox}%
+  }%
+}
+\title{数学报告标题}
+\author{报告人}
+\institute{机构}
+\date{\today}
+\begin{document}
+\begin{frame}
+  \titlepage
+\end{frame}
+\begin{frame}{问题与动机}
+  \begin{itemize}
+    \item 用一句话陈述研究对象与问题。
+    \item 说明数学动机、已知结果与报告边界。
+  \end{itemize}
+\end{frame}
+\begin{frame}{主结果}
+  \begin{theorem}
+    在完整假设下陈述来源材料中的主定理。
+  \end{theorem}
+  \begin{alertblock}{来源纪律}
+    本页的假设、量词与证明状态必须和来源材料一致。
+  \end{alertblock}
+\end{frame}
+\begin{frame}{总结}
+  \begin{enumerate}
+    \item 回顾主线与关键工具。
+    \item 列出限制、开放问题与引用。
+  \end{enumerate}
+\end{frame}
+\end{document}

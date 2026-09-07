@@ -2,14 +2,20 @@
 #![allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #![recursion_limit = "256"]
 
-use std::{convert::Infallible, path::PathBuf};
+pub mod research_v2;
+
+use std::{
+    convert::Infallible,
+    path::{Component, PathBuf},
+    sync::LazyLock,
+};
 
 use async_stream::stream;
 use axum::{
     Json, Router,
     body::Body,
     extract::{
-        Path, Query, Request, State, WebSocketUpgrade,
+        Extension, Path, Query, Request, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
@@ -18,487 +24,544 @@ use axum::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{get, post},
+    routing::{MethodRouter, get, post},
 };
 use chrono::Utc;
 use futures::{SinkExt, StreamExt};
-use research_core::{CoreError, ResearchService};
+use research_core::{CoreError, ResearchService, render_problem_document_markdown};
 use research_domain::{
-    BoardCapabilities, Budget, CandidateSubmission, CommandMode, HumanRouteProposalRequest,
-    ProblemContract, ProblemRevisionRequest,
+    Actor, BoardCapabilities, Budget, CandidateSubmission, CommandMode, HumanRouteCreateRequest,
+    HumanRouteProposalRequest, ProblemContract, ProblemDocument, ProblemRevisionRequest,
+    ReviewMode,
 };
-use research_storage::{BoardInclude, CommandDraft, SqliteStore, StorageError};
+use research_storage::{
+    BoardInclude, CommandDraft, ProblemDraftConfirmationRequest, SqliteStore, StorageError,
+    TaskLeaseCompletionRequest,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_stream::Stream;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use ulid::Ulid;
-use utoipa::ToSchema;
 
 #[derive(Clone)]
 pub struct AppState {
     pub service: ResearchService,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum EndpointMethod {
+    Get,
+    Post,
+}
+
+impl EndpointMethod {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "get",
+            Self::Post => "post",
+        }
+    }
+
+    fn matches(self, method: &Method) -> bool {
+        matches!(
+            (self, method),
+            (Self::Get, &Method::GET) | (Self::Post, &Method::POST)
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EndpointAuth {
+    Public,
+    Actor,
+    WorkerToken,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EndpointResponse {
+    Json,
+    Board,
+    ObligationGraph,
+    EventStream,
+    Binary,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EndpointDescriptor {
+    path: &'static str,
+    method: EndpointMethod,
+    summary: &'static str,
+    auth: EndpointAuth,
+    request_schema: Option<&'static str>,
+    idempotency_required: bool,
+    success_status: &'static str,
+    response: EndpointResponse,
+    documented: bool,
+}
+
+const fn endpoint_descriptor(
+    path: &'static str,
+    method: EndpointMethod,
+    summary: &'static str,
+    auth: EndpointAuth,
+    request_schema: Option<&'static str>,
+    idempotency_required: bool,
+    success_status: &'static str,
+    response: EndpointResponse,
+    documented: bool,
+) -> EndpointDescriptor {
+    EndpointDescriptor {
+        path,
+        method,
+        summary,
+        auth,
+        request_schema,
+        idempotency_required,
+        success_status,
+        response,
+        documented,
+    }
+}
+
+struct ContractEndpoint {
+    descriptor: EndpointDescriptor,
+    method_router: MethodRouter<AppState>,
+}
+
+impl ContractEndpoint {
+    fn new(descriptor: EndpointDescriptor, method_router: MethodRouter<AppState>) -> Self {
+        Self {
+            descriptor,
+            method_router,
+        }
+    }
+}
+
+struct ApiContract {
+    router: Router<AppState>,
+    descriptors: Vec<EndpointDescriptor>,
+}
+
+impl ApiContract {
+    fn new() -> Self {
+        Self {
+            router: Router::new(),
+            descriptors: Vec::new(),
+        }
+    }
+
+    fn add(mut self, endpoint: ContractEndpoint) -> Self {
+        self.router = self
+            .router
+            .route(endpoint.descriptor.path, endpoint.method_router);
+        self.descriptors.push(endpoint.descriptor);
+        self
+    }
+}
+
+macro_rules! endpoint {
+    (hidden public get $path:literal => $handler:ident, $summary:literal) => {
+        ContractEndpoint::new(
+            endpoint_descriptor(
+                $path,
+                EndpointMethod::Get,
+                $summary,
+                EndpointAuth::Public,
+                None,
+                false,
+                "200",
+                EndpointResponse::Json,
+                false,
+            ),
+            get($handler),
+        )
+    };
+    (public created $path:literal => $handler:ident, $summary:literal, $schema:literal) => {
+        ContractEndpoint::new(
+            endpoint_descriptor(
+                $path,
+                EndpointMethod::Post,
+                $summary,
+                EndpointAuth::Public,
+                Some($schema),
+                false,
+                "201",
+                EndpointResponse::Json,
+                true,
+            ),
+            post($handler),
+        )
+    };
+    (worker post $path:literal => $handler:ident, $summary:literal, $schema:literal) => {
+        ContractEndpoint::new(
+            endpoint_descriptor(
+                $path,
+                EndpointMethod::Post,
+                $summary,
+                EndpointAuth::WorkerToken,
+                Some($schema),
+                false,
+                "202",
+                EndpointResponse::Json,
+                true,
+            ),
+            post($handler),
+        )
+    };
+    (actor get $path:literal => $handler:ident, $summary:literal) => {
+        ContractEndpoint::new(
+            endpoint_descriptor(
+                $path,
+                EndpointMethod::Get,
+                $summary,
+                EndpointAuth::Actor,
+                None,
+                false,
+                "200",
+                EndpointResponse::Json,
+                true,
+            ),
+            get($handler),
+        )
+    };
+    (actor board $path:literal => $handler:ident, $summary:literal) => {
+        ContractEndpoint::new(
+            endpoint_descriptor(
+                $path,
+                EndpointMethod::Get,
+                $summary,
+                EndpointAuth::Actor,
+                None,
+                false,
+                "200",
+                EndpointResponse::Board,
+                true,
+            ),
+            get($handler),
+        )
+    };
+    (actor obligation_graph $path:literal => $handler:ident, $summary:literal) => {
+        ContractEndpoint::new(
+            endpoint_descriptor(
+                $path,
+                EndpointMethod::Get,
+                $summary,
+                EndpointAuth::Actor,
+                None,
+                false,
+                "200",
+                EndpointResponse::ObligationGraph,
+                true,
+            ),
+            get($handler),
+        )
+    };
+    (actor events $path:literal => $handler:ident, $summary:literal) => {
+        ContractEndpoint::new(
+            endpoint_descriptor(
+                $path,
+                EndpointMethod::Get,
+                $summary,
+                EndpointAuth::Actor,
+                None,
+                false,
+                "200",
+                EndpointResponse::EventStream,
+                true,
+            ),
+            get($handler),
+        )
+    };
+    (actor websocket $path:literal => $handler:ident, $summary:literal) => {
+        ContractEndpoint::new(
+            endpoint_descriptor(
+                $path,
+                EndpointMethod::Get,
+                $summary,
+                EndpointAuth::Actor,
+                None,
+                false,
+                "101",
+                EndpointResponse::Json,
+                true,
+            ),
+            get($handler),
+        )
+    };
+    (actor download $path:literal => $handler:ident, $summary:literal) => {
+        ContractEndpoint::new(
+            endpoint_descriptor(
+                $path,
+                EndpointMethod::Get,
+                $summary,
+                EndpointAuth::Actor,
+                None,
+                false,
+                "200",
+                EndpointResponse::Binary,
+                true,
+            ),
+            get($handler),
+        )
+    };
+    (actor post $path:literal => $handler:ident, $summary:literal, $schema:literal) => {
+        ContractEndpoint::new(
+            endpoint_descriptor(
+                $path,
+                EndpointMethod::Post,
+                $summary,
+                EndpointAuth::Actor,
+                Some($schema),
+                false,
+                "202",
+                EndpointResponse::Json,
+                true,
+            ),
+            post($handler),
+        )
+    };
+    (actor created $path:literal => $handler:ident, $summary:literal, $schema:literal) => {
+        ContractEndpoint::new(
+            endpoint_descriptor(
+                $path,
+                EndpointMethod::Post,
+                $summary,
+                EndpointAuth::Actor,
+                Some($schema),
+                false,
+                "201",
+                EndpointResponse::Json,
+                true,
+            ),
+            post($handler),
+        )
+    };
+    (actor command $path:literal => $handler:ident, $summary:literal, $schema:literal) => {
+        ContractEndpoint::new(
+            endpoint_descriptor(
+                $path,
+                EndpointMethod::Post,
+                $summary,
+                EndpointAuth::Actor,
+                Some($schema),
+                true,
+                "202",
+                EndpointResponse::Json,
+                true,
+            ),
+            post($handler),
+        )
+    };
+    (actor idempotent_created $path:literal => $handler:ident, $summary:literal, $schema:literal) => {
+        ContractEndpoint::new(
+            endpoint_descriptor(
+                $path,
+                EndpointMethod::Post,
+                $summary,
+                EndpointAuth::Actor,
+                Some($schema),
+                true,
+                "201",
+                EndpointResponse::Json,
+                true,
+            ),
+            post($handler),
+        )
+    };
+}
+
+fn endpoint_contract() -> ApiContract {
+    ApiContract::new()
+        .add(endpoint!(hidden public get "/health" => health, "Health check"))
+        .add(endpoint!(hidden public get "/api/openapi.json" => openapi, "OpenAPI document"))
+        .add(endpoint!(public created "/api/v1/actors/bootstrap" => bootstrap_actor, "Bootstrap the first administrator", "BootstrapActorRequest"))
+        .add(endpoint!(actor created "/api/v1/actors" => create_actor, "Create a local actor and access token", "CreateActorRequest"))
+        .add(endpoint!(actor created "/api/v1/worker-nodes" => register_worker_node, "Register a distributed worker node", "RegisterWorkerNodeRequest"))
+        .add(endpoint!(worker post "/api/v1/worker-nodes/{node_id}/heartbeat" => heartbeat_worker_node, "Authenticate and heartbeat a worker node epoch", "NodeHeartbeatRequest"))
+        .add(endpoint!(worker post "/api/v1/projects/{project_id}/distributed/leases/next" => lease_distributed_task, "Lease the next capability-compatible task", "LeaseTaskRequest"))
+        .add(endpoint!(actor get "/api/v1/task-leases/{lease_id}" => get_task_lease, "Get a task lease"))
+        .add(endpoint!(worker post "/api/v1/task-leases/{lease_id}/renew" => renew_task_lease, "Renew an active task lease with epoch checks", "RenewLeaseRequest"))
+        .add(endpoint!(worker post "/api/v1/task-leases/{lease_id}/steers" => poll_task_steers, "Poll pending safe-point steering for an active task lease", "LeaseSteersRequest"))
+        .add(endpoint!(worker post "/api/v1/task-leases/{lease_id}/complete" => complete_task_lease, "Commit remote worker output with stale-result rejection", "CompleteLeaseRequest"))
+        .add(endpoint!(actor command "/api/v1/problem-drafts" => generate_problem_draft, "Begin generating a reviewable problem document from a prompt and bounded workspace material", "GenerateProblemDraftRequest"))
+        .add(endpoint!(actor get "/api/v1/problem-drafts/{draft_id}" => get_problem_draft, "Get a generated problem draft for human review"))
+        .add(endpoint!(actor command "/api/v1/problem-drafts/{draft_id}/commands/cancel" => cancel_problem_draft, "Cancel the active generation attempt for a problem draft", "ProblemDraftControlRequest"))
+        .add(endpoint!(actor command "/api/v1/problem-drafts/{draft_id}/commands/retry" => retry_problem_draft, "Retry a failed problem draft as a new durable attempt", "ProblemDraftControlRequest"))
+        .add(endpoint!(actor command "/api/v1/problem-drafts/{draft_id}/commands/confirm" => confirm_problem_draft, "Confirm a problem document, create its project, and optionally start research", "ConfirmProblemDraftRequest"))
+        .add(endpoint!(actor created "/api/v1/projects" => create_project, "Create project", "CreateProjectRequest"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}" => get_project, "Get project"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/status" => project_status, "Get aggregate status"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/snapshot" => snapshot, "Get consistent snapshot"))
+        .add(endpoint!(actor board "/api/v1/projects/{project_id}/board" => board, "Get the atomic MathCat Lab board projection"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/problem-revisions" => revise_problem, "Create an auditable problem-contract revision and invalidate stale work", "ProblemRevisionRequest"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/route-proposals" => route_proposals, "List auditable human route proposals"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/route-proposals" => propose_route, "Propose a route for Planner validation", "HumanRouteProposalRequest"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/latest" => latest, "Get latest report metadata"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/publications" => publications, "List idempotent publication runs"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/publications" => create_publication, "Create or replay a revision-pinned publication run", "CreatePublicationRequest"))
+        .add(endpoint!(actor get "/api/v1/publications/{publication_id}" => publication, "Get a publication run"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/goals/{goal_id}/closures" => goal_closures, "List auditable Goal Completion evidence"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/rounds" => rounds, "List rounds"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/rounds/current" => current_round, "Get current round"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/workers" => workers, "List workers"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/workers/{worker_id}" => worker, "Get worker"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/tasks" => tasks, "List tasks"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/tasks" => create_human_task, "Create a human-assigned task", "CommandRequest"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/tasks/{task_id}" => task, "Get task"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/tasks/{task_id}/attempts" => task_attempts, "List bounded task attempts and failure signatures"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/tasks/{task_id}/contract" => task_contract, "Get the immutable task contract"))
+        .add(endpoint!(actor get "/api/v1/tasks/{task_id}/context-packet" => task_context_packet, "Get the exact context packet delivered to a worker"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/tasks/{task_id}/steers" => task_steers, "List queued and applied task steering"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/tasks/{task_id}/commands/steer" => steer_task, "Queue task guidance for the next safe point", "CommandRequest"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/tasks/{task_id}/commands/pause" => pause_task, "Pause a task", "CommandRequest"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/tasks/{task_id}/commands/resume" => resume_task, "Resume a task", "CommandRequest"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/tasks/{task_id}/commands/reassign" => reassign_task, "Reassign a task", "CommandRequest"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/tasks/{task_id}/commands/cancel" => cancel_task, "Cancel a task and reject stale output", "CommandRequest"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/tasks/{task_id}/commands/set-priority" => set_task_priority, "Change task priority", "CommandRequest"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/tasks/{task_id}/commands/retry" => retry_task, "Queue a bounded retry under the task retry policy", "CommandRequest"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/tasks/{task_id}/commands/rebuild-context" => rebuild_task_context, "Rebuild an invalid task context as a new immutable packet and contract version", "CommandRequest"))
+        .add(endpoint!(actor command "/api/v1/tasks/{task_id}/commands/rebuild-context" => rebuild_task_context_by_task, "Rebuild task context using the architecture-compatible task-scoped path", "CommandRequest"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/routes" => routes, "List routes"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/routes" => create_human_route, "Create and immediately schedule an auditable human-authored route", "HumanRouteCreateRequest"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/routes/{route_id}/commands/approve" => approve_route, "Approve budget eligibility for a route when human approval is enabled", "CommandRequest"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/route-families" => route_families, "List semantic route families and canonical routes"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/route-tombstones" => route_tombstones, "List pruned route fingerprints and revival conditions"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/routes/{route_id}" => route, "Get route"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/routes/{route_id}/progress-ledger" => route_progress_ledger, "List material route progress entries"))
+        .add(endpoint!(actor get "/api/v1/routes/{route_id}/progress-digest" => route_progress_digest, "Get a provenance-aware route progress digest"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/worker-instances" => worker_instances, "List worker process instances, handshakes, and health"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/planning/delta" => planning_delta, "Get the current or most recently consumed research delta"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/planning/revisions" => planning_revisions, "List atomic plan revisions"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/planning/revisions/{plan_revision_id}" => planning_revision, "Get route, fact, bottleneck, and task decisions for one plan revision"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/strategy/states" => strategy_states, "List immutable Strategy Director states and macro audits"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/strategy/latest" => latest_strategy_state, "Get the latest whole-proof strategy state"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/bottlenecks" => bottlenecks, "List the persistent bottleneck register"))
+        .add(endpoint!(actor obligation_graph "/api/v1/projects/{project_id}/obligations" => proof_obligations, "Get the proof-obligation graph and candidate coverage ledger"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/facts/{fact_id}/planning-impact" => fact_planning_impact, "Explain how planning consumed or deferred a fact"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/planner/health" => planner_health, "Get planner circuit-breaker and degraded-mode health"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/context/digest" => context_digest, "Get the provenance-aware project planning digest"))
+        .add(endpoint!(actor get "/api/v1/system/storage/health" => storage_health, "Get state queue, outbox, lease, and reconciliation health"))
+        .add(endpoint!(actor get "/api/v1/system/state-writer/status" => state_writer_status, "Get bounded SQLite StateWriter status"))
+        .add(endpoint!(actor post "/api/v1/system/reconciliation/commands/run" => run_reconciliation, "Run an authorized consistency reconciliation scan", "ReconciliationRequest"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/graphs/{graph_type}" => graph, "Get goal, hypothesis, fact, or six-kind combined graph"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/graphs/combined/delta" => graph_delta, "Recover a snapshot-assisted combined graph delta from an event cursor"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/verifications" => verifications, "List verifications"))
+        .add(endpoint!(actor get "/api/v1/verifications/{verification_id}" => verification, "Get verification"))
+        .add(endpoint!(actor get "/api/v1/verifications/{verification_id}/case" => verification_case_by_verification, "Get trusted verification case"))
+        .add(endpoint!(actor get "/api/v1/verification-cases/{case_id}" => verification_case, "Get verification case with policy and evidence"))
+        .add(endpoint!(actor get "/api/v1/verification-cases/{case_id}/snapshot" => verification_snapshot, "Get immutable verification snapshot"))
+        .add(endpoint!(actor get "/api/v1/verification-cases/{case_id}/checks" => verification_checks, "List verification checks"))
+        .add(endpoint!(actor get "/api/v1/verification-cases/{case_id}/findings" => verification_findings, "List verification findings"))
+        .add(endpoint!(actor get "/api/v1/verification-cases/{case_id}/evidence" => verification_evidence, "List verification evidence"))
+        .add(endpoint!(actor get "/api/v1/verification-cases/{case_id}/semantic-contract" => semantic_contract, "Get semantic contract"))
+        .add(endpoint!(actor get "/api/v1/verification-cases/{case_id}/formalization" => formalization, "Get Lean formalization"))
+        .add(endpoint!(actor get "/api/v1/verification-cases/{case_id}/alignment-reviews" => alignment_reviews, "List semantic alignment reviews"))
+        .add(endpoint!(actor get "/api/v1/verification-cases/{case_id}/backend-runs" => backend_runs, "List verification backend runs"))
+        .add(endpoint!(actor get "/api/v1/verification-cases/{case_id}/package" => verification_package, "Get content-addressed verification package"))
+        .add(endpoint!(actor get "/api/v1/verification-cases/{case_id}/replays" => verification_replays, "List independent replays"))
+        .add(endpoint!(actor get "/api/v1/formalizations/{formalization_id}" => get_formalization, "Get formalization and current source"))
+        .add(endpoint!(actor get "/api/v1/formalizations/{formalization_id}/semantic-contract" => formalization_semantic_contract, "Get formalization semantic contract"))
+        .add(endpoint!(actor get "/api/v1/formalizations/{formalization_id}/alignment" => formalization_alignment, "Get formalization alignment reviews"))
+        .add(endpoint!(actor get "/api/v1/formalizations/{formalization_id}/goals" => formalization_goals, "List current open Pantograph goals"))
+        .add(endpoint!(actor get "/api/v1/formalizations/{formalization_id}/proof-tree" => formalization_proof_tree, "Page through proof tree nodes and edges"))
+        .add(endpoint!(actor get "/api/v1/formalizations/{formalization_id}/attempts" => formalization_attempts, "List visible tactic attempts"))
+        .add(endpoint!(actor command "/api/v1/formalizations/{formalization_id}/hints" => add_formalization_hint, "Add a hint for the next proof-node expansion", "ProofHintRequest"))
+        .add(endpoint!(actor command "/api/v1/formalizations/{formalization_id}/proof-nodes/{node_id}/commands/prune" => prune_formalization_branch, "Prune a proof branch immediately", "ProofSearchCommandRequest"))
+        .add(endpoint!(actor command "/api/v1/formalizations/{formalization_id}/commands/cancel" => cancel_formalization_search, "Cancel an interactive proof search", "ProofSearchCommandRequest"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/uncertainties" => uncertainties, "List uncertainties"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/sources" => sources, "List unverified source leads"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/sources/ingestions" => source_ingestions, "List source insertion, deduplication, and rejection provenance"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/experiment-capsules" => experiment_capsules, "List content-addressed unverified experiment capsules"))
+        .add(endpoint!(actor get "/api/v1/experiment-capsules/{capsule_id}" => experiment_capsule, "Get an exact experiment capsule and replay metadata"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/failure-patterns" => failure_patterns, "List failure patterns"))
+        .add(endpoint!(actor get "/api/v1/facts/{fact_id}" => fact, "Get fact"))
+        .add(endpoint!(actor get "/api/v1/facts/catalog" => fact_catalog, "List the global fact catalog"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/fact-imports" => fact_imports, "List cross-project fact imports"))
+        .add(endpoint!(actor idempotent_created "/api/v1/projects/{project_id}/fact-imports" => import_fact, "Import a fact and its complete assured dependency closure", "ImportFactRequest"))
+        .add(endpoint!(actor get "/api/v1/facts/{fact_id}/assurance" => fact_assurance, "List current and historical fact assurances"))
+        .add(endpoint!(actor get "/api/v1/facts/{fact_id}/verification-history" => fact_verification_history, "List verification, challenge, replay, and assurance history"))
+        .add(endpoint!(actor get "/api/v1/facts/{fact_id}/formalization" => fact_formalization, "Get the latest fact formalization"))
+        .add(endpoint!(actor get "/api/v1/facts/{fact_id}/dependency-closure" => fact_dependency_closure, "Get dependency closure with assurance levels"))
+        .add(endpoint!(actor get "/api/v1/facts/{fact_id}/impact" => fact_impact, "Get fact impact"))
+        .add(endpoint!(actor command "/api/v1/facts/{fact_id}/commands/challenge" => challenge_fact, "Challenge a fact and enqueue independent reverification", "FactGovernanceRequest"))
+        .add(endpoint!(actor command "/api/v1/facts/{fact_id}/commands/reverify" => reverify_fact, "Reverify a fact without overwriting its assurance history", "FactGovernanceRequest"))
+        .add(endpoint!(actor command "/api/v1/facts/{fact_id}/commands/request-formalization" => request_fact_formalization, "Request a fresh Lean formalization and certification", "FactGovernanceRequest"))
+        .add(endpoint!(actor command "/api/v1/facts/{fact_id}/commands/request-independent-proof" => request_independent_proof, "Request a separately snapshotted proof with an extra independent review", "FactGovernanceRequest"))
+        .add(endpoint!(actor command "/api/v1/facts/{fact_id}/commands/suspend" => suspend_fact, "Suspend a fact and invalidate downstream use", "FactGovernanceRequest"))
+        .add(endpoint!(actor command "/api/v1/facts/{fact_id}/commands/revoke" => revoke_fact, "Revoke a fact and apply dependency impact", "FactGovernanceRequest"))
+        .add(endpoint!(actor events "/api/v1/projects/{project_id}/events" => events, "Subscribe to SSE events"))
+        .add(endpoint!(actor websocket "/api/v1/projects/{project_id}/ws" => websocket_events, "Resume a bidirectional WebSocket event stream with heartbeat usage"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/security-audit" => security_audit, "List append-only authorization decisions"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/artifacts" => artifacts, "List artifacts"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/artifacts/{artifact_id}" => artifact, "Get artifact metadata"))
+        .add(endpoint!(actor download "/api/v1/projects/{project_id}/artifacts/{artifact_id}/content" => artifact_content, "Download artifact"))
+        .add(endpoint!(actor download "/api/v1/projects/{project_id}/reports/latest" => latest_report_content, "Download latest report"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/commands/{command_id}" => command, "Get command status"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/commands/start" => start_project, "Start project", "CommandRequest"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/commands/pause" => pause_project, "Pause project", "CommandRequest"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/commands/resume" => resume_project, "Resume project", "CommandRequest"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/commands/stop" => stop_project, "Stop project", "CommandRequest"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/commands/replan" => replan, "Trigger replan", "CommandRequest"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/commands/goal-review" => goal_review, "Cancel unfinished work and immediately start a focused goal review", "CommandRequest"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/commands/review-policy" => review_policy, "Update the durable human review policy", "CommandRequest"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/commands/settings" => research_settings, "Atomically update project budget and human review policy", "CommandRequest"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/suggestions" => add_suggestion, "Add next-round suggestion", "SuggestionRequest"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/routes/{route_id}/commands/pause" => pause_route, "Pause route", "CommandRequest"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/routes/{route_id}/commands/resume" => resume_route, "Resume route", "CommandRequest"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/routes/{route_id}/commands/stop" => stop_route, "Stop route", "CommandRequest"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/routes/{route_id}/commands/prune" => prune_route, "Prune and tombstone a route", "CommandRequest"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/routes/commands/merge" => merge_routes, "Merge duplicate routes into a canonical route", "CommandRequest"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/routes/{route_id}/commands/revive" => revive_route, "Revive a tombstoned route with explicit evidence", "CommandRequest"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/workers/{worker_id}/commands/stop" => stop_worker, "Stop worker", "CommandRequest"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/workers/{worker_id}/commands/pause" => pause_worker, "Pause worker task intake", "CommandRequest"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/workers/{worker_id}/commands/resume" => resume_worker, "Resume worker task intake", "CommandRequest"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/worker-instances/{worker_instance_id}/commands/quarantine" => quarantine_worker_instance, "Quarantine a faulty worker instance and expire its lease", "CommandRequest"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/usage" => usage_summary, "Get measured model-call and token usage"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/budgets" => budget_overrides, "List scoped budget overrides"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/commands/adjust-budget" => adjust_budget, "Adjust a scoped budget without dropping below consumed usage", "CommandRequest"))
+        .add(endpoint!(actor get "/api/v1/projects/{project_id}/questions" => human_questions, "List proactive human clarification questions"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/questions/{question_id}/commands/answer" => answer_question, "Answer a clarification question and resume affected work", "CommandRequest"))
+        .add(endpoint!(actor command "/api/v1/projects/{project_id}/candidates" => submit_candidate, "Submit candidate claim", "CandidateSubmission"))
+}
+
+static ENDPOINT_DESCRIPTORS: LazyLock<Vec<EndpointDescriptor>> =
+    LazyLock::new(|| endpoint_contract().descriptors);
+
+fn endpoint_policy(method: &Method, path: &str) -> Option<&'static EndpointDescriptor> {
+    ENDPOINT_DESCRIPTORS
+        .iter()
+        .find(|endpoint| endpoint.method.matches(method) && route_path_matches(endpoint.path, path))
+}
+
+fn endpoint_auth(method: &Method, path: &str) -> EndpointAuth {
+    endpoint_policy(method, path).map_or(EndpointAuth::Actor, |endpoint| endpoint.auth)
+}
+
+fn route_path_matches(template: &str, actual: &str) -> bool {
+    let mut template_segments = template.split('/');
+    let mut actual_segments = actual.split('/');
+    loop {
+        match (template_segments.next(), actual_segments.next()) {
+            (Some(template_segment), Some(actual_segment)) => {
+                let is_parameter =
+                    template_segment.starts_with('{') && template_segment.ends_with('}');
+                if (is_parameter && actual_segment.is_empty())
+                    || (!is_parameter && template_segment != actual_segment)
+                {
+                    return false;
+                }
+            }
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
 pub fn router(service: ResearchService) -> Router {
     let state = AppState { service };
-    Router::new()
-        .route("/health", get(health))
-        .route("/api/openapi.json", get(openapi))
-        .route("/api/v1/actors/bootstrap", post(bootstrap_actor))
-        .route("/api/v1/actors", post(create_actor))
-        .route("/api/v1/worker-nodes", post(register_worker_node))
-        .route(
-            "/api/v1/worker-nodes/{node_id}/heartbeat",
-            post(heartbeat_worker_node),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/distributed/leases/next",
-            post(lease_distributed_task),
-        )
-        .route("/api/v1/task-leases/{lease_id}", get(get_task_lease))
-        .route(
-            "/api/v1/task-leases/{lease_id}/renew",
-            post(renew_task_lease),
-        )
-        .route(
-            "/api/v1/task-leases/{lease_id}/complete",
-            post(complete_task_lease),
-        )
-        .route("/api/v1/projects", post(create_project))
-        .route("/api/v1/projects/{project_id}", get(get_project))
-        .route("/api/v1/projects/{project_id}/status", get(project_status))
-        .route("/api/v1/projects/{project_id}/snapshot", get(snapshot))
-        .route("/api/v1/projects/{project_id}/board", get(board))
-        .route(
-            "/api/v1/projects/{project_id}/problem-revisions",
-            post(revise_problem),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/route-proposals",
-            get(route_proposals).post(propose_route),
-        )
-        .route("/api/v1/projects/{project_id}/latest", get(latest))
-        .route(
-            "/api/v1/projects/{project_id}/publications",
-            get(publications).post(create_publication),
-        )
-        .route(
-            "/api/v1/publications/{publication_id}",
-            get(publication),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/goals/{goal_id}/closures",
-            get(goal_closures),
-        )
-        .route("/api/v1/projects/{project_id}/rounds", get(rounds))
-        .route(
-            "/api/v1/projects/{project_id}/rounds/current",
-            get(current_round),
-        )
-        .route("/api/v1/projects/{project_id}/workers", get(workers))
-        .route(
-            "/api/v1/projects/{project_id}/workers/{worker_id}",
-            get(worker),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/tasks",
-            get(tasks).post(create_human_task),
-        )
-        .route("/api/v1/projects/{project_id}/tasks/{task_id}", get(task))
-        .route(
-            "/api/v1/projects/{project_id}/tasks/{task_id}/attempts",
-            get(task_attempts),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/tasks/{task_id}/contract",
-            get(task_contract),
-        )
-        .route(
-            "/api/v1/tasks/{task_id}/context-packet",
-            get(task_context_packet),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/tasks/{task_id}/steers",
-            get(task_steers),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/tasks/{task_id}/commands/steer",
-            post(steer_task),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/tasks/{task_id}/commands/pause",
-            post(pause_task),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/tasks/{task_id}/commands/resume",
-            post(resume_task),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/tasks/{task_id}/commands/reassign",
-            post(reassign_task),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/tasks/{task_id}/commands/cancel",
-            post(cancel_task),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/tasks/{task_id}/commands/set-priority",
-            post(set_task_priority),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/tasks/{task_id}/commands/retry",
-            post(retry_task),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/tasks/{task_id}/commands/rebuild-context",
-            post(rebuild_task_context),
-        )
-        .route(
-            "/api/v1/tasks/{task_id}/commands/rebuild-context",
-            post(rebuild_task_context_by_task),
-        )
-        .route("/api/v1/projects/{project_id}/routes", get(routes))
-        .route(
-            "/api/v1/projects/{project_id}/routes/{route_id}/commands/approve",
-            post(approve_route),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/route-families",
-            get(route_families),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/route-tombstones",
-            get(route_tombstones),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/routes/{route_id}",
-            get(route),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/routes/{route_id}/progress-ledger",
-            get(route_progress_ledger),
-        )
-        .route(
-            "/api/v1/routes/{route_id}/progress-digest",
-            get(route_progress_digest),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/worker-instances",
-            get(worker_instances),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/planning/delta",
-            get(planning_delta),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/planning/revisions",
-            get(planning_revisions),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/planning/revisions/{plan_revision_id}",
-            get(planning_revision),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/strategy/states",
-            get(strategy_states),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/strategy/latest",
-            get(latest_strategy_state),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/bottlenecks",
-            get(bottlenecks),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/facts/{fact_id}/planning-impact",
-            get(fact_planning_impact),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/planner/health",
-            get(planner_health),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/context/digest",
-            get(context_digest),
-        )
-        .route("/api/v1/system/storage/health", get(storage_health))
-        .route(
-            "/api/v1/system/state-writer/status",
-            get(state_writer_status),
-        )
-        .route(
-            "/api/v1/system/reconciliation/commands/run",
-            post(run_reconciliation),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/graphs/{graph_type}",
-            get(graph),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/graphs/combined/delta",
-            get(graph_delta),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/verifications",
-            get(verifications),
-        )
-        .route("/api/v1/verifications/{verification_id}", get(verification))
-        .route(
-            "/api/v1/verifications/{verification_id}/case",
-            get(verification_case_by_verification),
-        )
-        .route(
-            "/api/v1/verification-cases/{case_id}",
-            get(verification_case),
-        )
-        .route(
-            "/api/v1/verification-cases/{case_id}/snapshot",
-            get(verification_snapshot),
-        )
-        .route(
-            "/api/v1/verification-cases/{case_id}/checks",
-            get(verification_checks),
-        )
-        .route(
-            "/api/v1/verification-cases/{case_id}/findings",
-            get(verification_findings),
-        )
-        .route(
-            "/api/v1/verification-cases/{case_id}/evidence",
-            get(verification_evidence),
-        )
-        .route(
-            "/api/v1/verification-cases/{case_id}/semantic-contract",
-            get(semantic_contract),
-        )
-        .route(
-            "/api/v1/verification-cases/{case_id}/formalization",
-            get(formalization),
-        )
-        .route(
-            "/api/v1/verification-cases/{case_id}/alignment-reviews",
-            get(alignment_reviews),
-        )
-        .route(
-            "/api/v1/verification-cases/{case_id}/backend-runs",
-            get(backend_runs),
-        )
-        .route(
-            "/api/v1/verification-cases/{case_id}/package",
-            get(verification_package),
-        )
-        .route(
-            "/api/v1/verification-cases/{case_id}/replays",
-            get(verification_replays),
-        )
-        .route(
-            "/api/v1/formalizations/{formalization_id}",
-            get(get_formalization),
-        )
-        .route(
-            "/api/v1/formalizations/{formalization_id}/semantic-contract",
-            get(formalization_semantic_contract),
-        )
-        .route(
-            "/api/v1/formalizations/{formalization_id}/alignment",
-            get(formalization_alignment),
-        )
-        .route(
-            "/api/v1/formalizations/{formalization_id}/goals",
-            get(formalization_goals),
-        )
-        .route(
-            "/api/v1/formalizations/{formalization_id}/proof-tree",
-            get(formalization_proof_tree),
-        )
-        .route(
-            "/api/v1/formalizations/{formalization_id}/attempts",
-            get(formalization_attempts),
-        )
-        .route(
-            "/api/v1/formalizations/{formalization_id}/hints",
-            post(add_formalization_hint),
-        )
-        .route(
-            "/api/v1/formalizations/{formalization_id}/proof-nodes/{node_id}/commands/prune",
-            post(prune_formalization_branch),
-        )
-        .route(
-            "/api/v1/formalizations/{formalization_id}/commands/cancel",
-            post(cancel_formalization_search),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/uncertainties",
-            get(uncertainties),
-        )
-        .route("/api/v1/projects/{project_id}/sources", get(sources))
-        .route(
-            "/api/v1/projects/{project_id}/sources/ingestions",
-            get(source_ingestions),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/experiment-capsules",
-            get(experiment_capsules),
-        )
-        .route(
-            "/api/v1/experiment-capsules/{capsule_id}",
-            get(experiment_capsule),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/failure-patterns",
-            get(failure_patterns),
-        )
-        .route("/api/v1/facts/{fact_id}", get(fact))
-        .route("/api/v1/facts/catalog", get(fact_catalog))
-        .route(
-            "/api/v1/projects/{project_id}/fact-imports",
-            get(fact_imports).post(import_fact),
-        )
-        .route("/api/v1/facts/{fact_id}/assurance", get(fact_assurance))
-        .route(
-            "/api/v1/facts/{fact_id}/verification-history",
-            get(fact_verification_history),
-        )
-        .route(
-            "/api/v1/facts/{fact_id}/formalization",
-            get(fact_formalization),
-        )
-        .route(
-            "/api/v1/facts/{fact_id}/dependency-closure",
-            get(fact_dependency_closure),
-        )
-        .route("/api/v1/facts/{fact_id}/impact", get(fact_impact))
-        .route(
-            "/api/v1/facts/{fact_id}/commands/challenge",
-            post(challenge_fact),
-        )
-        .route(
-            "/api/v1/facts/{fact_id}/commands/reverify",
-            post(reverify_fact),
-        )
-        .route(
-            "/api/v1/facts/{fact_id}/commands/request-formalization",
-            post(request_fact_formalization),
-        )
-        .route(
-            "/api/v1/facts/{fact_id}/commands/request-independent-proof",
-            post(request_independent_proof),
-        )
-        .route(
-            "/api/v1/facts/{fact_id}/commands/suspend",
-            post(suspend_fact),
-        )
-        .route("/api/v1/facts/{fact_id}/commands/revoke", post(revoke_fact))
-        .route("/api/v1/projects/{project_id}/events", get(events))
-        .route("/api/v1/projects/{project_id}/ws", get(websocket_events))
-        .route(
-            "/api/v1/projects/{project_id}/security-audit",
-            get(security_audit),
-        )
-        .route("/api/v1/projects/{project_id}/artifacts", get(artifacts))
-        .route(
-            "/api/v1/projects/{project_id}/artifacts/{artifact_id}",
-            get(artifact),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/artifacts/{artifact_id}/content",
-            get(artifact_content),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/reports/latest",
-            get(latest_report_content),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/commands/{command_id}",
-            get(command),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/commands/start",
-            post(start_project),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/commands/pause",
-            post(pause_project),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/commands/resume",
-            post(resume_project),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/commands/stop",
-            post(stop_project),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/commands/replan",
-            post(replan),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/suggestions",
-            post(add_suggestion),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/routes/{route_id}/commands/pause",
-            post(pause_route),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/routes/{route_id}/commands/resume",
-            post(resume_route),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/routes/{route_id}/commands/stop",
-            post(stop_route),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/routes/{route_id}/commands/prune",
-            post(prune_route),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/routes/commands/merge",
-            post(merge_routes),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/routes/{route_id}/commands/revive",
-            post(revive_route),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/workers/{worker_id}/commands/stop",
-            post(stop_worker),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/workers/{worker_id}/commands/pause",
-            post(pause_worker),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/workers/{worker_id}/commands/resume",
-            post(resume_worker),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/worker-instances/{worker_instance_id}/commands/quarantine",
-            post(quarantine_worker_instance),
-        )
-        .route("/api/v1/projects/{project_id}/usage", get(usage_summary))
-        .route(
-            "/api/v1/projects/{project_id}/budgets",
-            get(budget_overrides),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/commands/adjust-budget",
-            post(adjust_budget),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/questions",
-            get(human_questions),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/questions/{question_id}/commands/answer",
-            post(answer_question),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/candidates",
-            post(submit_candidate),
-        )
+    endpoint_contract()
+        .router
         .layer(middleware::from_fn_with_state(
             state.clone(),
             authentication_gate,
@@ -510,47 +573,43 @@ pub fn router(service: ResearchService) -> Router {
 
 async fn authentication_gate(
     State(state): State<AppState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    let path = request.uri().path();
-    let public_endpoint = path == "/health"
-        || path == "/api/openapi.json"
-        || path == "/api/v1/actors/bootstrap"
-        || (path.starts_with("/api/v1/worker-nodes/") && path.ends_with("/heartbeat"))
-        || (path.starts_with("/api/v1/projects/") && path.ends_with("/distributed/leases/next"))
-        || (path.starts_with("/api/v1/task-leases/")
-            && (path.ends_with("/renew") || path.ends_with("/complete")));
-    if request.method() != Method::OPTIONS && !public_endpoint {
+    let path = request.uri().path().to_owned();
+    let auth = endpoint_auth(request.method(), &path);
+    if request.method() != Method::OPTIONS && auth == EndpointAuth::Actor {
+        let actor = authenticate_actor(state.service.store(), request.headers()).await?;
         authorize_actor(
             state.service.store(),
-            request.headers(),
+            &actor,
             None,
             "api_access",
             "http_path",
-            path,
+            &path,
             "viewer",
         )
         .await?;
+        request.extensions_mut().insert(actor);
     }
     Ok(next.run(request).await)
 }
 
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize)]
 pub struct ApiEnvelope<T: Serialize> {
     pub data: Option<T>,
     pub meta: ResponseMeta,
     pub error: Option<ApiErrorBody>,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize)]
 pub struct ResponseMeta {
     pub request_id: String,
     pub project_revision: Option<i64>,
     pub event_cursor: Option<i64>,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize)]
 pub struct ApiErrorBody {
     pub code: String,
     pub message: String,
@@ -691,6 +750,20 @@ impl From<CoreError> for ApiError {
                 details: json!({}),
                 retryable: true,
             },
+            CoreError::InvalidProblemMaterial(message) => Self {
+                status: StatusCode::BAD_REQUEST,
+                code: "invalid_problem_material",
+                message,
+                details: json!({}),
+                retryable: false,
+            },
+            CoreError::Io(_) => Self {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "filesystem_error",
+                message: "a filesystem operation failed".into(),
+                details: json!({}),
+                retryable: true,
+            },
             other => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "internal_error",
@@ -722,7 +795,8 @@ impl IntoResponse for ApiError {
     }
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateProjectRequest {
     pub name: String,
     pub problem: String,
@@ -734,22 +808,106 @@ pub struct CreateProjectRequest {
     pub budget: Budget,
     #[serde(default)]
     pub human_route_approval: bool,
+    pub review_mode: Option<ReviewMode>,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenerateProblemDraftRequest {
+    pub prompt: String,
+    #[serde(default = "default_context_directory")]
+    pub context_dir: String,
+}
+
+fn default_context_directory() -> String {
+    ".".into()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmProblemDraftRequest {
+    pub expected_revision: i64,
+    pub expected_document_hash: String,
+    pub document: Option<ProblemDocument>,
+    #[serde(default)]
+    pub acknowledge_material_warnings: bool,
+    #[serde(default = "default_start_after_confirmation")]
+    pub start: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProblemDraftControlRequest {
+    pub expected_revision: i64,
+}
+
+const fn default_start_after_confirmation() -> bool {
+    true
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProblemDraftView {
+    pub draft: research_domain::ProblemDraft,
+    pub preview_markdown: Option<String>,
+}
+
+impl From<research_domain::ProblemDraft> for ProblemDraftView {
+    fn from(draft: research_domain::ProblemDraft) -> Self {
+        let preview_markdown = draft
+            .document
+            .as_ref()
+            .map(render_problem_document_markdown);
+        Self {
+            draft,
+            preview_markdown,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProblemDraftConfirmationView {
+    pub confirmation: research_domain::ProblemDraftConfirmation,
+    pub preview_markdown: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProblemDraftControlView {
+    pub draft: research_domain::ProblemDraft,
+    pub preview_markdown: Option<String>,
+    pub replayed: bool,
+}
+
+impl ProblemDraftControlView {
+    fn new(draft: research_domain::ProblemDraft, replayed: bool) -> Self {
+        let preview_markdown = draft
+            .document
+            .as_ref()
+            .map(render_problem_document_markdown);
+        Self {
+            draft,
+            preview_markdown,
+            replayed,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreatePublicationRequest {
     #[serde(default)]
     pub allow_partial: bool,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BootstrapActorRequest {
     pub actor_id: String,
     pub display_name: String,
     pub token: String,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateActorRequest {
     pub actor_id: String,
     pub display_name: String,
@@ -757,26 +915,29 @@ pub struct CreateActorRequest {
     pub token: String,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImportFactRequest {
     pub content_hash: String,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RegisterWorkerNodeRequest {
     pub node_id: String,
     pub display_name: String,
-    #[schema(value_type = Object)]
     pub capabilities: Value,
     pub token: String,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeHeartbeatRequest {
     pub node_epoch: i64,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LeaseTaskRequest {
     pub node_id: String,
     pub node_epoch: i64,
@@ -784,7 +945,8 @@ pub struct LeaseTaskRequest {
     pub ttl_seconds: u64,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RenewLeaseRequest {
     pub node_id: String,
     pub node_epoch: i64,
@@ -793,15 +955,27 @@ pub struct RenewLeaseRequest {
     pub ttl_seconds: u64,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeaseSteersRequest {
+    pub node_id: String,
+    pub node_epoch: i64,
+    pub lease_epoch: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompleteLeaseRequest {
     pub node_id: String,
     pub node_epoch: i64,
     pub lease_epoch: i64,
     pub output: research_domain::WorkerOutput,
+    #[serde(default)]
+    pub incorporated_steer_ids: Vec<String>,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReconciliationRequest {
     pub project_id: Option<String>,
     #[serde(default = "default_reconciliation_trigger")]
@@ -816,17 +990,18 @@ const fn default_lease_ttl() -> u64 {
     120
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommandRequest {
     pub expected_revision: i64,
     #[serde(default)]
     pub reason: String,
     #[serde(default = "empty_object")]
-    #[schema(value_type = Object)]
     pub payload: Value,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SuggestionRequest {
     pub expected_revision: i64,
     pub content: String,
@@ -921,12 +1096,12 @@ async fn bootstrap_actor(
 
 async fn create_actor(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Extension(actor): Extension<Actor>,
     Json(body): Json<CreateActorRequest>,
 ) -> Result<(StatusCode, Json<ApiEnvelope<research_domain::Actor>>), ApiError> {
-    let actor = authorize_actor(
+    authorize_actor(
         state.service.store(),
-        &headers,
+        &actor,
         None,
         "create_actor",
         "actor",
@@ -969,12 +1144,12 @@ async fn create_actor(
 
 async fn register_worker_node(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Extension(actor): Extension<Actor>,
     Json(body): Json<RegisterWorkerNodeRequest>,
 ) -> Result<(StatusCode, Json<ApiEnvelope<research_domain::WorkerNode>>), ApiError> {
-    let actor = authorize_actor(
+    authorize_actor(
         state.service.store(),
-        &headers,
+        &actor,
         None,
         "register_worker_node",
         "worker_node",
@@ -1068,12 +1243,12 @@ async fn lease_distributed_task(
 async fn get_task_lease(
     State(state): State<AppState>,
     Path(lease_id): Path<String>,
-    headers: HeaderMap,
+    Extension(actor): Extension<Actor>,
 ) -> Result<Json<ApiEnvelope<research_domain::TaskLease>>, ApiError> {
     let lease = state.service.store().get_task_lease(&lease_id).await?;
     authorize_actor(
         state.service.store(),
-        &headers,
+        &actor,
         Some(&lease.project_id),
         "get_task_lease",
         "task_lease",
@@ -1108,6 +1283,35 @@ async fn renew_task_lease(
     Ok(Json(success(&state.service, &project_id, lease).await?))
 }
 
+async fn poll_task_steers(
+    State(state): State<AppState>,
+    Path(lease_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<LeaseSteersRequest>,
+) -> Result<Json<ApiEnvelope<Value>>, ApiError> {
+    let token = worker_node_token(&headers)?;
+    let steers = state
+        .service
+        .store()
+        .pending_distributed_task_steers(
+            &lease_id,
+            &body.node_id,
+            token,
+            body.node_epoch,
+            body.lease_epoch,
+        )
+        .await?;
+    let lease = state.service.store().get_task_lease(&lease_id).await?;
+    Ok(Json(
+        success(
+            &state.service,
+            &lease.project_id,
+            json!({"lease_id":lease_id,"steers":steers}),
+        )
+        .await?,
+    ))
+}
+
 async fn complete_task_lease(
     State(state): State<AppState>,
     Path(lease_id): Path<String>,
@@ -1118,14 +1322,15 @@ async fn complete_task_lease(
     let lease = state.service.store().get_task_lease(&lease_id).await?;
     state
         .service
-        .complete_distributed_task(
-            &lease_id,
-            &body.node_id,
+        .complete_distributed_task(TaskLeaseCompletionRequest {
+            lease_id: &lease_id,
+            node_id: &body.node_id,
             token,
-            body.node_epoch,
-            body.lease_epoch,
-            &body.output,
-        )
+            node_epoch: body.node_epoch,
+            lease_epoch: body.lease_epoch,
+            output: &body.output,
+            incorporated_steer_ids: &body.incorporated_steer_ids,
+        })
         .await?;
     Ok((
         StatusCode::ACCEPTED,
@@ -1140,14 +1345,255 @@ async fn complete_task_lease(
     ))
 }
 
+fn relative_context_directory(value: &str) -> Result<PathBuf, ApiError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::invalid("context_dir must not be empty"));
+    }
+    let path = PathBuf::from(trimmed);
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ApiError::invalid(
+            "context_dir must remain relative to the configured problem material root",
+        ));
+    }
+    Ok(path)
+}
+
+async fn generate_problem_draft(
+    State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    headers: HeaderMap,
+    Json(body): Json<GenerateProblemDraftRequest>,
+) -> Result<(StatusCode, Json<ApiEnvelope<ProblemDraftView>>), ApiError> {
+    let key = idempotency_key(&headers)?;
+    authorize_actor(
+        state.service.store(),
+        &actor,
+        None,
+        "generate_problem_draft",
+        "problem_draft",
+        "new",
+        "researcher",
+    )
+    .await?;
+    if body.prompt.trim().is_empty() {
+        return Err(ApiError::invalid("prompt must not be empty"));
+    }
+    let context_dir = relative_context_directory(&body.context_dir)?;
+    let draft = state
+        .service
+        .begin_problem_draft_generation(&actor.actor_id, &key, body.prompt.trim(), &context_dir)
+        .await?;
+    state
+        .service
+        .store()
+        .record_security_audit(
+            None,
+            Some(&actor.actor_id),
+            "generate_problem_draft",
+            "problem_draft",
+            &draft.draft_id,
+            "allowed",
+            None,
+            Some(&key),
+        )
+        .await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(unscoped_success(ProblemDraftView::from(draft))),
+    ))
+}
+
+async fn get_problem_draft(
+    State(state): State<AppState>,
+    Path(draft_id): Path<String>,
+    Extension(actor): Extension<Actor>,
+) -> Result<Json<ApiEnvelope<ProblemDraftView>>, ApiError> {
+    authorize_actor(
+        state.service.store(),
+        &actor,
+        None,
+        "read_problem_draft",
+        "problem_draft",
+        &draft_id,
+        "viewer",
+    )
+    .await?;
+    let draft = state.service.store().get_problem_draft(&draft_id).await?;
+    Ok(Json(unscoped_success(ProblemDraftView::from(draft))))
+}
+
+async fn cancel_problem_draft(
+    State(state): State<AppState>,
+    Path(draft_id): Path<String>,
+    Extension(actor): Extension<Actor>,
+    headers: HeaderMap,
+    Json(body): Json<ProblemDraftControlRequest>,
+) -> Result<(StatusCode, Json<ApiEnvelope<ProblemDraftControlView>>), ApiError> {
+    let key = idempotency_key(&headers)?;
+    authorize_actor(
+        state.service.store(),
+        &actor,
+        None,
+        "cancel_problem_draft",
+        "problem_draft",
+        &draft_id,
+        "researcher",
+    )
+    .await?;
+    let (draft, replayed) = state
+        .service
+        .cancel_problem_draft(&actor.actor_id, &key, &draft_id, body.expected_revision)
+        .await?;
+    state
+        .service
+        .store()
+        .record_security_audit(
+            None,
+            Some(&actor.actor_id),
+            "cancel_problem_draft",
+            "problem_draft",
+            &draft_id,
+            "allowed",
+            None,
+            Some(&key),
+        )
+        .await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(unscoped_success(ProblemDraftControlView::new(
+            draft, replayed,
+        ))),
+    ))
+}
+
+async fn retry_problem_draft(
+    State(state): State<AppState>,
+    Path(draft_id): Path<String>,
+    Extension(actor): Extension<Actor>,
+    headers: HeaderMap,
+    Json(body): Json<ProblemDraftControlRequest>,
+) -> Result<(StatusCode, Json<ApiEnvelope<ProblemDraftControlView>>), ApiError> {
+    let key = idempotency_key(&headers)?;
+    authorize_actor(
+        state.service.store(),
+        &actor,
+        None,
+        "retry_problem_draft",
+        "problem_draft",
+        &draft_id,
+        "researcher",
+    )
+    .await?;
+    let (draft, replayed) = state
+        .service
+        .begin_problem_draft_retry(&actor.actor_id, &key, &draft_id, body.expected_revision)
+        .await?;
+    state
+        .service
+        .store()
+        .record_security_audit(
+            None,
+            Some(&actor.actor_id),
+            "retry_problem_draft",
+            "problem_draft",
+            &draft_id,
+            "allowed",
+            None,
+            Some(&key),
+        )
+        .await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(unscoped_success(ProblemDraftControlView::new(
+            draft, replayed,
+        ))),
+    ))
+}
+
+async fn confirm_problem_draft(
+    State(state): State<AppState>,
+    Path(draft_id): Path<String>,
+    Extension(actor): Extension<Actor>,
+    headers: HeaderMap,
+    Json(body): Json<ConfirmProblemDraftRequest>,
+) -> Result<(StatusCode, Json<ApiEnvelope<ProblemDraftConfirmationView>>), ApiError> {
+    let key = idempotency_key(&headers)?;
+    authorize_actor(
+        state.service.store(),
+        &actor,
+        None,
+        "confirm_problem_draft",
+        "problem_draft",
+        &draft_id,
+        "researcher",
+    )
+    .await?;
+    let result = state
+        .service
+        .confirm_problem_draft(ProblemDraftConfirmationRequest {
+            draft_id: &draft_id,
+            expected_revision: body.expected_revision,
+            expected_document_hash: &body.expected_document_hash,
+            idempotency_key: &key,
+            requested_by: &actor.actor_id,
+            start: body.start,
+            edited_document: body.document.as_ref(),
+            acknowledge_material_warnings: body.acknowledge_material_warnings,
+        })
+        .await?;
+    let project_id = result.project.project_id.clone();
+    let preview_markdown = result
+        .draft
+        .document
+        .as_ref()
+        .map(render_problem_document_markdown)
+        .ok_or_else(|| ApiError::invalid("confirmed problem draft has no document"))?;
+    state
+        .service
+        .store()
+        .record_security_audit(
+            Some(&project_id),
+            Some(&actor.actor_id),
+            "confirm_problem_draft",
+            "problem_draft",
+            &draft_id,
+            "allowed",
+            None,
+            Some(&key),
+        )
+        .await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            success(
+                &state.service,
+                &project_id,
+                ProblemDraftConfirmationView {
+                    confirmation: result,
+                    preview_markdown,
+                },
+            )
+            .await?,
+        ),
+    ))
+}
+
 async fn create_project(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Extension(actor): Extension<Actor>,
     Json(body): Json<CreateProjectRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = authorize_actor(
+    authorize_actor(
         state.service.store(),
-        &headers,
+        &actor,
         None,
         "create_project",
         "project",
@@ -1167,15 +1613,22 @@ async fn create_project(
         }),
         version: 1,
     };
-    let project = state
-        .service
-        .create_project_with_route_approval(
-            body.name,
-            contract,
-            body.budget,
-            body.human_route_approval,
-        )
-        .await?;
+    let project = if let Some(review_mode) = body.review_mode {
+        state
+            .service
+            .create_project_with_review_mode(body.name, contract, body.budget, review_mode)
+            .await?
+    } else {
+        state
+            .service
+            .create_project_with_route_approval(
+                body.name,
+                contract,
+                body.budget,
+                body.human_route_approval,
+            )
+            .await?
+    };
     let project_id = project.project_id.clone();
     state
         .service
@@ -1198,6 +1651,7 @@ async fn create_project(
 async fn create_publication(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
+    Extension(actor): Extension<Actor>,
     headers: HeaderMap,
     Json(body): Json<CreatePublicationRequest>,
 ) -> Result<
@@ -1208,9 +1662,9 @@ async fn create_publication(
     ApiError,
 > {
     let key = idempotency_key(&headers)?;
-    let actor = authorize_actor(
+    authorize_actor(
         state.service.store(),
-        &headers,
+        &actor,
         Some(&project_id),
         "create_publication",
         "project",
@@ -1335,6 +1789,7 @@ async fn board(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
     Query(query): Query<BoardQuery>,
+    Extension(actor): Extension<Actor>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     if query.schema_version != 1 {
@@ -1348,9 +1803,9 @@ async fn board(
             "timeline_limit must be between 0 and 500",
         ));
     }
-    let actor = authorize_actor(
+    authorize_actor(
         state.service.store(),
-        &headers,
+        &actor,
         Some(&project_id),
         "read_board",
         "project",
@@ -1383,7 +1838,10 @@ async fn board(
     let capabilities = BoardCapabilities {
         can_edit_problem: rank >= role_rank("researcher"),
         can_propose_route: rank >= role_rank("researcher"),
+        can_create_route: rank >= role_rank("researcher"),
         can_approve_route: rank >= role_rank("researcher"),
+        can_force_goal_review: rank >= role_rank("researcher"),
+        can_manage_settings: rank >= role_rank("operator"),
         can_control_project: rank >= role_rank("researcher"),
         can_control_tasks: rank >= role_rank("researcher"),
         can_govern_facts: rank >= role_rank("reviewer"),
@@ -1438,13 +1896,14 @@ async fn board(
 async fn revise_problem(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
+    Extension(actor): Extension<Actor>,
     headers: HeaderMap,
     Json(body): Json<ProblemRevisionRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let key = idempotency_key(&headers)?;
-    let actor = authorize_actor(
+    authorize_actor(
         state.service.store(),
-        &headers,
+        &actor,
         Some(&project_id),
         "revise_problem_contract",
         "project",
@@ -1473,13 +1932,14 @@ async fn revise_problem(
 async fn propose_route(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
+    Extension(actor): Extension<Actor>,
     headers: HeaderMap,
     Json(body): Json<HumanRouteProposalRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let key = idempotency_key(&headers)?;
-    let actor = authorize_actor(
+    authorize_actor(
         state.service.store(),
-        &headers,
+        &actor,
         Some(&project_id),
         "propose_route",
         "project",
@@ -1490,6 +1950,56 @@ async fn propose_route(
     let result = state
         .service
         .propose_human_route(&project_id, &body, &actor.actor_id, &key)
+        .await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ApiEnvelope {
+            data: Some(result.data),
+            meta: ResponseMeta {
+                request_id: request_id(),
+                project_revision: Some(result.project_revision),
+                event_cursor: Some(result.event_cursor),
+            },
+            error: None,
+        }),
+    ))
+}
+
+async fn create_human_route(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Extension(actor): Extension<Actor>,
+    headers: HeaderMap,
+    Json(body): Json<HumanRouteCreateRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let key = idempotency_key(&headers)?;
+    authorize_actor(
+        state.service.store(),
+        &actor,
+        Some(&project_id),
+        "create_human_route",
+        "project",
+        &project_id,
+        "researcher",
+    )
+    .await?;
+    let result = state
+        .service
+        .create_human_route(&project_id, &body, &actor.actor_id, &key)
+        .await?;
+    state
+        .service
+        .store()
+        .record_security_audit(
+            Some(&project_id),
+            Some(&actor.actor_id),
+            "create_human_route",
+            "route",
+            &result.data.route_id,
+            "allowed",
+            Some(&body.reason),
+            Some(&key),
+        )
         .await?;
     Ok((
         StatusCode::ACCEPTED,
@@ -1770,6 +2280,26 @@ async fn bottlenecks(
     Ok(Json(success(&state.service, &project_id, data).await?))
 }
 
+async fn proof_obligations(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<ApiEnvelope<research_domain::ProofObligationGraph>>, ApiError> {
+    let (data, project_revision, event_cursor) = state
+        .service
+        .store()
+        .proof_obligation_graph_snapshot(&project_id)
+        .await?;
+    Ok(Json(ApiEnvelope {
+        data: Some(data),
+        meta: ResponseMeta {
+            request_id: request_id(),
+            project_revision: Some(project_revision),
+            event_cursor: Some(event_cursor),
+        },
+        error: None,
+    }))
+}
+
 async fn fact_planning_impact(
     State(state): State<AppState>,
     Path((project_id, fact_id)): Path<(String, String)>,
@@ -1829,13 +2359,13 @@ async fn state_writer_status(
 
 async fn run_reconciliation(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Extension(actor): Extension<Actor>,
     Json(body): Json<ReconciliationRequest>,
 ) -> Result<Json<ApiEnvelope<Value>>, ApiError> {
     let target_id = body.project_id.as_deref().unwrap_or("system");
-    let actor = authorize_actor(
+    authorize_actor(
         state.service.store(),
-        &headers,
+        &actor,
         body.project_id.as_deref(),
         "run_reconciliation",
         "system",
@@ -2155,7 +2685,8 @@ const fn default_proof_tree_limit() -> u32 {
     50
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProofHintScope {
     #[serde(default)]
     goal_id: Option<String>,
@@ -2163,7 +2694,8 @@ struct ProofHintScope {
     proof_node_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProofHintRequest {
     kind: String,
     content: String,
@@ -2180,7 +2712,8 @@ fn default_human_author() -> String {
     "human".into()
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProofSearchCommandRequest {
     expected_cancellation_epoch: i64,
     #[serde(default = "default_human_author")]
@@ -2380,6 +2913,7 @@ async fn formalization_attempts(
 async fn add_formalization_hint(
     State(state): State<AppState>,
     Path(formalization_id): Path<String>,
+    Extension(actor): Extension<Actor>,
     headers: HeaderMap,
     Json(request): Json<ProofHintRequest>,
 ) -> Result<(StatusCode, Json<ApiEnvelope<research_domain::ProofHint>>), ApiError> {
@@ -2394,9 +2928,9 @@ async fn add_formalization_hint(
         .store()
         .get_verification_case(&formalization.case_id)
         .await?;
-    let actor = authorize_actor(
+    authorize_actor(
         state.service.store(),
-        &headers,
+        &actor,
         Some(&case.project_id),
         "add_proof_hint",
         "formalization",
@@ -2452,6 +2986,7 @@ async fn add_formalization_hint(
 async fn prune_formalization_branch(
     State(state): State<AppState>,
     Path((formalization_id, node_id)): Path<(String, String)>,
+    Extension(actor): Extension<Actor>,
     headers: HeaderMap,
     Json(request): Json<ProofSearchCommandRequest>,
 ) -> Result<(StatusCode, Json<ApiEnvelope<research_domain::ProofSearch>>), ApiError> {
@@ -2466,9 +3001,9 @@ async fn prune_formalization_branch(
         .store()
         .get_verification_case(&formalization.case_id)
         .await?;
-    let actor = authorize_actor(
+    authorize_actor(
         state.service.store(),
-        &headers,
+        &actor,
         Some(&case.project_id),
         "prune_proof_branch",
         "proof_node",
@@ -2514,6 +3049,7 @@ async fn prune_formalization_branch(
 async fn cancel_formalization_search(
     State(state): State<AppState>,
     Path(formalization_id): Path<String>,
+    Extension(actor): Extension<Actor>,
     headers: HeaderMap,
     Json(request): Json<ProofSearchCommandRequest>,
 ) -> Result<(StatusCode, Json<ApiEnvelope<research_domain::ProofSearch>>), ApiError> {
@@ -2528,9 +3064,9 @@ async fn cancel_formalization_search(
         .store()
         .get_verification_case(&formalization.case_id)
         .await?;
-    let actor = authorize_actor(
+    authorize_actor(
         state.service.store(),
-        &headers,
+        &actor,
         Some(&case.project_id),
         "cancel_proof_search",
         "formalization",
@@ -2583,11 +3119,11 @@ async fn fact(
 
 async fn fact_catalog(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Extension(actor): Extension<Actor>,
 ) -> Result<Json<ApiEnvelope<Vec<Value>>>, ApiError> {
     authorize_actor(
         state.service.store(),
-        &headers,
+        &actor,
         None,
         "list_fact_catalog",
         "fact_catalog",
@@ -2610,6 +3146,7 @@ async fn fact_catalog(
 async fn import_fact(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
+    Extension(actor): Extension<Actor>,
     headers: HeaderMap,
     Json(body): Json<ImportFactRequest>,
 ) -> Result<
@@ -2620,9 +3157,9 @@ async fn import_fact(
     ApiError,
 > {
     let key = idempotency_key(&headers)?;
-    let actor = authorize_actor(
+    authorize_actor(
         state.service.store(),
-        &headers,
+        &actor,
         Some(&project_id),
         "import_fact",
         "project",
@@ -2714,6 +3251,7 @@ async fn fact_dependency_closure(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FactGovernanceRequest {
     reason: String,
 }
@@ -2721,11 +3259,11 @@ struct FactGovernanceRequest {
 async fn security_audit(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
-    headers: HeaderMap,
+    Extension(actor): Extension<Actor>,
 ) -> Result<Json<ApiEnvelope<Vec<research_domain::SecurityAuditEntry>>>, ApiError> {
     authorize_actor(
         state.service.store(),
-        &headers,
+        &actor,
         Some(&project_id),
         "read_security_audit",
         "project",
@@ -2749,15 +3287,16 @@ type FactGovernanceResponse = (
 async fn govern_fact_command(
     state: AppState,
     fact_id: String,
+    actor: Actor,
     headers: HeaderMap,
     body: FactGovernanceRequest,
     action: &'static str,
 ) -> Result<FactGovernanceResponse, ApiError> {
     let key = idempotency_key(&headers)?;
     let fact = state.service.store().get_fact(&fact_id).await?;
-    let actor = authorize_actor(
+    authorize_actor(
         state.service.store(),
-        &headers,
+        &actor,
         Some(&fact.project_id),
         action,
         "fact",
@@ -2799,10 +3338,11 @@ macro_rules! fact_governance_handler {
         async fn $name(
             State(state): State<AppState>,
             Path(fact_id): Path<String>,
+            Extension(actor): Extension<Actor>,
             headers: HeaderMap,
             Json(body): Json<FactGovernanceRequest>,
         ) -> Result<FactGovernanceResponse, ApiError> {
-            govern_fact_command(state, fact_id, headers, body, $action).await
+            govern_fact_command(state, fact_id, actor, headers, body, $action).await
         }
     };
 }
@@ -2901,47 +3441,83 @@ type CommandResponse = (StatusCode, Json<ApiEnvelope<research_domain::HumanComma
 async fn start_project(
     state: State<AppState>,
     path: Path<String>,
+    Extension(actor): Extension<Actor>,
     headers: HeaderMap,
     body: Json<CommandRequest>,
 ) -> Result<CommandResponse, ApiError> {
-    project_command(state, path, headers, body, "start_project").await
+    project_command(state, path, actor, headers, body, "start_project").await
 }
 async fn pause_project(
     state: State<AppState>,
     path: Path<String>,
+    Extension(actor): Extension<Actor>,
     headers: HeaderMap,
     body: Json<CommandRequest>,
 ) -> Result<CommandResponse, ApiError> {
-    project_command(state, path, headers, body, "pause_project").await
+    project_command(state, path, actor, headers, body, "pause_project").await
 }
 async fn resume_project(
     state: State<AppState>,
     path: Path<String>,
+    Extension(actor): Extension<Actor>,
     headers: HeaderMap,
     body: Json<CommandRequest>,
 ) -> Result<CommandResponse, ApiError> {
-    project_command(state, path, headers, body, "resume_project").await
+    project_command(state, path, actor, headers, body, "resume_project").await
 }
 async fn stop_project(
     state: State<AppState>,
     path: Path<String>,
+    Extension(actor): Extension<Actor>,
     headers: HeaderMap,
     body: Json<CommandRequest>,
 ) -> Result<CommandResponse, ApiError> {
-    project_command(state, path, headers, body, "stop_project").await
+    project_command(state, path, actor, headers, body, "stop_project").await
 }
 async fn replan(
     state: State<AppState>,
     path: Path<String>,
+    Extension(actor): Extension<Actor>,
     headers: HeaderMap,
     body: Json<CommandRequest>,
 ) -> Result<CommandResponse, ApiError> {
-    project_command(state, path, headers, body, "trigger_replan").await
+    project_command(state, path, actor, headers, body, "trigger_replan").await
+}
+
+async fn goal_review(
+    state: State<AppState>,
+    path: Path<String>,
+    Extension(actor): Extension<Actor>,
+    headers: HeaderMap,
+    body: Json<CommandRequest>,
+) -> Result<CommandResponse, ApiError> {
+    project_command(state, path, actor, headers, body, "goal_review").await
+}
+
+async fn review_policy(
+    state: State<AppState>,
+    path: Path<String>,
+    Extension(actor): Extension<Actor>,
+    headers: HeaderMap,
+    body: Json<CommandRequest>,
+) -> Result<CommandResponse, ApiError> {
+    project_command(state, path, actor, headers, body, "review_policy").await
+}
+
+async fn research_settings(
+    state: State<AppState>,
+    path: Path<String>,
+    Extension(actor): Extension<Actor>,
+    headers: HeaderMap,
+    body: Json<CommandRequest>,
+) -> Result<CommandResponse, ApiError> {
+    project_command(state, path, actor, headers, body, "research_settings").await
 }
 
 async fn create_human_task(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
+    Extension(actor): Extension<Actor>,
     headers: HeaderMap,
     Json(body): Json<CommandRequest>,
 ) -> Result<CommandResponse, ApiError> {
@@ -2949,6 +3525,7 @@ async fn create_human_task(
         &state.service,
         &project_id,
         &headers,
+        &actor,
         body,
         "create_task",
         "project",
@@ -2961,6 +3538,7 @@ async fn create_human_task(
 async fn adjust_budget(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
+    Extension(actor): Extension<Actor>,
     headers: HeaderMap,
     Json(body): Json<CommandRequest>,
 ) -> Result<CommandResponse, ApiError> {
@@ -2968,6 +3546,7 @@ async fn adjust_budget(
         &state.service,
         &project_id,
         &headers,
+        &actor,
         body,
         "adjust_budget",
         "project",
@@ -2980,6 +3559,7 @@ async fn adjust_budget(
 async fn answer_question(
     State(state): State<AppState>,
     Path((project_id, question_id)): Path<(String, String)>,
+    Extension(actor): Extension<Actor>,
     headers: HeaderMap,
     Json(body): Json<CommandRequest>,
 ) -> Result<CommandResponse, ApiError> {
@@ -2987,6 +3567,7 @@ async fn answer_question(
         &state.service,
         &project_id,
         &headers,
+        &actor,
         body,
         "answer_question",
         "human_question",
@@ -2999,6 +3580,7 @@ async fn answer_question(
 async fn task_command(
     State(state): State<AppState>,
     Path((project_id, task_id)): Path<(String, String)>,
+    actor: Actor,
     headers: HeaderMap,
     Json(body): Json<CommandRequest>,
     command_type: &'static str,
@@ -3008,6 +3590,7 @@ async fn task_command(
         &state.service,
         &project_id,
         &headers,
+        &actor,
         body,
         command_type,
         "task",
@@ -3022,10 +3605,11 @@ macro_rules! task_command_handler {
         async fn $name(
             state: State<AppState>,
             path: Path<(String, String)>,
+            Extension(actor): Extension<Actor>,
             headers: HeaderMap,
             body: Json<CommandRequest>,
         ) -> Result<CommandResponse, ApiError> {
-            task_command(state, path, headers, body, $command, $mode).await
+            task_command(state, path, actor, headers, body, $command, $mode).await
         }
     };
 }
@@ -3050,6 +3634,7 @@ task_command_handler!(
 async fn rebuild_task_context_by_task(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
+    Extension(actor): Extension<Actor>,
     headers: HeaderMap,
     Json(body): Json<CommandRequest>,
 ) -> Result<CommandResponse, ApiError> {
@@ -3062,6 +3647,7 @@ async fn rebuild_task_context_by_task(
         &state.service,
         &packet.project_id,
         &headers,
+        &actor,
         body,
         "rebuild_task_context",
         "task",
@@ -3074,6 +3660,7 @@ async fn rebuild_task_context_by_task(
 async fn project_command(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
+    actor: Actor,
     headers: HeaderMap,
     Json(body): Json<CommandRequest>,
     command_type: &'static str,
@@ -3082,6 +3669,7 @@ async fn project_command(
         &state.service,
         &project_id,
         &headers,
+        &actor,
         body,
         command_type,
         "project",
@@ -3094,55 +3682,62 @@ async fn project_command(
 async fn pause_route(
     state: State<AppState>,
     path: Path<(String, String)>,
+    Extension(actor): Extension<Actor>,
     headers: HeaderMap,
     body: Json<CommandRequest>,
 ) -> Result<CommandResponse, ApiError> {
-    route_command(state, path, headers, body, "pause_route").await
+    route_command(state, path, actor, headers, body, "pause_route").await
 }
 async fn resume_route(
     state: State<AppState>,
     path: Path<(String, String)>,
+    Extension(actor): Extension<Actor>,
     headers: HeaderMap,
     body: Json<CommandRequest>,
 ) -> Result<CommandResponse, ApiError> {
-    route_command(state, path, headers, body, "resume_route").await
+    route_command(state, path, actor, headers, body, "resume_route").await
 }
 async fn stop_route(
     state: State<AppState>,
     path: Path<(String, String)>,
+    Extension(actor): Extension<Actor>,
     headers: HeaderMap,
     body: Json<CommandRequest>,
 ) -> Result<CommandResponse, ApiError> {
-    route_command(state, path, headers, body, "stop_route").await
+    route_command(state, path, actor, headers, body, "stop_route").await
 }
 async fn approve_route(
     state: State<AppState>,
     path: Path<(String, String)>,
+    Extension(actor): Extension<Actor>,
     headers: HeaderMap,
     body: Json<CommandRequest>,
 ) -> Result<CommandResponse, ApiError> {
-    route_command(state, path, headers, body, "approve_route").await
+    route_command(state, path, actor, headers, body, "approve_route").await
 }
 async fn prune_route(
     state: State<AppState>,
     path: Path<(String, String)>,
+    Extension(actor): Extension<Actor>,
     headers: HeaderMap,
     body: Json<CommandRequest>,
 ) -> Result<CommandResponse, ApiError> {
-    route_command(state, path, headers, body, "prune_route").await
+    route_command(state, path, actor, headers, body, "prune_route").await
 }
 async fn revive_route(
     state: State<AppState>,
     path: Path<(String, String)>,
+    Extension(actor): Extension<Actor>,
     headers: HeaderMap,
     body: Json<CommandRequest>,
 ) -> Result<CommandResponse, ApiError> {
-    route_command(state, path, headers, body, "revive_route").await
+    route_command(state, path, actor, headers, body, "revive_route").await
 }
 
 async fn merge_routes(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
+    Extension(actor): Extension<Actor>,
     headers: HeaderMap,
     Json(body): Json<CommandRequest>,
 ) -> Result<CommandResponse, ApiError> {
@@ -3150,6 +3745,7 @@ async fn merge_routes(
         &state.service,
         &project_id,
         &headers,
+        &actor,
         body,
         "merge_routes",
         "project",
@@ -3162,6 +3758,7 @@ async fn merge_routes(
 async fn route_command(
     State(state): State<AppState>,
     Path((project_id, route_id)): Path<(String, String)>,
+    actor: Actor,
     headers: HeaderMap,
     Json(body): Json<CommandRequest>,
     command_type: &'static str,
@@ -3170,6 +3767,7 @@ async fn route_command(
         &state.service,
         &project_id,
         &headers,
+        &actor,
         body,
         command_type,
         "route",
@@ -3182,6 +3780,7 @@ async fn route_command(
 async fn stop_worker(
     State(state): State<AppState>,
     Path((project_id, worker_id)): Path<(String, String)>,
+    Extension(actor): Extension<Actor>,
     headers: HeaderMap,
     Json(body): Json<CommandRequest>,
 ) -> Result<CommandResponse, ApiError> {
@@ -3189,6 +3788,7 @@ async fn stop_worker(
         &state.service,
         &project_id,
         &headers,
+        &actor,
         body,
         "stop_worker",
         "worker",
@@ -3201,6 +3801,7 @@ async fn stop_worker(
 async fn pause_worker(
     State(state): State<AppState>,
     Path((project_id, worker_id)): Path<(String, String)>,
+    Extension(actor): Extension<Actor>,
     headers: HeaderMap,
     Json(body): Json<CommandRequest>,
 ) -> Result<CommandResponse, ApiError> {
@@ -3208,6 +3809,7 @@ async fn pause_worker(
         &state.service,
         &project_id,
         &headers,
+        &actor,
         body,
         "pause_worker",
         "worker",
@@ -3220,6 +3822,7 @@ async fn pause_worker(
 async fn resume_worker(
     State(state): State<AppState>,
     Path((project_id, worker_id)): Path<(String, String)>,
+    Extension(actor): Extension<Actor>,
     headers: HeaderMap,
     Json(body): Json<CommandRequest>,
 ) -> Result<CommandResponse, ApiError> {
@@ -3227,6 +3830,7 @@ async fn resume_worker(
         &state.service,
         &project_id,
         &headers,
+        &actor,
         body,
         "resume_worker",
         "worker",
@@ -3239,6 +3843,7 @@ async fn resume_worker(
 async fn quarantine_worker_instance(
     State(state): State<AppState>,
     Path((project_id, worker_instance_id)): Path<(String, String)>,
+    Extension(actor): Extension<Actor>,
     headers: HeaderMap,
     Json(body): Json<CommandRequest>,
 ) -> Result<CommandResponse, ApiError> {
@@ -3246,6 +3851,7 @@ async fn quarantine_worker_instance(
         &state.service,
         &project_id,
         &headers,
+        &actor,
         body,
         "quarantine_worker_instance",
         "worker_instance",
@@ -3258,6 +3864,7 @@ async fn quarantine_worker_instance(
 async fn add_suggestion(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
+    Extension(actor): Extension<Actor>,
     headers: HeaderMap,
     Json(body): Json<SuggestionRequest>,
 ) -> Result<CommandResponse, ApiError> {
@@ -3270,6 +3877,7 @@ async fn add_suggestion(
         &state.service,
         &project_id,
         &headers,
+        &actor,
         command_body,
         "add_suggestion",
         "project",
@@ -3283,6 +3891,7 @@ async fn issue_command(
     service: &ResearchService,
     project_id: &str,
     headers: &HeaderMap,
+    actor: &Actor,
     body: CommandRequest,
     command_type: &str,
     target_kind: &str,
@@ -3290,9 +3899,9 @@ async fn issue_command(
     mode: CommandMode,
 ) -> Result<CommandResponse, ApiError> {
     let key = idempotency_key(headers)?;
-    let actor = authorize_actor(
+    authorize_actor(
         service.store(),
-        headers,
+        actor,
         Some(project_id),
         command_type,
         target_kind,
@@ -3338,13 +3947,14 @@ async fn issue_command(
 async fn submit_candidate(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
+    Extension(actor): Extension<Actor>,
     headers: HeaderMap,
     Json(body): Json<CandidateSubmission>,
 ) -> Result<impl IntoResponse, ApiError> {
     let key = idempotency_key(&headers)?;
-    let actor = authorize_actor(
+    authorize_actor(
         state.service.store(),
-        &headers,
+        &actor,
         Some(&project_id),
         "submit_candidate",
         "project",
@@ -3382,11 +3992,11 @@ async fn websocket_events(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
     Query(query): Query<EventQuery>,
-    headers: HeaderMap,
+    Extension(actor): Extension<Actor>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize_actor(
         state.service.store(),
-        &headers,
+        &actor,
         Some(&project_id),
         "subscribe_websocket",
         "project",
@@ -3536,6 +4146,18 @@ async fn success<T: Serialize>(
     })
 }
 
+fn unscoped_success<T: Serialize>(data: T) -> ApiEnvelope<T> {
+    ApiEnvelope {
+        data: Some(data),
+        meta: ResponseMeta {
+            request_id: request_id(),
+            project_revision: None,
+            event_cursor: None,
+        },
+        error: None,
+    }
+}
+
 fn idempotency_key(headers: &HeaderMap) -> Result<String, ApiError> {
     headers
         .get("Idempotency-Key")
@@ -3553,17 +4175,9 @@ fn worker_node_token(headers: &HeaderMap) -> Result<&str, ApiError> {
         .ok_or_else(|| ApiError::unauthorized("X-Worker-Token header is required"))
 }
 
-async fn authorize_actor(
-    store: &SqliteStore,
-    headers: &HeaderMap,
-    project_id: Option<&str>,
-    action: &str,
-    target_kind: &str,
-    target_id: &str,
-    minimum_role: &str,
-) -> Result<research_domain::Actor, ApiError> {
+async fn authenticate_actor(store: &SqliteStore, headers: &HeaderMap) -> Result<Actor, ApiError> {
     if store.actor_count().await? == 0 {
-        return Ok(research_domain::Actor {
+        return Ok(Actor {
             actor_id: "local-unconfigured-admin".into(),
             display_name: "Local unconfigured administrator".into(),
             role: "admin".into(),
@@ -3583,7 +4197,7 @@ async fn authorize_actor(
             retryable: false,
         })?;
     let token = headers
-        .get(http::header::AUTHORIZATION)
+        .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .filter(|value| !value.is_empty())
@@ -3594,7 +4208,7 @@ async fn authorize_actor(
             details: json!({}),
             retryable: false,
         })?;
-    let actor = store
+    store
         .authenticate_actor(actor_id, token)
         .await
         .map_err(|_| ApiError {
@@ -3603,7 +4217,18 @@ async fn authorize_actor(
             message: "actor credentials are invalid".into(),
             details: json!({}),
             retryable: false,
-        })?;
+        })
+}
+
+async fn authorize_actor(
+    store: &SqliteStore,
+    actor: &Actor,
+    project_id: Option<&str>,
+    action: &str,
+    target_kind: &str,
+    target_id: &str,
+    minimum_role: &str,
+) -> Result<(), ApiError> {
     if role_rank(&actor.role) < role_rank(minimum_role) {
         store
             .record_security_audit(
@@ -3625,7 +4250,7 @@ async fn authorize_actor(
             retryable: false,
         });
     }
-    Ok(actor)
+    Ok(())
 }
 
 fn role_rank(role: &str) -> u8 {
@@ -3646,6 +4271,8 @@ fn command_minimum_role(command_type: &str) -> &'static str {
         | "pause_worker"
         | "resume_worker"
         | "adjust_budget"
+        | "review_policy"
+        | "research_settings"
         | "cancel_task"
         | "prune_route"
         | "merge_routes"
@@ -3662,662 +4289,12 @@ fn request_id() -> String {
 #[must_use]
 pub fn openapi_document() -> Value {
     let mut paths = serde_json::Map::new();
-    let entries = [
-        (
-            "/api/v1/actors/bootstrap",
-            "post",
-            "Bootstrap the first administrator",
-        ),
-        (
-            "/api/v1/actors",
-            "post",
-            "Create a local actor and access token",
-        ),
-        (
-            "/api/v1/worker-nodes",
-            "post",
-            "Register a distributed worker node",
-        ),
-        (
-            "/api/v1/worker-nodes/{node_id}/heartbeat",
-            "post",
-            "Authenticate and heartbeat a worker node epoch",
-        ),
-        (
-            "/api/v1/projects/{project_id}/distributed/leases/next",
-            "post",
-            "Lease the next capability-compatible task",
-        ),
-        ("/api/v1/task-leases/{lease_id}", "get", "Get a task lease"),
-        (
-            "/api/v1/task-leases/{lease_id}/renew",
-            "post",
-            "Renew an active task lease with epoch checks",
-        ),
-        (
-            "/api/v1/task-leases/{lease_id}/complete",
-            "post",
-            "Commit remote worker output with stale-result rejection",
-        ),
-        ("/api/v1/projects", "post", "Create project"),
-        ("/api/v1/projects/{project_id}", "get", "Get project"),
-        (
-            "/api/v1/projects/{project_id}/publications",
-            "get",
-            "List idempotent publication runs",
-        ),
-        (
-            "/api/v1/projects/{project_id}/publications",
-            "post",
-            "Create or replay a revision-pinned publication run",
-        ),
-        (
-            "/api/v1/publications/{publication_id}",
-            "get",
-            "Get a publication run",
-        ),
-        (
-            "/api/v1/projects/{project_id}/goals/{goal_id}/closures",
-            "get",
-            "List auditable Goal Completion evidence",
-        ),
-        (
-            "/api/v1/projects/{project_id}/status",
-            "get",
-            "Get aggregate status",
-        ),
-        (
-            "/api/v1/projects/{project_id}/snapshot",
-            "get",
-            "Get consistent snapshot",
-        ),
-        (
-            "/api/v1/projects/{project_id}/board",
-            "get",
-            "Get the atomic MathCat Lab board projection",
-        ),
-        (
-            "/api/v1/projects/{project_id}/problem-revisions",
-            "post",
-            "Create an auditable problem-contract revision and invalidate stale work",
-        ),
-        (
-            "/api/v1/projects/{project_id}/route-proposals",
-            "get",
-            "List auditable human route proposals",
-        ),
-        (
-            "/api/v1/projects/{project_id}/route-proposals",
-            "post",
-            "Propose a route for Planner validation",
-        ),
-        (
-            "/api/v1/projects/{project_id}/latest",
-            "get",
-            "Get latest report metadata",
-        ),
-        ("/api/v1/projects/{project_id}/rounds", "get", "List rounds"),
-        (
-            "/api/v1/projects/{project_id}/rounds/current",
-            "get",
-            "Get current round",
-        ),
-        (
-            "/api/v1/projects/{project_id}/workers",
-            "get",
-            "List workers",
-        ),
-        (
-            "/api/v1/projects/{project_id}/workers/{worker_id}",
-            "get",
-            "Get worker",
-        ),
-        ("/api/v1/projects/{project_id}/tasks", "get", "List tasks"),
-        (
-            "/api/v1/projects/{project_id}/tasks",
-            "post",
-            "Create a human-assigned task",
-        ),
-        (
-            "/api/v1/projects/{project_id}/tasks/{task_id}",
-            "get",
-            "Get task",
-        ),
-        (
-            "/api/v1/projects/{project_id}/tasks/{task_id}/attempts",
-            "get",
-            "List bounded task attempts and failure signatures",
-        ),
-        (
-            "/api/v1/projects/{project_id}/tasks/{task_id}/contract",
-            "get",
-            "Get the immutable task contract",
-        ),
-        (
-            "/api/v1/tasks/{task_id}/context-packet",
-            "get",
-            "Get the exact context packet delivered to a worker",
-        ),
-        (
-            "/api/v1/projects/{project_id}/tasks/{task_id}/steers",
-            "get",
-            "List queued and applied task steering",
-        ),
-        (
-            "/api/v1/projects/{project_id}/tasks/{task_id}/commands/steer",
-            "post",
-            "Queue task guidance for the next safe point",
-        ),
-        (
-            "/api/v1/projects/{project_id}/tasks/{task_id}/commands/pause",
-            "post",
-            "Pause a task",
-        ),
-        (
-            "/api/v1/projects/{project_id}/tasks/{task_id}/commands/resume",
-            "post",
-            "Resume a task",
-        ),
-        (
-            "/api/v1/projects/{project_id}/tasks/{task_id}/commands/reassign",
-            "post",
-            "Reassign a task",
-        ),
-        (
-            "/api/v1/projects/{project_id}/tasks/{task_id}/commands/cancel",
-            "post",
-            "Cancel a task and reject stale output",
-        ),
-        (
-            "/api/v1/projects/{project_id}/tasks/{task_id}/commands/set-priority",
-            "post",
-            "Change task priority",
-        ),
-        (
-            "/api/v1/projects/{project_id}/tasks/{task_id}/commands/retry",
-            "post",
-            "Queue a bounded retry under the task retry policy",
-        ),
-        (
-            "/api/v1/projects/{project_id}/tasks/{task_id}/commands/rebuild-context",
-            "post",
-            "Rebuild an invalid task context as a new immutable packet and contract version",
-        ),
-        (
-            "/api/v1/tasks/{task_id}/commands/rebuild-context",
-            "post",
-            "Rebuild task context using the architecture-compatible task-scoped path",
-        ),
-        ("/api/v1/projects/{project_id}/routes", "get", "List routes"),
-        (
-            "/api/v1/projects/{project_id}/routes/{route_id}/commands/approve",
-            "post",
-            "Approve budget eligibility for a route when human approval is enabled",
-        ),
-        (
-            "/api/v1/projects/{project_id}/routes/{route_id}",
-            "get",
-            "Get route",
-        ),
-        (
-            "/api/v1/projects/{project_id}/route-families",
-            "get",
-            "List semantic route families and canonical routes",
-        ),
-        (
-            "/api/v1/projects/{project_id}/route-tombstones",
-            "get",
-            "List pruned route fingerprints and revival conditions",
-        ),
-        (
-            "/api/v1/projects/{project_id}/routes/{route_id}/progress-ledger",
-            "get",
-            "List material route progress entries",
-        ),
-        (
-            "/api/v1/routes/{route_id}/progress-digest",
-            "get",
-            "Get a provenance-aware route progress digest",
-        ),
-        (
-            "/api/v1/projects/{project_id}/worker-instances",
-            "get",
-            "List worker process instances, handshakes, and health",
-        ),
-        (
-            "/api/v1/projects/{project_id}/planning/delta",
-            "get",
-            "Get the current or most recently consumed research delta",
-        ),
-        (
-            "/api/v1/projects/{project_id}/planning/revisions",
-            "get",
-            "List atomic plan revisions",
-        ),
-        (
-            "/api/v1/projects/{project_id}/planning/revisions/{plan_revision_id}",
-            "get",
-            "Get route, fact, bottleneck, and task decisions for one plan revision",
-        ),
-        (
-            "/api/v1/projects/{project_id}/strategy/states",
-            "get",
-            "List immutable Strategy Director states and macro audits",
-        ),
-        (
-            "/api/v1/projects/{project_id}/strategy/latest",
-            "get",
-            "Get the latest whole-proof strategy state",
-        ),
-        (
-            "/api/v1/projects/{project_id}/bottlenecks",
-            "get",
-            "List the persistent bottleneck register",
-        ),
-        (
-            "/api/v1/projects/{project_id}/facts/{fact_id}/planning-impact",
-            "get",
-            "Explain how planning consumed or deferred a fact",
-        ),
-        (
-            "/api/v1/projects/{project_id}/planner/health",
-            "get",
-            "Get planner circuit-breaker and degraded-mode health",
-        ),
-        (
-            "/api/v1/projects/{project_id}/context/digest",
-            "get",
-            "Get the provenance-aware project planning digest",
-        ),
-        (
-            "/api/v1/system/storage/health",
-            "get",
-            "Get state queue, outbox, lease, and reconciliation health",
-        ),
-        (
-            "/api/v1/system/state-writer/status",
-            "get",
-            "Get bounded SQLite StateWriter status",
-        ),
-        (
-            "/api/v1/system/reconciliation/commands/run",
-            "post",
-            "Run an authorized consistency reconciliation scan",
-        ),
-        (
-            "/api/v1/projects/{project_id}/graphs/{graph_type}",
-            "get",
-            "Get goal, hypothesis, fact, or six-kind combined graph",
-        ),
-        (
-            "/api/v1/projects/{project_id}/graphs/combined/delta",
-            "get",
-            "Recover a snapshot-assisted combined graph delta from an event cursor",
-        ),
-        (
-            "/api/v1/projects/{project_id}/verifications",
-            "get",
-            "List verifications",
-        ),
-        (
-            "/api/v1/verifications/{verification_id}",
-            "get",
-            "Get verification",
-        ),
-        (
-            "/api/v1/verifications/{verification_id}/case",
-            "get",
-            "Get trusted verification case",
-        ),
-        (
-            "/api/v1/verification-cases/{case_id}",
-            "get",
-            "Get verification case with policy and evidence",
-        ),
-        (
-            "/api/v1/verification-cases/{case_id}/snapshot",
-            "get",
-            "Get immutable verification snapshot",
-        ),
-        (
-            "/api/v1/verification-cases/{case_id}/checks",
-            "get",
-            "List verification checks",
-        ),
-        (
-            "/api/v1/verification-cases/{case_id}/findings",
-            "get",
-            "List verification findings",
-        ),
-        (
-            "/api/v1/verification-cases/{case_id}/evidence",
-            "get",
-            "List verification evidence",
-        ),
-        (
-            "/api/v1/verification-cases/{case_id}/semantic-contract",
-            "get",
-            "Get semantic contract",
-        ),
-        (
-            "/api/v1/verification-cases/{case_id}/formalization",
-            "get",
-            "Get Lean formalization",
-        ),
-        (
-            "/api/v1/verification-cases/{case_id}/alignment-reviews",
-            "get",
-            "List semantic alignment reviews",
-        ),
-        (
-            "/api/v1/verification-cases/{case_id}/backend-runs",
-            "get",
-            "List verification backend runs",
-        ),
-        (
-            "/api/v1/verification-cases/{case_id}/package",
-            "get",
-            "Get content-addressed verification package",
-        ),
-        (
-            "/api/v1/verification-cases/{case_id}/replays",
-            "get",
-            "List independent replays",
-        ),
-        (
-            "/api/v1/formalizations/{formalization_id}",
-            "get",
-            "Get formalization and current source",
-        ),
-        (
-            "/api/v1/formalizations/{formalization_id}/semantic-contract",
-            "get",
-            "Get formalization semantic contract",
-        ),
-        (
-            "/api/v1/formalizations/{formalization_id}/alignment",
-            "get",
-            "Get formalization alignment reviews",
-        ),
-        (
-            "/api/v1/formalizations/{formalization_id}/goals",
-            "get",
-            "List current open Pantograph goals",
-        ),
-        (
-            "/api/v1/formalizations/{formalization_id}/proof-tree",
-            "get",
-            "Page through proof tree nodes and edges",
-        ),
-        (
-            "/api/v1/formalizations/{formalization_id}/attempts",
-            "get",
-            "List visible tactic attempts",
-        ),
-        (
-            "/api/v1/formalizations/{formalization_id}/hints",
-            "post",
-            "Add a hint for the next proof-node expansion",
-        ),
-        (
-            "/api/v1/formalizations/{formalization_id}/proof-nodes/{node_id}/commands/prune",
-            "post",
-            "Prune a proof branch immediately",
-        ),
-        (
-            "/api/v1/formalizations/{formalization_id}/commands/cancel",
-            "post",
-            "Cancel an interactive proof search",
-        ),
-        (
-            "/api/v1/projects/{project_id}/uncertainties",
-            "get",
-            "List uncertainties",
-        ),
-        (
-            "/api/v1/projects/{project_id}/sources",
-            "get",
-            "List unverified source leads",
-        ),
-        (
-            "/api/v1/projects/{project_id}/sources/ingestions",
-            "get",
-            "List source insertion, deduplication, and rejection provenance",
-        ),
-        (
-            "/api/v1/projects/{project_id}/experiment-capsules",
-            "get",
-            "List content-addressed unverified experiment capsules",
-        ),
-        (
-            "/api/v1/experiment-capsules/{capsule_id}",
-            "get",
-            "Get an exact experiment capsule and replay metadata",
-        ),
-        (
-            "/api/v1/projects/{project_id}/failure-patterns",
-            "get",
-            "List failure patterns",
-        ),
-        ("/api/v1/facts/{fact_id}", "get", "Get fact"),
-        (
-            "/api/v1/facts/catalog",
-            "get",
-            "List the global fact catalog",
-        ),
-        (
-            "/api/v1/projects/{project_id}/fact-imports",
-            "get",
-            "List cross-project fact imports",
-        ),
-        (
-            "/api/v1/projects/{project_id}/fact-imports",
-            "post",
-            "Import a fact and its complete assured dependency closure",
-        ),
-        (
-            "/api/v1/facts/{fact_id}/assurance",
-            "get",
-            "List current and historical fact assurances",
-        ),
-        (
-            "/api/v1/facts/{fact_id}/verification-history",
-            "get",
-            "List verification, challenge, replay, and assurance history",
-        ),
-        (
-            "/api/v1/facts/{fact_id}/formalization",
-            "get",
-            "Get the latest fact formalization",
-        ),
-        (
-            "/api/v1/facts/{fact_id}/dependency-closure",
-            "get",
-            "Get dependency closure with assurance levels",
-        ),
-        ("/api/v1/facts/{fact_id}/impact", "get", "Get fact impact"),
-        (
-            "/api/v1/facts/{fact_id}/commands/challenge",
-            "post",
-            "Challenge a fact and enqueue independent reverification",
-        ),
-        (
-            "/api/v1/facts/{fact_id}/commands/reverify",
-            "post",
-            "Reverify a fact without overwriting its assurance history",
-        ),
-        (
-            "/api/v1/facts/{fact_id}/commands/request-formalization",
-            "post",
-            "Request a fresh Lean formalization and certification",
-        ),
-        (
-            "/api/v1/facts/{fact_id}/commands/request-independent-proof",
-            "post",
-            "Request a separately snapshotted proof with an extra independent review",
-        ),
-        (
-            "/api/v1/facts/{fact_id}/commands/suspend",
-            "post",
-            "Suspend a fact and invalidate downstream use",
-        ),
-        (
-            "/api/v1/facts/{fact_id}/commands/revoke",
-            "post",
-            "Revoke a fact and apply dependency impact",
-        ),
-        (
-            "/api/v1/projects/{project_id}/events",
-            "get",
-            "Subscribe to SSE events",
-        ),
-        (
-            "/api/v1/projects/{project_id}/ws",
-            "get",
-            "Resume a bidirectional WebSocket event stream with heartbeat usage",
-        ),
-        (
-            "/api/v1/projects/{project_id}/security-audit",
-            "get",
-            "List append-only authorization decisions",
-        ),
-        (
-            "/api/v1/projects/{project_id}/artifacts",
-            "get",
-            "List artifacts",
-        ),
-        (
-            "/api/v1/projects/{project_id}/artifacts/{artifact_id}",
-            "get",
-            "Get artifact metadata",
-        ),
-        (
-            "/api/v1/projects/{project_id}/artifacts/{artifact_id}/content",
-            "get",
-            "Download artifact",
-        ),
-        (
-            "/api/v1/projects/{project_id}/reports/latest",
-            "get",
-            "Download latest report",
-        ),
-        (
-            "/api/v1/projects/{project_id}/commands/{command_id}",
-            "get",
-            "Get command status",
-        ),
-        (
-            "/api/v1/projects/{project_id}/commands/start",
-            "post",
-            "Start project",
-        ),
-        (
-            "/api/v1/projects/{project_id}/commands/pause",
-            "post",
-            "Pause project",
-        ),
-        (
-            "/api/v1/projects/{project_id}/commands/resume",
-            "post",
-            "Resume project",
-        ),
-        (
-            "/api/v1/projects/{project_id}/commands/stop",
-            "post",
-            "Stop project",
-        ),
-        (
-            "/api/v1/projects/{project_id}/commands/replan",
-            "post",
-            "Trigger replan",
-        ),
-        (
-            "/api/v1/projects/{project_id}/suggestions",
-            "post",
-            "Add next-round suggestion",
-        ),
-        (
-            "/api/v1/projects/{project_id}/routes/{route_id}/commands/pause",
-            "post",
-            "Pause route",
-        ),
-        (
-            "/api/v1/projects/{project_id}/routes/{route_id}/commands/resume",
-            "post",
-            "Resume route",
-        ),
-        (
-            "/api/v1/projects/{project_id}/routes/{route_id}/commands/stop",
-            "post",
-            "Stop route",
-        ),
-        (
-            "/api/v1/projects/{project_id}/routes/{route_id}/commands/prune",
-            "post",
-            "Prune and tombstone a route",
-        ),
-        (
-            "/api/v1/projects/{project_id}/routes/commands/merge",
-            "post",
-            "Merge duplicate routes into a canonical route",
-        ),
-        (
-            "/api/v1/projects/{project_id}/routes/{route_id}/commands/revive",
-            "post",
-            "Revive a tombstoned route with explicit evidence",
-        ),
-        (
-            "/api/v1/projects/{project_id}/workers/{worker_id}/commands/stop",
-            "post",
-            "Stop worker",
-        ),
-        (
-            "/api/v1/projects/{project_id}/workers/{worker_id}/commands/pause",
-            "post",
-            "Pause worker task intake",
-        ),
-        (
-            "/api/v1/projects/{project_id}/workers/{worker_id}/commands/resume",
-            "post",
-            "Resume worker task intake",
-        ),
-        (
-            "/api/v1/projects/{project_id}/worker-instances/{worker_instance_id}/commands/quarantine",
-            "post",
-            "Quarantine a faulty worker instance and expire its lease",
-        ),
-        (
-            "/api/v1/projects/{project_id}/usage",
-            "get",
-            "Get measured model-call and token usage",
-        ),
-        (
-            "/api/v1/projects/{project_id}/budgets",
-            "get",
-            "List scoped budget overrides",
-        ),
-        (
-            "/api/v1/projects/{project_id}/commands/adjust-budget",
-            "post",
-            "Adjust a scoped budget without dropping below consumed usage",
-        ),
-        (
-            "/api/v1/projects/{project_id}/questions",
-            "get",
-            "List proactive human clarification questions",
-        ),
-        (
-            "/api/v1/projects/{project_id}/questions/{question_id}/commands/answer",
-            "post",
-            "Answer a clarification question and resume affected work",
-        ),
-        (
-            "/api/v1/projects/{project_id}/candidates",
-            "post",
-            "Submit candidate claim",
-        ),
-    ];
-    for (path, method, summary) in entries {
+    for endpoint in ENDPOINT_DESCRIPTORS
+        .iter()
+        .filter(|endpoint| endpoint.documented)
+    {
+        let path = endpoint.path;
+        let method = endpoint.method.as_str();
         let mut parameters: Vec<Value> = path
             .split('/')
             .filter_map(|segment| {
@@ -4329,7 +4306,7 @@ pub fn openapi_document() -> Value {
                     })
             })
             .collect();
-        if path.ends_with("/board") {
+        if endpoint.response == EndpointResponse::Board {
             parameters.extend([
                 json!({"name":"timeline_limit","in":"query","required":false,"schema":{"type":"integer","minimum":0,"maximum":500,"default":100}}),
                 json!({"name":"include","in":"query","required":false,"schema":{"type":"string","default":"summary"}}),
@@ -4337,55 +4314,36 @@ pub fn openapi_document() -> Value {
                 json!({"name":"If-None-Match","in":"header","required":false,"schema":{"type":"string"}}),
             ]);
         }
-        let idempotent_write = method == "post"
-            && (path.contains("/commands/")
-                || path.ends_with("/candidates")
-                || path.ends_with("/suggestions")
-                || path.ends_with("/hints")
-                || path.ends_with("/fact-imports")
-                || path.ends_with("/problem-revisions")
-                || path.ends_with("/route-proposals")
-                || path == "/api/v1/projects/{project_id}/tasks");
-        if idempotent_write {
+        if endpoint.idempotency_required {
             parameters.push(json!({
                 "name":"Idempotency-Key","in":"header","required":true,
                 "schema":{"type":"string","minLength":1},
                 "description":"Unique key used to deduplicate retried writes."
             }));
         }
-        let success_status = if method == "get" && path.ends_with("/ws") {
-            "101"
-        } else if method == "post"
-            && matches!(
-                path,
-                "/api/v1/projects"
-                    | "/api/v1/actors/bootstrap"
-                    | "/api/v1/actors"
-                    | "/api/v1/worker-nodes"
-                    | "/api/v1/projects/{project_id}/fact-imports"
-            )
-        {
-            "201"
-        } else if method == "post" {
-            "202"
-        } else {
-            "200"
-        };
-        let success_content = if path.ends_with("/events") {
-            json!({"text/event-stream":{"schema":{"type":"string"}}})
-        } else if path.ends_with("/content") || path.ends_with("/reports/latest") {
-            json!({"application/octet-stream":{"schema":{"type":"string","contentEncoding":"binary"}}})
-        } else if path.ends_with("/board") {
-            json!({"application/json":{"schema":{"$ref":"#/components/schemas/BoardEnvelope"}}})
-        } else {
-            json!({"application/json":{"schema":{"$ref":"#/components/schemas/SuccessEnvelope"}}})
+        let success_content = match endpoint.response {
+            EndpointResponse::EventStream => {
+                json!({"text/event-stream":{"schema":{"type":"string"}}})
+            }
+            EndpointResponse::Binary => {
+                json!({"application/octet-stream":{"schema":{"type":"string","contentEncoding":"binary"}}})
+            }
+            EndpointResponse::Board => {
+                json!({"application/json":{"schema":{"$ref":"#/components/schemas/BoardEnvelope"}}})
+            }
+            EndpointResponse::ObligationGraph => {
+                json!({"application/json":{"schema":{"$ref":"#/components/schemas/ProofObligationGraphEnvelope"}}})
+            }
+            EndpointResponse::Json => {
+                json!({"application/json":{"schema":{"$ref":"#/components/schemas/SuccessEnvelope"}}})
+            }
         };
         let mut responses = serde_json::Map::new();
         responses.insert(
-            success_status.into(),
+            endpoint.success_status.into(),
             json!({"description":"Success","content":success_content}),
         );
-        if path.ends_with("/board") {
+        if endpoint.response == EndpointResponse::Board {
             responses.insert(
                 "304".into(),
                 json!({"description":"Board revision is unchanged"}),
@@ -4396,59 +4354,18 @@ pub fn openapi_document() -> Value {
             json!({"description":"Error envelope","content":{"application/json":{"schema":{"$ref":"#/components/schemas/ErrorEnvelope"}}}}),
         );
         let mut operation = json!({
-            "summary":summary,
+            "summary":endpoint.summary,
             "parameters":parameters,
             "responses":responses,
         });
-        if path == "/api/v1/actors/bootstrap" {
-            operation["security"] = json!([]);
-        } else if (path.starts_with("/api/v1/worker-nodes/") && path.ends_with("/heartbeat"))
-            || path.ends_with("/distributed/leases/next")
-            || path.ends_with("/renew")
-            || path.ends_with("/complete")
-        {
-            operation["security"] = json!([{"WorkerToken":[]}]);
+        match endpoint.auth {
+            EndpointAuth::Public => operation["security"] = json!([]),
+            EndpointAuth::WorkerToken => {
+                operation["security"] = json!([{"WorkerToken":[]}]);
+            }
+            EndpointAuth::Actor => {}
         }
-        if method == "post" {
-            let schema = if path == "/api/v1/projects" {
-                "CreateProjectRequest"
-            } else if path == "/api/v1/actors/bootstrap" {
-                "BootstrapActorRequest"
-            } else if path == "/api/v1/actors" {
-                "CreateActorRequest"
-            } else if path == "/api/v1/worker-nodes" {
-                "RegisterWorkerNodeRequest"
-            } else if path.ends_with("/heartbeat") {
-                "NodeHeartbeatRequest"
-            } else if path.ends_with("/distributed/leases/next") {
-                "LeaseTaskRequest"
-            } else if path.ends_with("/renew") {
-                "RenewLeaseRequest"
-            } else if path.ends_with("/complete") {
-                "CompleteLeaseRequest"
-            } else if path.ends_with("/reconciliation/commands/run") {
-                "ReconciliationRequest"
-            } else if path.ends_with("/fact-imports") {
-                "ImportFactRequest"
-            } else if path.starts_with("/api/v1/facts/") && path.contains("/commands/") {
-                "FactGovernanceRequest"
-            } else if path.ends_with("/publications") {
-                "CreatePublicationRequest"
-            } else if path.ends_with("/candidates") {
-                "CandidateSubmission"
-            } else if path.ends_with("/suggestions") {
-                "SuggestionRequest"
-            } else if path.ends_with("/problem-revisions") {
-                "ProblemRevisionRequest"
-            } else if path.ends_with("/route-proposals") {
-                "HumanRouteProposalRequest"
-            } else if path.contains("/formalizations/") && path.ends_with("/hints") {
-                "ProofHintRequest"
-            } else if path.contains("/formalizations/") {
-                "ProofSearchCommandRequest"
-            } else {
-                "CommandRequest"
-            };
+        if let Some(schema) = endpoint.request_schema {
             operation["requestBody"] = json!({
                 "required":true,
                 "content":{"application/json":{"schema":{"$ref":format!("#/components/schemas/{schema}")}}}
@@ -4481,14 +4398,62 @@ pub fn openapi_document() -> Value {
             "BoardEnvelope":{"type":"object","additionalProperties":false,"required":["data","meta","error"],"properties":{
                 "data":{"$ref":"#/components/schemas/ResearchBoardView"},"meta":{"$ref":"#/components/schemas/ResponseMeta"},"error":{"type":"null"}
             }},
+            "ProofObligationGraphEnvelope":{"type":"object","additionalProperties":false,"required":["data","meta","error"],"properties":{
+                "data":{"$ref":"#/components/schemas/ProofObligationGraph"},"meta":{"$ref":"#/components/schemas/ResponseMeta"},"error":{"type":"null"}
+            }},
             "ErrorEnvelope":{"type":"object","required":["data","meta","error"],"properties":{
                 "data":{"type":"null"},"meta":{"$ref":"#/components/schemas/ResponseMeta"},"error":{"$ref":"#/components/schemas/ApiErrorBody"}
             }},
             "Budget":{"type":"object","required":["max_rounds","max_parallel_workers","max_minutes_per_task","max_model_calls_per_task","max_total_model_calls"],"properties":{
-                "max_rounds":{"type":"integer","minimum":1},"max_parallel_workers":{"type":"integer","minimum":1},"max_minutes_per_task":{"type":"integer","minimum":1},"max_model_calls_per_task":{"type":"integer","minimum":1},"max_total_model_calls":{"type":"integer","minimum":1}
+                "max_rounds":{"type":"integer","minimum":1},"max_parallel_workers":{"type":"integer","minimum":1,"maximum":16},"max_minutes_per_task":{"type":"integer","minimum":1,"maximum":1440},"max_model_calls_per_task":{"type":"integer","minimum":1},"max_total_model_calls":{"type":"integer","minimum":1}
+            }},
+            "ProofObligation":{"type":"object","additionalProperties":false,"required":["obligation_id","project_id","goal_id","parent_obligation_id","source_kind","statement","completion_criteria","necessity","status","priority","source_verification_id","source_bottleneck_id","source_fingerprint","provenance","satisfied_by_fact_id","created_revision","updated_revision","created_at","updated_at"],"properties":{
+                "obligation_id":{"type":"string"},"project_id":{"type":"string"},"goal_id":{"type":["string","null"]},"parent_obligation_id":{"type":["string","null"]},"source_kind":{"type":"string"},"statement":{"type":"string"},"completion_criteria":{"type":"string"},"necessity":{"type":"string","enum":["required","advisory"]},"status":{"type":"string","enum":["open","satisfied","blocked","obsolete"]},"priority":{"type":"number"},"source_verification_id":{"type":["string","null"]},"source_bottleneck_id":{"type":["string","null"]},"source_fingerprint":{"type":"string"},"provenance":{},"satisfied_by_fact_id":{"type":["string","null"]},"created_revision":{"type":"integer","format":"int64"},"updated_revision":{"type":"integer","format":"int64"},"created_at":{"type":"string","format":"date-time"},"updated_at":{"type":"string","format":"date-time"}
+            }},
+            "ObligationEdge":{"type":"object","additionalProperties":false,"required":["edge_id","project_id","source_obligation_id","target_obligation_id","kind","created_at"],"properties":{
+                "edge_id":{"type":"string"},"project_id":{"type":"string"},"source_obligation_id":{"type":"string"},"target_obligation_id":{"type":"string"},"kind":{"type":"string","enum":["depends_on","refines"]},"created_at":{"type":"string","format":"date-time"}
+            }},
+            "CandidateObligationCoverage":{"type":"object","additionalProperties":false,"required":["coverage_id","project_id","candidate_id","obligation_id","verification_id","disposition","fact_id","rationale","created_at"],"properties":{
+                "coverage_id":{"type":"string"},"project_id":{"type":"string"},"candidate_id":{"type":"string"},"obligation_id":{"type":"string"},"verification_id":{"type":"string"},"disposition":{"type":"string","enum":["supports","satisfies","insufficient","unknown"]},"fact_id":{"type":["string","null"]},"rationale":{"type":"string"},"created_at":{"type":"string","format":"date-time"}
+            }},
+            "ProofObligationGraph":{"type":"object","additionalProperties":false,"required":["obligations","edges","coverage"],"properties":{
+                "obligations":{"type":"array","items":{"$ref":"#/components/schemas/ProofObligation"}},"edges":{"type":"array","items":{"$ref":"#/components/schemas/ObligationEdge"}},"coverage":{"type":"array","items":{"$ref":"#/components/schemas/CandidateObligationCoverage"}}
             }},
             "CreateProjectRequest":{"type":"object","additionalProperties":false,"required":["name","problem"],"properties":{
-                "name":{"type":"string","minLength":1},"problem":{"type":"string","minLength":1},"target_statement":{"type":["string","null"]},"assumptions":{"type":"array","items":{"type":"string"}},"success_criteria":{"type":["string","null"]},"budget":{"$ref":"#/components/schemas/Budget"},"human_route_approval":{"type":"boolean","default":false}
+                "name":{"type":"string","minLength":1},"problem":{"type":"string","minLength":1},"target_statement":{"type":["string","null"]},"assumptions":{"type":"array","items":{"type":"string"}},"success_criteria":{"type":["string","null"]},"budget":{"$ref":"#/components/schemas/Budget"},"human_route_approval":{"type":"boolean","default":false,"description":"Legacy compatibility flag; review_mode takes precedence when supplied."},"review_mode":{"type":["string","null"],"enum":["automatic","balanced","strict",null]}
+            }},
+            "ProblemAssumption":{"type":"object","additionalProperties":false,"required":["statement","provenance"],"properties":{
+                "statement":{"type":"string","minLength":1},"provenance":{"type":"string","enum":["prompt","material","inferred"]}
+            }},
+            "ProblemMaterial":{"type":"object","additionalProperties":false,"required":["relative_path","media_type","byte_size","included_bytes","sha256","status","warning"],"properties":{
+                "relative_path":{"type":"string"},"media_type":{"type":"string"},"byte_size":{"type":"integer","minimum":0},"included_bytes":{"type":"integer","minimum":0},"sha256":{"type":"string"},"status":{"type":"string"},"warning":{"type":["string","null"]}
+            }},
+            "ProblemDocument":{"type":"object","additionalProperties":false,"required":["name","problem","target_statement","success_criteria","budget","budget_rationale"],"properties":{
+                "name":{"type":"string","minLength":1},"problem":{"type":"string","minLength":1},"target_statement":{"type":"string","minLength":1},"assumptions":{"type":"array","items":{"$ref":"#/components/schemas/ProblemAssumption"}},"success_criteria":{"type":"string","minLength":1},"budget":{"$ref":"#/components/schemas/Budget"},"human_route_approval":{"type":"boolean","default":false},"budget_rationale":{"type":"string"},"generation_notes":{"type":"array","items":{"type":"string"}},"unresolved_questions":{"type":"array","items":{"type":"string"}},"material_references":{"type":"array","items":{"type":"string"}}
+            }},
+            "ProblemDraft":{"type":"object","additionalProperties":false,"required":["draft_id","requested_by","creation_idempotency_key","creation_request_hash","prompt","material_directory","materials","status","revision","document","document_hash","material_manifest_hash","model","input_tokens","output_tokens","elapsed_ms","error_kind","error_message","confirmation_idempotency_key","confirmation_request_hash","confirmed_project_id","start_command_id","created_at","updated_at","generation_completed_at","confirmed_at"],"properties":{
+                "draft_id":{"type":"string"},"requested_by":{"type":"string"},"creation_idempotency_key":{"type":"string"},"creation_request_hash":{"type":"string"},"prompt":{"type":"string"},"material_directory":{"type":"string"},"materials":{"type":"array","items":{"$ref":"#/components/schemas/ProblemMaterial"}},"status":{"type":"string","enum":["generating","awaiting_confirmation","confirmed","failed"]},"revision":{"type":"integer","format":"int64"},"document":{"oneOf":[{"$ref":"#/components/schemas/ProblemDocument"},{"type":"null"}]},"document_hash":{"type":["string","null"]},"material_manifest_hash":{"type":"string"},"model":{"type":["string","null"]},"input_tokens":{"type":"integer","format":"int64"},"output_tokens":{"type":"integer","format":"int64"},"elapsed_ms":{"type":"integer","format":"int64"},"error_kind":{"type":["string","null"]},"error_message":{"type":["string","null"]},"confirmation_idempotency_key":{"type":["string","null"]},"confirmation_request_hash":{"type":["string","null"]},"confirmed_project_id":{"type":["string","null"]},"start_command_id":{"type":["string","null"]},"created_at":{"type":"string","format":"date-time"},"updated_at":{"type":"string","format":"date-time"},"generation_completed_at":{"type":["string","null"],"format":"date-time"},"confirmed_at":{"type":["string","null"],"format":"date-time"}
+            }},
+            "ProblemDraftConfirmation":{"type":"object","additionalProperties":false,"required":["draft","project","start_command","replayed"],"properties":{
+                "draft":{"$ref":"#/components/schemas/ProblemDraft"},"project":{"type":"object"},"start_command":{"type":["object","null"]},"replayed":{"type":"boolean"}
+            }},
+            "ProblemDraftView":{"type":"object","additionalProperties":false,"required":["draft","preview_markdown"],"properties":{
+                "draft":{"$ref":"#/components/schemas/ProblemDraft"},"preview_markdown":{"type":["string","null"]}
+            }},
+            "ProblemDraftConfirmationView":{"type":"object","additionalProperties":false,"required":["confirmation","preview_markdown"],"properties":{
+                "confirmation":{"$ref":"#/components/schemas/ProblemDraftConfirmation"},"preview_markdown":{"type":"string"}
+            }},
+            "ProblemDraftControlView":{"type":"object","additionalProperties":false,"required":["draft","preview_markdown","replayed"],"properties":{
+                "draft":{"$ref":"#/components/schemas/ProblemDraft"},"preview_markdown":{"type":["string","null"]},"replayed":{"type":"boolean"}
+            }},
+            "GenerateProblemDraftRequest":{"type":"object","additionalProperties":false,"required":["prompt"],"properties":{
+                "prompt":{"type":"string","minLength":1},"context_dir":{"type":"string","default":"."}
+            }},
+            "ProblemDraftControlRequest":{"type":"object","additionalProperties":false,"required":["expected_revision"],"properties":{
+                "expected_revision":{"type":"integer","format":"int64","minimum":1}
+            }},
+            "ConfirmProblemDraftRequest":{"type":"object","additionalProperties":false,"required":["expected_revision","expected_document_hash"],"properties":{
+                "expected_revision":{"type":"integer","format":"int64","minimum":1},"expected_document_hash":{"type":"string","minLength":1},"document":{"oneOf":[{"$ref":"#/components/schemas/ProblemDocument"},{"type":"null"}]},"acknowledge_material_warnings":{"type":"boolean","default":false},"start":{"type":"boolean","default":true}
             }},
             "CreatePublicationRequest":{"type":"object","additionalProperties":false,"properties":{
                 "allow_partial":{"type":"boolean","default":false}
@@ -4511,8 +4476,11 @@ pub fn openapi_document() -> Value {
             "RenewLeaseRequest":{"type":"object","additionalProperties":false,"required":["node_id","node_epoch","lease_epoch"],"properties":{
                 "node_id":{"type":"string"},"node_epoch":{"type":"integer","format":"int64"},"lease_epoch":{"type":"integer","format":"int64"},"ttl_seconds":{"type":"integer","minimum":10,"maximum":3600}
             }},
+            "LeaseSteersRequest":{"type":"object","additionalProperties":false,"required":["node_id","node_epoch","lease_epoch"],"properties":{
+                "node_id":{"type":"string"},"node_epoch":{"type":"integer","format":"int64"},"lease_epoch":{"type":"integer","format":"int64"}
+            }},
             "CompleteLeaseRequest":{"type":"object","additionalProperties":false,"required":["node_id","node_epoch","lease_epoch","output"],"properties":{
-                "node_id":{"type":"string"},"node_epoch":{"type":"integer","format":"int64"},"lease_epoch":{"type":"integer","format":"int64"},"output":{"type":"object"}
+                "node_id":{"type":"string"},"node_epoch":{"type":"integer","format":"int64"},"lease_epoch":{"type":"integer","format":"int64"},"output":{"type":"object"},"incorporated_steer_ids":{"type":"array","items":{"type":"string"},"default":[]}
             }},
             "ReconciliationRequest":{"type":"object","additionalProperties":false,"properties":{
                 "project_id":{"type":["string","null"]},"trigger_kind":{"type":"string","default":"admin_api"}
@@ -4526,22 +4494,26 @@ pub fn openapi_document() -> Value {
             "CommandRequest":{"type":"object","additionalProperties":false,"required":["expected_revision"],"properties":{
                 "expected_revision":{"type":"integer","format":"int64"},"reason":{"type":"string"},"payload":{"type":"object"}
             }},
-            "SuggestionRequest":{"type":"object","additionalProperties":false,"required":["expected_revision","content","target_route_id"],"properties":{
+            "SuggestionRequest":{"type":"object","additionalProperties":false,"required":["expected_revision","content"],"properties":{
                 "expected_revision":{"type":"integer","format":"int64"},"content":{"type":"string","minLength":1},"target_route_id":{"type":["string","null"]},"reason":{"type":"string"}
             }},
-            "ProblemRevisionRequest":{"type":"object","additionalProperties":false,"required":["expected_revision","target_statement","assumptions","success_criteria","change_reason","replan"],"properties":{
+            "ProblemRevisionRequest":{"type":"object","additionalProperties":false,"required":["expected_revision","target_statement","success_criteria","change_reason"],"properties":{
                 "expected_revision":{"type":"integer","format":"int64"},"target_statement":{"type":"string","minLength":1},"assumptions":{"type":"array","items":{"type":"string"}},"success_criteria":{"type":"string","minLength":1},"change_reason":{"type":"string","minLength":1},"replan":{"type":"boolean"}
             }},
-            "HumanRouteProposalRequest":{"type":"object","additionalProperties":false,"required":["expected_revision","title","method_summary","target_goal_ids","required_fact_ids","known_risks","reason"],"properties":{
+            "HumanRouteProposalRequest":{"type":"object","additionalProperties":false,"required":["expected_revision","title","method_summary","reason"],"properties":{
                 "expected_revision":{"type":"integer","format":"int64"},"title":{"type":"string","minLength":1},"method_summary":{"type":"string","minLength":1},"target_goal_ids":{"type":"array","items":{"type":"string"}},"required_fact_ids":{"type":"array","items":{"type":"string"}},"known_risks":{"type":"array","items":{"type":"string"}},"reason":{"type":"string","minLength":1}
             }},
-            "BoardCapabilities":{"type":"object","additionalProperties":false,"required":["can_edit_problem","can_propose_route","can_approve_route","can_control_project","can_control_tasks","can_govern_facts"],"properties":{
-                "can_edit_problem":{"type":"boolean"},"can_propose_route":{"type":"boolean"},"can_approve_route":{"type":"boolean"},"can_control_project":{"type":"boolean"},"can_control_tasks":{"type":"boolean"},"can_govern_facts":{"type":"boolean"}
+            "HumanRouteCreateRequest":{"type":"object","additionalProperties":false,"required":["expected_revision","title","method_summary","objective","completion_contract","reason"],"properties":{
+                "expected_revision":{"type":"integer","format":"int64"},"title":{"type":"string","minLength":1},"method_summary":{"type":"string","minLength":1},"approach_kind":{"type":"string"},"route_role":{"type":"string"},"plain_language_summary":{"type":"string"},"steps":{"type":"array","items":{"type":"string"}},"target_goal_ids":{"type":"array","items":{"type":"string"}},"required_fact_ids":{"type":"array","items":{"type":"string"}},"known_risks":{"type":"array","items":{"type":"string"}},"worker_role":{"type":"string","default":"prover"},"objective":{"type":"string","minLength":1},"completion_contract":{"type":"string","minLength":1},"priority":{"type":"number","minimum":0,"maximum":1,"default":0.9},"reason":{"type":"string","minLength":1}
             }},
-            "ResearchBoardView":{"type":"object","additionalProperties":true,"required":["schema_version","project_id","agent","mode","status","revision","event_cursor","problem","summary","routes","goals","claims","failed_routes","human_questions","uncertainties","tasks","workers","verification_queue","artifacts","timeline","graph","capabilities"],"properties":{
-                "schema_version":{"type":"integer","const":1},"project_id":{"type":"string"},"agent":{"type":"string","const":"mathcat"},"mode":{"type":"string"},"status":{"type":"string"},"revision":{"type":"integer","format":"int64"},"event_cursor":{"type":"integer","format":"int64"},"problem":{"type":"object"},"summary":{"type":"object"},"routes":{"type":"array","items":{"type":"object"}},"goals":{"type":"array","items":{"type":"object"}},"claims":{"type":"array","items":{"type":"object"}},"failed_routes":{"type":"array","items":{"type":"object"}},"human_questions":{"type":"array","items":{"type":"object"}},"uncertainties":{"type":"array","items":{"type":"object"}},"tasks":{"type":"array","items":{"type":"object"}},"workers":{"type":"array","items":{"type":"object"}},"verification_queue":{"type":"array","items":{"type":"object"}},"artifacts":{"type":"array","items":{"type":"object"}},"timeline":{"type":"array","items":{"type":"object"}},"graph":{"type":["object","null"]},"capabilities":{"$ref":"#/components/schemas/BoardCapabilities"}
+            "BoardCapabilities":{"type":"object","additionalProperties":false,"required":["can_edit_problem","can_propose_route","can_create_route","can_approve_route","can_force_goal_review","can_manage_settings","can_control_project","can_control_tasks","can_govern_facts"],"properties":{
+                "can_edit_problem":{"type":"boolean"},"can_propose_route":{"type":"boolean"},"can_create_route":{"type":"boolean"},"can_approve_route":{"type":"boolean"},"can_force_goal_review":{"type":"boolean"},"can_manage_settings":{"type":"boolean"},"can_control_project":{"type":"boolean"},"can_control_tasks":{"type":"boolean"},"can_govern_facts":{"type":"boolean"}
             }},
-            "CandidateSubmission":{"type":"object","additionalProperties":false,"required":["task_id","route_id","target_goal_ids","statement","assumptions","proof_markdown","dependency_fact_ids","definitions_introduced","external_source_ids","candidate_type","task_revision","route_cancellation_epoch"],"properties":{
+            "BoardPlanningSuggestion":{"type":"object","additionalProperties":false,"required":["suggestion_id","content","target_route_id","status","decision","created_in_round","effective_round"],"properties":{"suggestion_id":{"type":"string"},"content":{"type":"string"},"target_route_id":{"type":["string","null"]},"status":{"type":"string"},"decision":{"type":["object","null"]},"created_in_round":{"type":"integer","format":"int64"},"effective_round":{"type":"integer","format":"int64"}}},
+            "ResearchBoardView":{"type":"object","additionalProperties":true,"required":["schema_version","project_id","agent","mode","status","revision","event_cursor","problem","settings","summary","routes","goals","claims","failed_routes","planning_suggestions","human_questions","uncertainties","tasks","workers","verification_queue","artifacts","timeline","graph","capabilities"],"properties":{
+                "schema_version":{"type":"integer","const":1},"project_id":{"type":"string"},"agent":{"type":"string","const":"mathcat"},"mode":{"type":"string"},"status":{"type":"string"},"revision":{"type":"integer","format":"int64"},"event_cursor":{"type":"integer","format":"int64"},"problem":{"type":"object"},"settings":{"type":"object","required":["budget","review_mode","human_route_approval","running_task_policy"],"properties":{"budget":{"$ref":"#/components/schemas/Budget"},"review_mode":{"type":"string","enum":["automatic","balanced","strict"]},"human_route_approval":{"type":"boolean"},"running_task_policy":{"type":"string"}}},"summary":{"type":"object"},"routes":{"type":"array","items":{"type":"object"}},"goals":{"type":"array","items":{"type":"object"}},"claims":{"type":"array","items":{"type":"object"}},"failed_routes":{"type":"array","items":{"type":"object"}},"planning_suggestions":{"type":"array","items":{"$ref":"#/components/schemas/BoardPlanningSuggestion"}},"human_questions":{"type":"array","items":{"type":"object"}},"uncertainties":{"type":"array","items":{"type":"object"}},"tasks":{"type":"array","items":{"type":"object"}},"workers":{"type":"array","items":{"type":"object"}},"verification_queue":{"type":"array","items":{"type":"object"}},"artifacts":{"type":"array","items":{"type":"object"}},"timeline":{"type":"array","items":{"type":"object"}},"graph":{"type":["object","null"]},"capabilities":{"$ref":"#/components/schemas/BoardCapabilities"}
+            }},
+            "CandidateSubmission":{"type":"object","additionalProperties":false,"required":["task_id","route_id","statement","proof_markdown","candidate_type","task_revision","route_cancellation_epoch"],"properties":{
                 "task_id":{"type":"string"},"route_id":{"type":"string"},"target_goal_ids":{"type":"array","items":{"type":"string"}},"statement":{"type":"string","minLength":1},"assumptions":{"type":"array","items":{"type":"string"}},"proof_markdown":{"type":"string","minLength":1},"dependency_fact_ids":{"type":"array","items":{"type":"string"}},"definitions_introduced":{"type":"object"},"external_source_ids":{"type":"array","items":{"type":"string"}},"candidate_type":{"type":"string","enum":["theorem","lemma","proposition","counterexample","observation"]},"task_revision":{"type":"integer","format":"int64"},"route_cancellation_epoch":{"type":"integer","format":"int64"}
             }},
             "ProofHintRequest":{"type":"object","additionalProperties":false,"required":["kind","content"],"properties":{
@@ -4560,7 +4532,7 @@ pub fn openapi_document() -> Value {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::BTreeSet, fs, sync::Arc};
 
     use axum::{
         body::{Body, to_bytes},
@@ -4568,34 +4540,763 @@ mod tests {
     };
     use futures::{SinkExt, StreamExt};
     use research_core::ResearchConfig;
-    use research_storage::SqliteStore;
+    use research_storage::{ProblemDraftBeginRequest, SqliteStore};
     use research_worker_runtime::MockBackend;
     use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
     use tower::ServiceExt;
 
     use super::*;
 
-    async fn app() -> (Router, ResearchService, tempfile::TempDir) {
+    async fn app_with_backend(
+        backend: MockBackend,
+    ) -> (Router, ResearchService, tempfile::TempDir) {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = SqliteStore::connect("sqlite::memory:", temp.path().join("artifacts"))
             .await
             .expect("store");
         let service = ResearchService::new(
             store,
-            Arc::new(MockBackend::default()),
+            Arc::new(backend),
             ResearchConfig {
                 runtime_root: temp.path().join("runtime"),
                 output_root: temp.path().join("output"),
+                material_root: temp.path().to_path_buf(),
                 model: None,
                 lean_project_root: None,
-                proof_search_budget: research_domain::ProofSearchBudget::default(),
-                ranking_weights: research_domain::RankingWeights::default(),
                 planner_timeout_seconds: 5,
                 worker_timeout_seconds: 5,
                 verifier_timeout_seconds: 5,
+                problem_generator_timeout_seconds: 5,
+                ..ResearchConfig::default()
             },
         );
         (router(service.clone()), service, temp)
+    }
+
+    async fn app() -> (Router, ResearchService, tempfile::TempDir) {
+        app_with_backend(MockBackend::default()).await
+    }
+
+    fn generated_problem_document() -> Value {
+        json!({
+            "name":"Finite graph extremal question",
+            "problem":"Let G be a finite simple graph. Determine whether the stated bound holds.",
+            "target_statement":"For every finite simple graph G satisfying A, invariant f(G) is at most n.",
+            "assumptions":[{"statement":"G is finite and simple.","provenance":"prompt"}],
+            "success_criteria":"The exact target receives an accepted verdict, every dependency is active, and no blocking uncertainty remains.",
+            "budget":{
+                "max_rounds":1,
+                "max_parallel_workers":1,
+                "max_minutes_per_task":1,
+                "max_model_calls_per_task":1,
+                "max_total_model_calls":1
+            },
+            "human_route_approval":false,
+            "budget_rationale":"A bounded first pass is sufficient for this narrow fixture.",
+            "generation_notes":[],
+            "unresolved_questions":[],
+            "material_references":["a.md"]
+        })
+    }
+
+    #[tokio::test]
+    async fn problem_draft_http_flow_is_authenticated_idempotent_and_confirmation_gated() {
+        let (app, service, temp) =
+            app_with_backend(MockBackend::from_responses([generated_problem_document()])).await;
+        fs::create_dir(temp.path().join("notes")).expect("notes directory");
+        fs::write(temp.path().join("notes/a.md"), "finite graph background")
+            .expect("material fixture");
+        fs::write(temp.path().join("notes/blob.pdf"), b"%PDF excluded fixture")
+            .expect("unsupported material fixture");
+
+        let bootstrap = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/actors/bootstrap")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "actor_id":"admin",
+                            "display_name":"Admin",
+                            "token":"admin-token-123456789"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("bootstrap response");
+        assert_eq!(bootstrap.status(), StatusCode::CREATED);
+
+        for (actor_id, display_name, role, token) in [
+            (
+                "researcher",
+                "Researcher",
+                "researcher",
+                "researcher-token-123456789",
+            ),
+            ("viewer", "Viewer", "viewer", "viewer-token-123456789"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/actors")
+                        .header("content-type", "application/json")
+                        .header("X-Actor-Id", "admin")
+                        .header("Authorization", "Bearer admin-token-123456789")
+                        .body(Body::from(
+                            json!({
+                                "actor_id":actor_id,
+                                "display_name":display_name,
+                                "role":role,
+                                "token":token
+                            })
+                            .to_string(),
+                        ))
+                        .expect("request"),
+                )
+                .await
+                .expect("create actor response");
+            assert_eq!(response.status(), StatusCode::CREATED);
+        }
+
+        let request_body = json!({
+            "prompt":"study the finite graph bound",
+            "context_dir":"notes"
+        });
+        let viewer_forbidden = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/problem-drafts")
+                    .header("content-type", "application/json")
+                    .header("Idempotency-Key", "draft-http-viewer")
+                    .header("X-Actor-Id", "viewer")
+                    .header("Authorization", "Bearer viewer-token-123456789")
+                    .body(Body::from(request_body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("viewer response");
+        assert_eq!(viewer_forbidden.status(), StatusCode::FORBIDDEN);
+
+        let missing_key = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/problem-drafts")
+                    .header("content-type", "application/json")
+                    .header("X-Actor-Id", "researcher")
+                    .header("Authorization", "Bearer researcher-token-123456789")
+                    .body(Body::from(request_body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("missing idempotency response");
+        assert_eq!(missing_key.status(), StatusCode::BAD_REQUEST);
+
+        let unknown_field = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/problem-drafts")
+                    .header("content-type", "application/json")
+                    .header("Idempotency-Key", "draft-http-unknown")
+                    .header("X-Actor-Id", "researcher")
+                    .header("Authorization", "Bearer researcher-token-123456789")
+                    .body(Body::from(
+                        json!({
+                            "prompt":"study the finite graph bound",
+                            "context_dir":"notes",
+                            "unexpected":true
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("unknown field response");
+        assert!(!unknown_field.status().is_success());
+
+        let generated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/problem-drafts")
+                    .header("content-type", "application/json")
+                    .header("Idempotency-Key", "draft-http-1")
+                    .header("X-Actor-Id", "researcher")
+                    .header("Authorization", "Bearer researcher-token-123456789")
+                    .body(Body::from(request_body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("generation response");
+        assert_eq!(generated.status(), StatusCode::ACCEPTED);
+        let generated_bytes = to_bytes(generated.into_body(), usize::MAX)
+            .await
+            .expect("generated body");
+        let generated_text = String::from_utf8(generated_bytes.to_vec()).expect("UTF-8 response");
+        assert!(
+            !generated_text.contains(&temp.path().display().to_string()),
+            "API responses must not expose the configured absolute material root"
+        );
+        let initial: Value = serde_json::from_str(&generated_text).expect("generation json");
+        assert_eq!(
+            initial
+                .pointer("/data/draft/status")
+                .and_then(Value::as_str),
+            Some("generating")
+        );
+        assert_eq!(
+            initial
+                .pointer("/data/draft/material_directory")
+                .and_then(Value::as_str),
+            Some("notes")
+        );
+        assert_eq!(
+            initial
+                .pointer("/data/draft/materials/0/relative_path")
+                .and_then(Value::as_str),
+            Some("a.md")
+        );
+        assert!(
+            initial
+                .pointer("/data/preview_markdown")
+                .is_some_and(Value::is_null)
+        );
+        assert!(
+            initial
+                .pointer("/data/draft/confirmed_project_id")
+                .is_some_and(Value::is_null),
+            "generation must not create a project before confirmation"
+        );
+        let draft_id = initial
+            .pointer("/data/draft/draft_id")
+            .and_then(Value::as_str)
+            .expect("draft id")
+            .to_owned();
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let draft = service
+                    .store()
+                    .get_problem_draft(&draft_id)
+                    .await
+                    .expect("poll draft");
+                if draft.status != research_domain::ProblemDraftStatus::Generating {
+                    break draft;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background generation completed");
+        assert_eq!(
+            completed.status,
+            research_domain::ProblemDraftStatus::AwaitingConfirmation
+        );
+        let preview_markdown = completed
+            .document
+            .as_ref()
+            .map(render_problem_document_markdown);
+        let generated = json!({"data":{"draft":completed,"preview_markdown":preview_markdown}});
+        let revision = generated
+            .pointer("/data/draft/revision")
+            .and_then(Value::as_i64)
+            .expect("draft revision");
+        let document_hash = generated
+            .pointer("/data/draft/document_hash")
+            .and_then(Value::as_str)
+            .expect("document hash")
+            .to_owned();
+
+        let replay = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/problem-drafts")
+                    .header("content-type", "application/json")
+                    .header("Idempotency-Key", "draft-http-1")
+                    .header("X-Actor-Id", "researcher")
+                    .header("Authorization", "Bearer researcher-token-123456789")
+                    .body(Body::from(request_body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("generation replay");
+        assert_eq!(replay.status(), StatusCode::ACCEPTED);
+        let replay: Value = serde_json::from_slice(
+            &to_bytes(replay.into_body(), usize::MAX)
+                .await
+                .expect("replay body"),
+        )
+        .expect("replay json");
+        assert_eq!(
+            replay
+                .pointer("/data/draft/draft_id")
+                .and_then(Value::as_str),
+            Some(draft_id.as_str())
+        );
+
+        let read = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/problem-drafts/{draft_id}"))
+                    .header("X-Actor-Id", "viewer")
+                    .header("Authorization", "Bearer viewer-token-123456789")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("draft read");
+        assert_eq!(read.status(), StatusCode::OK);
+        let read: Value = serde_json::from_slice(
+            &to_bytes(read.into_body(), usize::MAX)
+                .await
+                .expect("read body"),
+        )
+        .expect("read json");
+        assert_eq!(
+            read.pointer("/data/preview_markdown"),
+            generated.pointer("/data/preview_markdown")
+        );
+
+        let mut edited_document = generated
+            .pointer("/data/draft/document")
+            .expect("generated document")
+            .clone();
+        edited_document["name"] = json!("Human-reviewed graph question");
+        let confirmation_body = json!({
+            "expected_revision":revision,
+            "expected_document_hash":document_hash,
+            "document":edited_document,
+            "acknowledge_material_warnings":true,
+            "start":false
+        });
+        let missing_confirmation_key = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/problem-drafts/{draft_id}/commands/confirm"
+                    ))
+                    .header("content-type", "application/json")
+                    .header("X-Actor-Id", "researcher")
+                    .header("Authorization", "Bearer researcher-token-123456789")
+                    .body(Body::from(confirmation_body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("missing confirmation idempotency response");
+        assert_eq!(missing_confirmation_key.status(), StatusCode::BAD_REQUEST);
+
+        let viewer_confirmation = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/problem-drafts/{draft_id}/commands/confirm"
+                    ))
+                    .header("content-type", "application/json")
+                    .header("Idempotency-Key", "confirm-http-viewer")
+                    .header("X-Actor-Id", "viewer")
+                    .header("Authorization", "Bearer viewer-token-123456789")
+                    .body(Body::from(confirmation_body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("viewer confirmation response");
+        assert_eq!(viewer_confirmation.status(), StatusCode::FORBIDDEN);
+
+        let mut unacknowledged_body = confirmation_body.clone();
+        unacknowledged_body["acknowledge_material_warnings"] = json!(false);
+        let unacknowledged = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/problem-drafts/{draft_id}/commands/confirm"
+                    ))
+                    .header("content-type", "application/json")
+                    .header("Idempotency-Key", "confirm-http-unacknowledged")
+                    .header("X-Actor-Id", "researcher")
+                    .header("Authorization", "Bearer researcher-token-123456789")
+                    .body(Body::from(unacknowledged_body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("unacknowledged warning response");
+        assert_eq!(unacknowledged.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let confirmed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/problem-drafts/{draft_id}/commands/confirm"
+                    ))
+                    .header("content-type", "application/json")
+                    .header("Idempotency-Key", "confirm-http-1")
+                    .header("X-Actor-Id", "researcher")
+                    .header("Authorization", "Bearer researcher-token-123456789")
+                    .body(Body::from(confirmation_body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("confirmation response");
+        assert_eq!(confirmed.status(), StatusCode::ACCEPTED);
+        let confirmed: Value = serde_json::from_slice(
+            &to_bytes(confirmed.into_body(), usize::MAX)
+                .await
+                .expect("confirmation body"),
+        )
+        .expect("confirmation json");
+        assert_eq!(
+            confirmed
+                .pointer("/data/confirmation/draft/status")
+                .and_then(Value::as_str),
+            Some("confirmed")
+        );
+        assert_eq!(
+            confirmed
+                .pointer("/data/confirmation/project/status")
+                .and_then(Value::as_str),
+            Some("created")
+        );
+        assert_eq!(
+            confirmed
+                .pointer("/data/confirmation/project/name")
+                .and_then(Value::as_str),
+            Some("Human-reviewed graph question")
+        );
+        assert!(
+            confirmed
+                .pointer("/data/confirmation/start_command")
+                .is_some_and(Value::is_null)
+        );
+        let project_id = confirmed
+            .pointer("/data/confirmation/project/project_id")
+            .and_then(Value::as_str)
+            .expect("project id")
+            .to_owned();
+        service
+            .store()
+            .get_project(&project_id)
+            .await
+            .expect("confirmation created project");
+
+        let confirmation_replay = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/problem-drafts/{draft_id}/commands/confirm"
+                    ))
+                    .header("content-type", "application/json")
+                    .header("Idempotency-Key", "confirm-http-1")
+                    .header("X-Actor-Id", "researcher")
+                    .header("Authorization", "Bearer researcher-token-123456789")
+                    .body(Body::from(confirmation_body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("confirmation replay");
+        assert_eq!(confirmation_replay.status(), StatusCode::ACCEPTED);
+        let confirmation_replay: Value = serde_json::from_slice(
+            &to_bytes(confirmation_replay.into_body(), usize::MAX)
+                .await
+                .expect("confirmation replay body"),
+        )
+        .expect("confirmation replay json");
+        assert_eq!(
+            confirmation_replay
+                .pointer("/data/confirmation/project/project_id")
+                .and_then(Value::as_str),
+            Some(project_id.as_str())
+        );
+        assert_eq!(
+            confirmation_replay
+                .pointer("/data/confirmation/replayed")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let mut conflicting_confirmation = confirmation_body;
+        conflicting_confirmation["start"] = json!(true);
+        let conflict = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/problem-drafts/{draft_id}/commands/confirm"
+                    ))
+                    .header("content-type", "application/json")
+                    .header("Idempotency-Key", "confirm-http-1")
+                    .header("X-Actor-Id", "researcher")
+                    .header("Authorization", "Bearer researcher-token-123456789")
+                    .body(Body::from(conflicting_confirmation.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("confirmation conflict");
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn problem_draft_cancel_and_retry_commands_enforce_auth_and_idempotency() {
+        let backend = MockBackend::default();
+        let backend_control = backend.clone();
+        let (app, service, temp) = app_with_backend(backend).await;
+        service
+            .store()
+            .bootstrap_admin("admin", "Admin", "admin-token-123456789")
+            .await
+            .expect("bootstrap admin");
+        for (actor_id, role, token) in [
+            ("researcher", "researcher", "researcher-token-123456789"),
+            ("other", "researcher", "other-researcher-token-123456789"),
+            ("viewer", "viewer", "viewer-token-123456789"),
+        ] {
+            service
+                .store()
+                .create_actor(actor_id, actor_id, role, token)
+                .await
+                .expect("create actor");
+        }
+        fs::create_dir(temp.path().join("empty-materials")).expect("empty material scope");
+        let materials = Vec::new();
+        let (generating, _) = service
+            .store()
+            .begin_problem_draft(ProblemDraftBeginRequest {
+                requested_by: "researcher",
+                idempotency_key: "control-draft-create",
+                prompt: "formulate a finite graph problem",
+                material_directory: "empty-materials",
+                materials: &materials,
+                model: None,
+            })
+            .await
+            .expect("generating draft");
+        let cancel_body = json!({"expected_revision":generating.revision}).to_string();
+
+        let viewer_denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/problem-drafts/{}/commands/cancel",
+                        generating.draft_id
+                    ))
+                    .header("content-type", "application/json")
+                    .header("Idempotency-Key", "viewer-cancel")
+                    .header("X-Actor-Id", "viewer")
+                    .header("Authorization", "Bearer viewer-token-123456789")
+                    .body(Body::from(cancel_body.clone()))
+                    .expect("request"),
+            )
+            .await
+            .expect("viewer cancel response");
+        assert_eq!(viewer_denied.status(), StatusCode::FORBIDDEN);
+
+        let other_denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/problem-drafts/{}/commands/cancel",
+                        generating.draft_id
+                    ))
+                    .header("content-type", "application/json")
+                    .header("Idempotency-Key", "other-cancel")
+                    .header("X-Actor-Id", "other")
+                    .header("Authorization", "Bearer other-researcher-token-123456789")
+                    .body(Body::from(cancel_body.clone()))
+                    .expect("request"),
+            )
+            .await
+            .expect("other requester cancel response");
+        assert_eq!(other_denied.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let cancel = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/problem-drafts/{}/commands/cancel",
+                        generating.draft_id
+                    ))
+                    .header("content-type", "application/json")
+                    .header("Idempotency-Key", "control-cancel")
+                    .header("X-Actor-Id", "researcher")
+                    .header("Authorization", "Bearer researcher-token-123456789")
+                    .body(Body::from(cancel_body.clone()))
+                    .expect("request"),
+            )
+            .await
+            .expect("cancel response");
+        assert_eq!(cancel.status(), StatusCode::ACCEPTED);
+        let cancelled: Value = serde_json::from_slice(
+            &to_bytes(cancel.into_body(), usize::MAX)
+                .await
+                .expect("cancel body"),
+        )
+        .expect("cancel json");
+        assert_eq!(
+            cancelled
+                .pointer("/data/draft/status")
+                .and_then(Value::as_str),
+            Some("failed")
+        );
+        assert_eq!(
+            cancelled
+                .pointer("/data/draft/error_kind")
+                .and_then(Value::as_str),
+            Some("cancelled")
+        );
+        let cancelled_revision = cancelled
+            .pointer("/data/draft/revision")
+            .and_then(Value::as_i64)
+            .expect("cancelled revision");
+
+        let cancel_replay = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/problem-drafts/{}/commands/cancel",
+                        generating.draft_id
+                    ))
+                    .header("content-type", "application/json")
+                    .header("Idempotency-Key", "control-cancel")
+                    .header("X-Actor-Id", "researcher")
+                    .header("Authorization", "Bearer researcher-token-123456789")
+                    .body(Body::from(cancel_body))
+                    .expect("request"),
+            )
+            .await
+            .expect("cancel replay response");
+        let cancel_replay: Value = serde_json::from_slice(
+            &to_bytes(cancel_replay.into_body(), usize::MAX)
+                .await
+                .expect("cancel replay body"),
+        )
+        .expect("cancel replay json");
+        assert_eq!(
+            cancel_replay
+                .pointer("/data/replayed")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let mut retry_output = generated_problem_document();
+        retry_output["material_references"] = json!([]);
+        backend_control.push(retry_output).await;
+        let retry_body = json!({"expected_revision":cancelled_revision}).to_string();
+        let retry = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/problem-drafts/{}/commands/retry",
+                        generating.draft_id
+                    ))
+                    .header("content-type", "application/json")
+                    .header("Idempotency-Key", "control-retry")
+                    .header("X-Actor-Id", "researcher")
+                    .header("Authorization", "Bearer researcher-token-123456789")
+                    .body(Body::from(retry_body.clone()))
+                    .expect("request"),
+            )
+            .await
+            .expect("retry response");
+        assert_eq!(retry.status(), StatusCode::ACCEPTED);
+        let retried: Value = serde_json::from_slice(
+            &to_bytes(retry.into_body(), usize::MAX)
+                .await
+                .expect("retry body"),
+        )
+        .expect("retry json");
+        assert_eq!(
+            retried
+                .pointer("/data/draft/status")
+                .and_then(Value::as_str),
+            Some("generating")
+        );
+        assert_eq!(
+            retried
+                .pointer("/data/draft/draft_id")
+                .and_then(Value::as_str),
+            Some(generating.draft_id.as_str())
+        );
+        let retried_terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let draft = service
+                    .store()
+                    .get_problem_draft(&generating.draft_id)
+                    .await
+                    .expect("poll retried draft");
+                if draft.status != research_domain::ProblemDraftStatus::Generating {
+                    break draft;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background retry completed");
+        assert_eq!(
+            retried_terminal.status,
+            research_domain::ProblemDraftStatus::AwaitingConfirmation
+        );
+
+        let retry_replay = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/problem-drafts/{}/commands/retry",
+                        generating.draft_id
+                    ))
+                    .header("content-type", "application/json")
+                    .header("Idempotency-Key", "control-retry")
+                    .header("X-Actor-Id", "researcher")
+                    .header("Authorization", "Bearer researcher-token-123456789")
+                    .body(Body::from(retry_body))
+                    .expect("request"),
+            )
+            .await
+            .expect("retry replay response");
+        let retry_replay: Value = serde_json::from_slice(
+            &to_bytes(retry_replay.into_body(), usize::MAX)
+                .await
+                .expect("retry replay body"),
+        )
+        .expect("retry replay json");
+        assert_eq!(
+            retry_replay
+                .pointer("/data/replayed")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
     }
 
     #[tokio::test]
@@ -4646,6 +5347,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_project_review_mode_precedes_the_legacy_approval_boolean() {
+        let (app, _service, _temp) = app().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/projects")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name":"automatic review project",
+                            "problem":"Prove P",
+                            "budget":{
+                                "max_rounds":2,
+                                "max_parallel_workers":2,
+                                "max_minutes_per_task":20,
+                                "max_model_calls_per_task":2,
+                                "max_total_model_calls":20
+                            },
+                            "human_route_approval":true,
+                            "review_mode":"automatic"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body: Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body"),
+        )
+        .expect("json");
+        assert_eq!(
+            body.pointer("/data/review_mode").and_then(Value::as_str),
+            Some("automatic")
+        );
+        assert_eq!(
+            body.pointer("/data/human_route_approval")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
     async fn commands_require_idempotency_key() {
         let (app, service, _temp) = app().await;
         let project = service
@@ -4684,6 +5432,221 @@ mod tests {
         assert_eq!(
             body.pointer("/error/code").and_then(Value::as_str),
             Some("invalid_request")
+        );
+    }
+
+    #[tokio::test]
+    async fn human_collaboration_endpoints_accept_the_ui_contracts_and_are_documented() {
+        let (app, service, _temp) = app().await;
+        let project = service
+            .create_project_with_review_mode(
+                "human route api".into(),
+                ProblemContract {
+                    original_problem: "Prove P".into(),
+                    target_statement: "P".into(),
+                    assumptions: vec![],
+                    success_criteria: "accepted".into(),
+                    version: 1,
+                },
+                Budget::default(),
+                ReviewMode::Strict,
+            )
+            .await
+            .expect("strict project");
+        let route_body = json!({
+            "expected_revision":project.revision,
+            "title":"Human localization route",
+            "method_summary":"Study P after localization at every prime",
+            "approach_kind":"reduction",
+            "route_role":"primary",
+            "plain_language_summary":"Reduce the global claim to local checks.",
+            "steps":["localize the statement","prove the local-to-global bridge"],
+            "target_goal_ids":[],
+            "required_fact_ids":[],
+            "known_risks":["the bridge may need finite generation"],
+            "worker_role":"human_collaborator",
+            "objective":"Prove the exact local-to-global bridge.",
+            "completion_contract":"A checkable proof, counterexample, or named blocker.",
+            "priority":0.95,
+            "reason":"Execute the route authored on the research whiteboard."
+        });
+        let route_uri = format!("/api/v1/projects/{}/routes", project.project_id);
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&route_uri)
+                    .header("content-type", "application/json")
+                    .header("Idempotency-Key", "api-human-route-1")
+                    .body(Body::from(route_body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("human route response");
+        assert_eq!(created.status(), StatusCode::ACCEPTED);
+        let created: Value = serde_json::from_slice(
+            &to_bytes(created.into_body(), usize::MAX)
+                .await
+                .expect("body"),
+        )
+        .expect("json");
+        assert_eq!(
+            created
+                .pointer("/data/execution_started")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            created
+                .pointer("/data/route_id")
+                .and_then(Value::as_str)
+                .is_some()
+        );
+        assert!(
+            created
+                .pointer("/data/task_id")
+                .and_then(Value::as_str)
+                .is_some()
+        );
+
+        let settings_project = service
+            .create_project(
+                "settings api".into(),
+                ProblemContract {
+                    original_problem: "Prove Q".into(),
+                    target_statement: "Q".into(),
+                    assumptions: vec![],
+                    success_criteria: "accepted".into(),
+                    version: 1,
+                },
+                Budget::default(),
+            )
+            .await
+            .expect("settings project");
+        let settings = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/projects/{}/commands/settings",
+                        settings_project.project_id
+                    ))
+                    .header("content-type", "application/json")
+                    .header("Idempotency-Key", "api-settings-1")
+                    .body(Body::from(
+                        json!({
+                            "expected_revision":settings_project.revision,
+                            "reason":"whiteboard settings",
+                            "payload":{
+                                "limits":{
+                                    "max_rounds":8,
+                                    "max_parallel_workers":4,
+                                    "max_minutes_per_task":30,
+                                    "max_model_calls_per_task":3,
+                                    "max_total_model_calls":80
+                                },
+                                "review_mode":"automatic"
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("settings response");
+        assert_eq!(settings.status(), StatusCode::ACCEPTED);
+        let settings: Value = serde_json::from_slice(
+            &to_bytes(settings.into_body(), usize::MAX)
+                .await
+                .expect("body"),
+        )
+        .expect("json");
+        assert_eq!(
+            settings.pointer("/data/type").and_then(Value::as_str),
+            Some("research_settings")
+        );
+        assert_eq!(
+            settings
+                .pointer("/data/payload/review_mode")
+                .and_then(Value::as_str),
+            Some("automatic")
+        );
+
+        let focus_project = service
+            .create_project(
+                "goal review api".into(),
+                ProblemContract {
+                    original_problem: "Prove R".into(),
+                    target_statement: "R".into(),
+                    assumptions: vec![],
+                    success_criteria: "accepted".into(),
+                    version: 1,
+                },
+                Budget::default(),
+            )
+            .await
+            .expect("goal review project");
+        let focus = "从交换代数的局部化角度重新讨论主目标";
+        let goal_review = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/projects/{}/commands/goal-review",
+                        focus_project.project_id
+                    ))
+                    .header("content-type", "application/json")
+                    .header("Idempotency-Key", "api-goal-review-1")
+                    .body(Body::from(
+                        json!({
+                            "expected_revision":focus_project.revision,
+                            "reason":"force a new goal discussion",
+                            "payload":{"focus":focus}
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("goal review response");
+        assert_eq!(goal_review.status(), StatusCode::ACCEPTED);
+        let goal_review: Value = serde_json::from_slice(
+            &to_bytes(goal_review.into_body(), usize::MAX)
+                .await
+                .expect("body"),
+        )
+        .expect("json");
+        assert_eq!(
+            goal_review
+                .pointer("/data/payload/focus")
+                .and_then(Value::as_str),
+            Some(focus)
+        );
+
+        let document = openapi_document();
+        for path in [
+            "/paths/~1api~1v1~1projects~1{project_id}~1routes/post",
+            "/paths/~1api~1v1~1projects~1{project_id}~1commands~1goal-review/post",
+            "/paths/~1api~1v1~1projects~1{project_id}~1commands~1review-policy/post",
+            "/paths/~1api~1v1~1projects~1{project_id}~1commands~1settings/post",
+        ] {
+            assert!(
+                document.pointer(path).is_some(),
+                "missing OpenAPI path {path}"
+            );
+        }
+        assert_eq!(
+            document
+                .pointer("/paths/~1api~1v1~1projects~1{project_id}~1routes/post/requestBody/content/application~1json/schema/$ref")
+                .and_then(Value::as_str),
+            Some("#/components/schemas/HumanRouteCreateRequest")
+        );
+        assert!(
+            document
+                .pointer("/components/schemas/ResearchBoardView/properties/planning_suggestions/items/$ref")
+                .is_some()
         );
     }
 
@@ -4984,6 +5947,335 @@ mod tests {
         assert!(runs[0].result.is_some());
     }
 
+    #[test]
+    fn endpoint_descriptors_are_unique_and_drive_openapi_metadata() {
+        assert_eq!(ENDPOINT_DESCRIPTORS.len(), 150);
+        let mut registered = BTreeSet::new();
+        for endpoint in ENDPOINT_DESCRIPTORS.iter() {
+            assert!(
+                registered.insert((endpoint.path, endpoint.method)),
+                "duplicate endpoint descriptor: {} {}",
+                endpoint.method.as_str(),
+                endpoint.path
+            );
+        }
+
+        let document = openapi_document();
+        let paths = document["paths"].as_object().expect("OpenAPI paths");
+        let documented: BTreeSet<_> = ENDPOINT_DESCRIPTORS
+            .iter()
+            .filter(|endpoint| endpoint.documented)
+            .map(|endpoint| {
+                (
+                    endpoint.path.to_owned(),
+                    endpoint.method.as_str().to_owned(),
+                )
+            })
+            .collect();
+        let mut generated = BTreeSet::new();
+        for (path, path_item) in paths {
+            for method in ["get", "post"] {
+                if path_item.get(method).is_some() {
+                    generated.insert((path.clone(), method.to_owned()));
+                }
+            }
+        }
+        assert_eq!(documented.len(), 148);
+        assert_eq!(generated, documented);
+
+        for endpoint in ENDPOINT_DESCRIPTORS
+            .iter()
+            .filter(|endpoint| endpoint.documented)
+        {
+            let operation = &paths[endpoint.path][endpoint.method.as_str()];
+            assert_eq!(
+                operation["summary"].as_str(),
+                Some(endpoint.summary),
+                "summary drift for {} {}",
+                endpoint.method.as_str(),
+                endpoint.path
+            );
+            assert!(
+                operation["responses"]
+                    .get(endpoint.success_status)
+                    .is_some(),
+                "success status drift for {} {}",
+                endpoint.method.as_str(),
+                endpoint.path
+            );
+            let documents_idempotency = operation["parameters"]
+                .as_array()
+                .expect("operation parameters")
+                .iter()
+                .any(|parameter| parameter["name"] == "Idempotency-Key");
+            assert_eq!(
+                documents_idempotency,
+                endpoint.idempotency_required,
+                "idempotency drift for {} {}",
+                endpoint.method.as_str(),
+                endpoint.path
+            );
+            match endpoint.auth {
+                EndpointAuth::Public => assert_eq!(operation["security"], json!([])),
+                EndpointAuth::WorkerToken => {
+                    assert_eq!(operation["security"], json!([{"WorkerToken":[]}]));
+                }
+                EndpointAuth::Actor => assert!(operation.get("security").is_none()),
+            }
+            match endpoint.request_schema {
+                Some(schema) => assert_eq!(
+                    operation["requestBody"]["content"]["application/json"]["schema"]["$ref"]
+                        .as_str(),
+                    Some(format!("#/components/schemas/{schema}").as_str())
+                ),
+                None => assert!(operation.get("requestBody").is_none()),
+            }
+        }
+
+        let publication = endpoint_policy(&Method::POST, "/api/v1/projects/project-1/publications")
+            .expect("publication endpoint");
+        assert!(publication.idempotency_required);
+        let generation = endpoint_policy(&Method::POST, "/api/v1/problem-drafts")
+            .expect("problem generation endpoint");
+        assert!(generation.idempotency_required);
+        assert_eq!(generation.success_status, "202");
+        let confirmation = endpoint_policy(
+            &Method::POST,
+            "/api/v1/problem-drafts/draft-1/commands/confirm",
+        )
+        .expect("problem confirmation endpoint");
+        assert!(confirmation.idempotency_required);
+        assert_eq!(confirmation.success_status, "202");
+        for command in ["cancel", "retry"] {
+            let control = endpoint_policy(
+                &Method::POST,
+                &format!("/api/v1/problem-drafts/draft-1/commands/{command}"),
+            )
+            .expect("problem draft control endpoint");
+            assert!(control.idempotency_required);
+            assert_eq!(control.success_status, "202");
+        }
+        let reconciliation =
+            endpoint_policy(&Method::POST, "/api/v1/system/reconciliation/commands/run")
+                .expect("reconciliation endpoint");
+        assert!(!reconciliation.idempotency_required);
+    }
+
+    #[test]
+    fn request_schema_defaults_and_unknown_field_policy_match_serde() {
+        fn required_fields(document: &Value, schema: &str) -> BTreeSet<String> {
+            document["components"]["schemas"][schema]["required"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        }
+
+        let document = openapi_document();
+        assert_eq!(
+            required_fields(&document, "GenerateProblemDraftRequest"),
+            ["prompt"].into_iter().map(str::to_owned).collect()
+        );
+        assert_eq!(
+            required_fields(&document, "ConfirmProblemDraftRequest"),
+            ["expected_document_hash", "expected_revision"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
+        assert_eq!(
+            required_fields(&document, "ProblemDraftControlRequest"),
+            ["expected_revision"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
+        assert_eq!(
+            required_fields(&document, "ProblemRevisionRequest"),
+            [
+                "change_reason",
+                "expected_revision",
+                "success_criteria",
+                "target_statement",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+        );
+        assert_eq!(
+            required_fields(&document, "HumanRouteProposalRequest"),
+            ["expected_revision", "method_summary", "reason", "title"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
+        assert_eq!(
+            required_fields(&document, "CandidateSubmission"),
+            [
+                "candidate_type",
+                "proof_markdown",
+                "route_cancellation_epoch",
+                "route_id",
+                "statement",
+                "task_id",
+                "task_revision",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+        );
+
+        let problem: ProblemRevisionRequest = serde_json::from_value(json!({
+            "expected_revision":1,
+            "target_statement":"p",
+            "success_criteria":"prove p",
+            "change_reason":"clarify"
+        }))
+        .expect("defaulted problem revision fields");
+        assert!(problem.assumptions.is_empty());
+        assert!(!problem.replan);
+
+        let generated: GenerateProblemDraftRequest = serde_json::from_value(json!({
+            "prompt":"study the local notes"
+        }))
+        .expect("defaulted problem generation fields");
+        assert_eq!(generated.context_dir, ".");
+        let confirmation: ConfirmProblemDraftRequest = serde_json::from_value(json!({
+            "expected_revision":2,
+            "expected_document_hash":"sha256"
+        }))
+        .expect("defaulted confirmation fields");
+        assert!(confirmation.start);
+        assert!(!confirmation.acknowledge_material_warnings);
+        assert!(confirmation.document.is_none());
+        let control: ProblemDraftControlRequest = serde_json::from_value(json!({
+            "expected_revision":2
+        }))
+        .expect("problem draft control request");
+        assert_eq!(control.expected_revision, 2);
+        assert!(
+            serde_json::from_value::<ProblemDraftControlRequest>(json!({
+                "expected_revision":2,
+                "unexpected":true
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ConfirmProblemDraftRequest>(json!({
+                "expected_revision":2,
+                "expected_document_hash":"sha256",
+                "unexpected":true
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ProblemRevisionRequest>(json!({
+                "expected_revision":1,
+                "target_statement":"p",
+                "success_criteria":"prove p",
+                "change_reason":"clarify",
+                "undocumented":true
+            }))
+            .is_err()
+        );
+
+        let route: HumanRouteProposalRequest = serde_json::from_value(json!({
+            "expected_revision":1,
+            "title":"direct",
+            "method_summary":"prove directly",
+            "reason":"independent route"
+        }))
+        .expect("defaulted route proposal fields");
+        assert!(route.target_goal_ids.is_empty());
+        assert!(route.required_fact_ids.is_empty());
+        assert!(route.known_risks.is_empty());
+
+        let candidate: CandidateSubmission = serde_json::from_value(json!({
+            "task_id":"task-1",
+            "route_id":"route-1",
+            "statement":"p",
+            "proof_markdown":"proof",
+            "candidate_type":"theorem",
+            "task_revision":1,
+            "route_cancellation_epoch":0
+        }))
+        .expect("defaulted candidate fields");
+        assert!(candidate.target_goal_ids.is_empty());
+        assert!(candidate.assumptions.is_empty());
+        assert!(candidate.dependency_fact_ids.is_empty());
+        assert!(candidate.definitions_introduced.is_empty());
+        assert!(candidate.external_source_ids.is_empty());
+        assert!(
+            serde_json::from_value::<CreatePublicationRequest>(
+                json!({"allow_partial":false,"undocumented":true})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn endpoint_auth_matches_exact_route_templates_and_fails_closed() {
+        assert_eq!(
+            endpoint_auth(&Method::POST, "/api/v1/actors/bootstrap"),
+            EndpointAuth::Public
+        );
+        assert_eq!(
+            endpoint_auth(&Method::POST, "/api/v1/worker-nodes/node-1/heartbeat"),
+            EndpointAuth::WorkerToken
+        );
+        assert_eq!(
+            endpoint_auth(
+                &Method::POST,
+                "/api/v1/projects/project-1/distributed/leases/next"
+            ),
+            EndpointAuth::WorkerToken
+        );
+        assert_eq!(
+            endpoint_auth(&Method::GET, "/api/v1/task-leases/lease-1"),
+            EndpointAuth::Actor
+        );
+        for command in ["cancel", "retry"] {
+            assert_eq!(
+                endpoint_auth(
+                    &Method::POST,
+                    &format!("/api/v1/problem-drafts/draft-1/commands/{command}")
+                ),
+                EndpointAuth::Actor
+            );
+        }
+        assert_eq!(
+            endpoint_auth(&Method::POST, "/api/v1/problem-drafts"),
+            EndpointAuth::Actor
+        );
+        assert_eq!(
+            endpoint_auth(&Method::GET, "/api/v1/problem-drafts/draft-1"),
+            EndpointAuth::Actor
+        );
+        assert_eq!(
+            endpoint_auth(
+                &Method::POST,
+                "/api/v1/problem-drafts/draft-1/commands/confirm"
+            ),
+            EndpointAuth::Actor
+        );
+        assert_eq!(
+            endpoint_auth(&Method::POST, "/api/v1/worker-nodes/node-1/heartbeat/extra"),
+            EndpointAuth::Actor,
+            "an unknown lookalike path must not inherit public worker access"
+        );
+        assert_eq!(
+            endpoint_auth(&Method::GET, "/api/v1/actors/bootstrap"),
+            EndpointAuth::Actor,
+            "access policy is method-specific"
+        );
+        assert!(!route_path_matches(
+            "/api/v1/task-leases/{lease_id}",
+            "/api/v1/task-leases/"
+        ));
+    }
+
     #[tokio::test]
     async fn exposes_openapi_31_document() {
         let (app, _service, _temp) = app().await;
@@ -5003,7 +6295,36 @@ mod tests {
         )
         .expect("json");
         assert_eq!(body.get("openapi").and_then(Value::as_str), Some("3.1.0"));
+        assert!(
+            body.pointer("/paths/~1api~1v1~1problem-drafts/post")
+                .is_some()
+        );
+        assert!(
+            body.pointer("/paths/~1api~1v1~1problem-drafts~1{draft_id}/get")
+                .is_some()
+        );
+        assert!(
+            body.pointer("/paths/~1api~1v1~1problem-drafts~1{draft_id}~1commands~1confirm/post")
+                .is_some()
+        );
+        assert!(
+            body.pointer("/paths/~1api~1v1~1problem-drafts~1{draft_id}~1commands~1cancel/post")
+                .is_some()
+        );
+        assert!(
+            body.pointer("/paths/~1api~1v1~1problem-drafts~1{draft_id}~1commands~1retry/post")
+                .is_some()
+        );
         assert!(body.pointer("/paths/~1api~1v1~1projects/post").is_some());
+        assert!(
+            body.pointer("/paths/~1api~1v1~1projects~1{project_id}~1obligations/get")
+                .is_some()
+        );
+        assert_eq!(
+            body.pointer("/paths/~1api~1v1~1projects~1{project_id}~1obligations/get/responses/200/content/application~1json/schema/$ref")
+                .and_then(Value::as_str),
+            Some("#/components/schemas/ProofObligationGraphEnvelope")
+        );
         assert_eq!(
             body.pointer(
                 "/paths/~1api~1v1~1projects~1{project_id}~1commands~1start/post/parameters/1/name"
@@ -5051,6 +6372,22 @@ mod tests {
         assert!(
             body.pointer("/components/securitySchemes/ActorBearer")
                 .is_some()
+        );
+        let suggestion_required = body
+            .pointer("/components/schemas/SuggestionRequest/required")
+            .and_then(Value::as_array)
+            .expect("SuggestionRequest required fields");
+        assert!(
+            suggestion_required
+                .iter()
+                .any(|value| value == "expected_revision")
+        );
+        assert!(suggestion_required.iter().any(|value| value == "content"));
+        assert!(
+            !suggestion_required
+                .iter()
+                .any(|value| value == "target_route_id"),
+            "optional target_route_id must not be advertised as required"
         );
     }
 
@@ -5122,6 +6459,106 @@ mod tests {
         }
         assert!(received_pong);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn handler_authorization_reuses_the_actor_authenticated_by_middleware() {
+        async fn strip_actor_credentials(
+            mut request: axum::extract::Request,
+            next: Next,
+        ) -> Response {
+            request.headers_mut().remove("X-Actor-Id");
+            request.headers_mut().remove(header::AUTHORIZATION);
+            next.run(request).await
+        }
+
+        async fn cached_admin_probe(
+            State(state): State<AppState>,
+            Extension(actor): Extension<Actor>,
+        ) -> Result<Json<Actor>, ApiError> {
+            authorize_actor(
+                state.service.store(),
+                &actor,
+                None,
+                "cached_admin_probe",
+                "system",
+                "probe",
+                "admin",
+            )
+            .await?;
+            Ok(Json(actor))
+        }
+
+        let (_app, service, _temp) = app().await;
+        service
+            .store()
+            .bootstrap_admin("admin", "Admin", "admin-token-123456789")
+            .await
+            .expect("admin");
+        let state = AppState { service };
+        let probe = Router::new()
+            .route("/private-auth-probe", get(cached_admin_probe))
+            .layer(middleware::from_fn(strip_actor_credentials))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                authentication_gate,
+            ))
+            .with_state(state);
+
+        let response = probe
+            .oneshot(
+                Request::builder()
+                    .uri("/private-auth-probe")
+                    .header("X-Actor-Id", "admin")
+                    .header("Authorization", "Bearer admin-token-123456789")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Actor = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body"),
+        )
+        .expect("actor json");
+        assert_eq!(body.actor_id, "admin");
+        assert_eq!(body.role, "admin");
+    }
+
+    #[tokio::test]
+    async fn public_worker_heartbeat_still_uses_only_the_worker_token() {
+        let (app, service, _temp) = app().await;
+        service
+            .store()
+            .bootstrap_admin("admin", "Admin", "admin-token-123456789")
+            .await
+            .expect("admin");
+        service
+            .store()
+            .register_worker_node(
+                "worker-node",
+                "Worker node",
+                json!({"local":false}),
+                "worker-token-123456789",
+            )
+            .await
+            .expect("worker node");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/worker-nodes/worker-node/heartbeat")
+                    .header("content-type", "application/json")
+                    .header("X-Worker-Token", "worker-token-123456789")
+                    .body(Body::from(json!({"node_epoch":1}).to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

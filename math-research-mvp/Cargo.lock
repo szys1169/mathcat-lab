@@ -143,7 +143,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
 dependencies = [
  "axum-core",
- "axum-macros",
  "base64",
  "bytes",
  "form_urlencoded",
@@ -157,7 +156,6 @@ dependencies = [
  "matchit",
  "memchr",
  "mime",
- "multer",
  "percent-encoding",
  "pin-project-lite",
  "serde_core",
@@ -191,17 +189,6 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
-]
-
-[[package]]
-name = "axum-macros"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7aa268c23bfbbd2c4363b9cd302a4f504fb2a9dfe7e3451d66f35dd392e20aca"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
 ]
 
 [[package]]
@@ -468,15 +455,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "encoding_rs"
-version = "0.8.35"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3"
-dependencies = [
- "cfg-if",
 ]
 
 [[package]]
@@ -1135,7 +1113,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "math-research-agent"
-version = "0.1.0"
+version = "2.5.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1176,16 +1154,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
-name = "mime_guess"
-version = "2.0.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
-dependencies = [
- "mime",
- "unicase",
-]
-
-[[package]]
 name = "mio"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1194,23 +1162,6 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "multer"
-version = "3.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83e87776546dc87511aa5ee218730c92b666d7264ab6ed41f9d215af9cd5224b"
-dependencies = [
- "bytes",
- "encoding_rs",
- "futures-util",
- "http",
- "httparse",
- "memchr",
- "mime",
- "spin",
- "version_check",
 ]
 
 [[package]]
@@ -1641,38 +1592,35 @@ dependencies = [
 
 [[package]]
 name = "research-api"
-version = "0.1.0"
+version = "2.5.0"
 dependencies = [
  "async-stream",
+ "async-trait",
  "axum",
- "bytes",
  "chrono",
  "futures",
- "http",
- "mime_guess",
  "research-core",
  "research-domain",
  "research-storage",
  "research-worker-runtime",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
- "thiserror",
  "tokio",
  "tokio-stream",
  "tokio-tungstenite",
+ "tokio-util",
  "tower",
  "tower-http",
- "tracing",
  "ulid",
- "utoipa",
 ]
 
 [[package]]
 name = "research-core"
-version = "0.1.0"
+version = "2.5.0"
 dependencies = [
- "anyhow",
+ "async-trait",
  "chrono",
  "futures",
  "hex",
@@ -1689,22 +1637,22 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "ulid",
 ]
 
 [[package]]
 name = "research-domain"
-version = "0.1.0"
+version = "2.5.0"
 dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "ulid",
  "utoipa",
 ]
 
 [[package]]
 name = "research-storage"
-version = "0.1.0"
+version = "2.5.0"
 dependencies = [
  "chrono",
  "hex",
@@ -1721,7 +1669,7 @@ dependencies = [
 
 [[package]]
 name = "research-worker-runtime"
-version = "0.1.0"
+version = "2.5.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1734,7 +1682,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
- "tracing",
  "ulid",
 ]
 
@@ -2444,15 +2391,12 @@ dependencies = [
  "futures-util",
  "http",
  "http-body",
- "http-body-util",
  "pin-project-lite",
- "tokio",
  "tower",
  "tower-layer",
  "tower-service",
  "tracing",
  "url",
- "uuid",
 ]
 
 [[package]]
@@ -2569,12 +2513,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "unicase"
-version = "2.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbc4bc3a9f746d862c45cb89d705aa10f187bb96c76001afab07a0d35ce60142"
-
-[[package]]
 name = "unicode-bidi"
 version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2654,17 +2592,6 @@ dependencies = [
  "regex",
  "syn 2.0.119",
  "ulid",
-]
-
-[[package]]
-name = "uuid"
-version = "1.26.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5772d71c9be8a8a6ac2117d949c5b224c1b72241bb611d9a3012edcf8af7812"
-dependencies = [
- "getrandom 0.4.3",
- "js-sys",
- "wasm-bindgen",
 ]
 
 [[package]]

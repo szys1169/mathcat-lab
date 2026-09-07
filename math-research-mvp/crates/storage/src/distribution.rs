@@ -1,13 +1,35 @@
-use chrono::{DateTime, Duration, Utc};
-use research_domain::{DomainEvent, Task, TaskLease, WorkerNode, WorkerOutput};
+use chrono::{DateTime, Utc};
+use research_domain::{
+    DomainEvent, Task, TaskLease, TaskSteer, Verification, WorkerNode, WorkerOutput,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 
 use crate::{
-    SqliteStore, StorageError, StorageResult, append_event, bump_revision, entity, json_text,
-    new_id, rows,
+    LocalResultSubmission, LocalTaskLease, SqliteStore, StorageError, StorageResult, append_event,
+    bump_revision, entity, json_text,
+    reliability_v2::worker_result_envelope_identity,
+    route_mutations::{TaskLeaseExpiry, expire_task_lease_tx},
+    rows,
 };
+
+#[derive(Debug)]
+pub struct TaskLeaseCompletion {
+    pub events: Vec<DomainEvent>,
+    pub verifications: Vec<Verification>,
+}
+
+/// Authenticated, fenced input for committing one distributed worker result.
+pub struct TaskLeaseCompletionRequest<'a> {
+    pub lease_id: &'a str,
+    pub node_id: &'a str,
+    pub token: &'a str,
+    pub node_epoch: i64,
+    pub lease_epoch: i64,
+    pub output: &'a WorkerOutput,
+    pub incorporated_steer_ids: &'a [String],
+}
 
 impl SqliteStore {
     pub async fn register_worker_node(
@@ -90,108 +112,68 @@ impl SqliteStore {
             .and_then(Value::as_array)
             .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>())
             .unwrap_or_default();
-        let _admission = self
-            .admit_write(
-                crate::state_writer::WritePriority::FactOrLease,
-                "lease_distributed_task",
-            )
-            .await?;
-        let mut tx = self.pool().begin().await?;
-        let now = Utc::now();
-        let expired = sqlx::query("SELECT lease_id,task_id,task_revision,route_epoch FROM task_leases WHERE project_id=? AND status='active' AND expires_at<?")
-            .bind(project_id).bind(now.to_rfc3339()).fetch_all(&mut *tx).await?;
-        let mut events = Vec::new();
-        for row in &expired {
-            let lease_id: String = row.try_get("lease_id")?;
-            let task_id: String = row.try_get("task_id")?;
-            sqlx::query("UPDATE task_leases SET status='expired' WHERE lease_id=?")
-                .bind(&lease_id)
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query("UPDATE tasks SET status=CASE WHEN worker_id IS NULL THEN 'open' ELSE 'assigned' END,revision=revision+1 WHERE task_id=? AND status='running' AND revision=? AND route_cancellation_epoch=?")
-                .bind(&task_id).bind(row.try_get::<i64,_>("task_revision")?).bind(row.try_get::<i64,_>("route_epoch")?).execute(&mut *tx).await?;
-            sqlx::query(
-                "UPDATE workers SET status='idle' WHERE current_task_id=? AND status='running'",
-            )
-            .bind(&task_id)
-            .execute(&mut *tx)
-            .await?;
-        }
-        let task_rows = sqlx::query("SELECT t.* FROM tasks t JOIN routes r ON t.route_id=r.route_id WHERE t.project_id=? AND t.status IN ('open','assigned') AND r.status='active' AND NOT EXISTS (SELECT 1 FROM task_leases l WHERE l.task_id=t.task_id AND l.status='active') ORDER BY t.priority DESC,t.task_id")
-            .bind(project_id).fetch_all(&mut *tx).await?;
-        let selected = task_rows.iter().find(|row| {
+        let mut events = self.expire_distributed_task_leases(project_id).await?;
+        let task_rows = sqlx::query("SELECT t.* FROM tasks t JOIN routes r ON t.route_id=r.route_id JOIN projects p ON p.project_id=t.project_id WHERE t.project_id=? AND t.status IN ('queued','open','assigned') AND r.status='active' AND p.status IN ('running','needs_human_review') AND r.human_review IN ('approved','not_required') AND t.context_packet_id IS NOT NULL AND EXISTS (SELECT 1 FROM context_packets c WHERE c.context_packet_id=t.context_packet_id AND c.status='active') AND EXISTS (SELECT 1 FROM task_contracts c WHERE c.task_id=t.task_id) AND (SELECT COUNT(*) FROM task_attempts a WHERE a.task_id=t.task_id)<3 AND NOT EXISTS (SELECT 1 FROM task_leases l WHERE l.task_id=t.task_id AND l.status='active') ORDER BY t.priority DESC,t.task_id")
+            .bind(project_id).fetch_all(self.pool()).await?;
+        for selected in task_rows.iter().filter(|row| {
             let role = row.try_get::<String, _>("worker_role").unwrap_or_default();
             roles.is_empty() || roles.contains(&role.as_str())
-        });
-        let Some(selected) = selected else {
-            if expired.is_empty() {
-                tx.rollback().await?;
-            } else {
-                let revision = bump_revision(&mut tx, project_id).await?;
-                events.push(
-                    append_event(
-                        &mut tx,
-                        project_id,
-                        revision,
-                        "task_lease.expired_batch",
-                        entity("project", project_id),
-                        json!({"count":expired.len()}),
-                        None,
-                    )
-                    .await?,
-                );
-                tx.commit().await?;
-            }
-            return Ok((None, events));
-        };
-        let task_id: String = selected.try_get("task_id")?;
-        let claimed = sqlx::query("UPDATE tasks SET status='running',revision=revision+1 WHERE task_id=? AND status IN ('open','assigned')")
-            .bind(&task_id).execute(&mut *tx).await?;
-        if claimed.rows_affected() != 1 {
-            return Err(StorageError::LateSubmission(
-                "task was claimed by another executor".into(),
-            ));
+        }) {
+            let task = rows::task(selected)?;
+            let offer = match self
+                .offer_local_task(
+                    &task,
+                    "distributed_worker",
+                    None,
+                    &format!("distributed:{node_id}"),
+                    node.capabilities.clone(),
+                )
+                .await
+            {
+                Ok(offer) => offer,
+                Err(StorageError::InvalidTransition(reason))
+                    if reason.contains("cannot be offered") =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            events.extend(offer.events.clone());
+            let local_lease = match self
+                .accept_distributed_handshake(
+                    &offer,
+                    (node_id, token, expected_node_epoch),
+                    Some("distributed-worker-v2"),
+                    json!({
+                        "node_id": node_id,
+                        "node_epoch": expected_node_epoch,
+                        "context_hash": offer.context_packet.content_hash,
+                        "task_contract_hash": offer.contract.content_hash,
+                    }),
+                    ttl_seconds,
+                )
+                .await
+            {
+                Ok(lease) => lease,
+                Err(error) => {
+                    if let Ok(failure_events) = self
+                        .fail_local_attempt(
+                            None,
+                            &offer,
+                            &format!("distributed worker handshake failed: {error}"),
+                        )
+                        .await
+                    {
+                        events.extend(failure_events);
+                    }
+                    return Err(error);
+                }
+            };
+            events.extend(local_lease.events.clone());
+            let lease = self.get_task_lease(&local_lease.lease_id).await?;
+            return Ok((Some((lease, local_lease.task)), events));
         }
-        sqlx::query("UPDATE workers SET status='running',last_heartbeat=? WHERE current_task_id=?")
-            .bind(now.to_rfc3339())
-            .bind(&task_id)
-            .execute(&mut *tx)
-            .await?;
-        let task_row = sqlx::query("SELECT * FROM tasks WHERE task_id=?")
-            .bind(&task_id)
-            .fetch_one(&mut *tx)
-            .await?;
-        let task = rows::task(&task_row)?;
-        let lease_epoch: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(lease_epoch),0)+1 FROM task_leases WHERE task_id=?",
-        )
-        .bind(&task_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        let lease_id = new_id("lease");
-        let ttl = i64::try_from(ttl_seconds.clamp(10, 3600)).unwrap_or(3600);
-        let expires_at = now + Duration::seconds(ttl);
-        sqlx::query("INSERT INTO task_leases(lease_id,project_id,task_id,node_id,task_revision,route_epoch,lease_epoch,status,leased_at,expires_at,completed_at) VALUES(?,?,?,?,?,?,?,'active',?,?,NULL)")
-            .bind(&lease_id).bind(project_id).bind(&task_id).bind(node_id).bind(task.revision)
-            .bind(task.route_cancellation_epoch).bind(lease_epoch).bind(now.to_rfc3339()).bind(expires_at.to_rfc3339())
-            .execute(&mut *tx).await?;
-        let revision = bump_revision(&mut tx, project_id).await?;
-        events.push(append_event(&mut tx, project_id, revision, "task_lease.created", entity("task_lease", &lease_id), json!({"task_id":task_id,"node_id":node_id,"task_revision":task.revision,"route_epoch":task.route_cancellation_epoch,"lease_epoch":lease_epoch,"expires_at":expires_at}), Some(entity("task", &task_id))).await?);
-        let lease = TaskLease {
-            lease_id,
-            project_id: project_id.into(),
-            task_id,
-            node_id: node_id.into(),
-            task_revision: task.revision,
-            route_epoch: task.route_cancellation_epoch,
-            lease_epoch,
-            status: "active".into(),
-            leased_at: now,
-            expires_at,
-            completed_at: None,
-        };
-        tx.commit().await?;
-        Ok((Some((lease, task)), events))
+        Ok((None, events))
     }
 
     pub async fn renew_task_lease(
@@ -204,22 +186,10 @@ impl SqliteStore {
         ttl_seconds: u64,
     ) -> StorageResult<TaskLease> {
         authenticate_node(self, node_id, token, node_epoch).await?;
-        let _admission = self
-            .admit_write(
-                crate::state_writer::WritePriority::Telemetry,
-                "renew_distributed_task_lease",
-            )
+        let (_, local_lease) =
+            load_distributed_lease(self, lease_id, node_id, token, lease_epoch, true).await?;
+        self.heartbeat_local_lease(&local_lease, ttl_seconds)
             .await?;
-        let now = Utc::now();
-        let expires_at =
-            now + Duration::seconds(i64::try_from(ttl_seconds.clamp(10, 3600)).unwrap_or(3600));
-        let updated = sqlx::query("UPDATE task_leases SET expires_at=? WHERE lease_id=? AND node_id=? AND lease_epoch=? AND status='active' AND expires_at>=?")
-            .bind(expires_at.to_rfc3339()).bind(lease_id).bind(node_id).bind(lease_epoch).bind(now.to_rfc3339()).execute(self.pool()).await?;
-        if updated.rows_affected() != 1 {
-            return Err(StorageError::LateSubmission(
-                "lease is expired, stale, or owned by another node".into(),
-            ));
-        }
         self.get_task_lease(lease_id).await
     }
 
@@ -237,64 +207,201 @@ impl SqliteStore {
 
     pub async fn complete_task_lease(
         &self,
+        request: TaskLeaseCompletionRequest<'_>,
+    ) -> StorageResult<TaskLeaseCompletion> {
+        let TaskLeaseCompletionRequest {
+            lease_id,
+            node_id,
+            token,
+            node_epoch,
+            lease_epoch,
+            output,
+            incorporated_steer_ids,
+        } = request;
+        authenticate_node(self, node_id, token, node_epoch).await?;
+        let (lease, lease_view) =
+            load_distributed_lease(self, lease_id, node_id, token, lease_epoch, false).await?;
+        let (_, _, idempotency_key) =
+            worker_result_envelope_identity(&lease_view.attempt_id, output)?;
+        if let Some(existing) = sqlx::query_scalar::<_, String>(
+            "SELECT result_envelope_id FROM result_envelopes WHERE project_id=? AND idempotency_key=?",
+        )
+        .bind(&lease.project_id)
+        .bind(&idempotency_key)
+        .fetch_optional(self.pool())
+        .await?
+        {
+            let ingestion = self.ingest_local_result_envelope(&existing).await?;
+            return Ok(TaskLeaseCompletion {
+                events: ingestion.events,
+                verifications: ingestion.verifications,
+            });
+        }
+        let (_, current_lease_view) =
+            load_distributed_lease(self, lease_id, node_id, token, lease_epoch, true).await?;
+        let submitted = self
+            .submit_local_result_envelope_after_steers(
+                &current_lease_view,
+                output,
+                incorporated_steer_ids,
+            )
+            .await?;
+        let (result_envelope_id, mut events) = match submitted {
+            LocalResultSubmission::Submitted {
+                result_envelope_id,
+                events,
+            } => (result_envelope_id, events),
+            LocalResultSubmission::SteeringPending { steers } => {
+                return Err(StorageError::InvalidTransition(format!(
+                    "result omitted {} pending steer(s): {}",
+                    steers.len(),
+                    steers
+                        .iter()
+                        .map(|steer| steer.steer_id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )));
+            }
+        };
+        let ingestion = self
+            .ingest_local_result_envelope(&result_envelope_id)
+            .await?;
+        events.extend(ingestion.events);
+        Ok(TaskLeaseCompletion {
+            events,
+            verifications: ingestion.verifications,
+        })
+    }
+
+    pub async fn pending_distributed_task_steers(
+        &self,
         lease_id: &str,
         node_id: &str,
         token: &str,
         node_epoch: i64,
         lease_epoch: i64,
-        output: &WorkerOutput,
-    ) -> StorageResult<Vec<DomainEvent>> {
+    ) -> StorageResult<Vec<TaskSteer>> {
         authenticate_node(self, node_id, token, node_epoch).await?;
-        let lease = self.get_task_lease(lease_id).await?;
-        if lease.node_id != node_id
-            || lease.lease_epoch != lease_epoch
-            || lease.status != "active"
-            || lease.expires_at < Utc::now()
-        {
-            return Err(StorageError::LateSubmission(
-                "lease is expired, stale, or owned by another node".into(),
-            ));
-        }
-        let task = self.get_task(&lease.project_id, &lease.task_id).await?;
-        if task.revision != lease.task_revision
-            || task.route_cancellation_epoch != lease.route_epoch
-        {
-            return Err(StorageError::LateSubmission(
-                "task revision or route epoch changed after lease".into(),
-            ));
-        }
-        let mut events = self.record_worker_output(&task, output).await?;
+        let (_, lease) =
+            load_distributed_lease(self, lease_id, node_id, token, lease_epoch, true).await?;
+        let (steers, _) = self
+            .pending_task_steers(
+                &lease.task.project_id,
+                &lease.task.task_id,
+                lease.task.revision,
+                lease.task.route_cancellation_epoch,
+            )
+            .await?;
+        Ok(steers)
+    }
+
+    async fn expire_distributed_task_leases(
+        &self,
+        project_id: &str,
+    ) -> StorageResult<Vec<DomainEvent>> {
         let _admission = self
             .admit_write(
                 crate::state_writer::WritePriority::FactOrLease,
-                "complete_distributed_task_lease",
+                "expire_distributed_task_leases",
             )
             .await?;
         let now = Utc::now();
         let mut tx = self.pool().begin().await?;
-        let updated = sqlx::query("UPDATE task_leases SET status='completed',completed_at=? WHERE lease_id=? AND status='active' AND lease_epoch=?")
-            .bind(now.to_rfc3339()).bind(lease_id).bind(lease_epoch).execute(&mut *tx).await?;
-        if updated.rows_affected() != 1 {
-            return Err(StorageError::LateSubmission(
-                "lease completion raced with another submitter".into(),
-            ));
+        let expired = sqlx::query("SELECT lease_id,task_id,attempt_id,worker_instance_id FROM task_leases WHERE project_id=? AND status='active' AND expires_at<?")
+            .bind(project_id).bind(now.to_rfc3339()).fetch_all(&mut *tx).await?;
+        if expired.is_empty() {
+            tx.rollback().await?;
+            return Ok(Vec::new());
         }
-        let revision = bump_revision(&mut tx, &lease.project_id).await?;
-        events.push(
-            append_event(
+        let mut event_data = Vec::with_capacity(expired.len());
+        for row in expired {
+            let lease_id: String = row.try_get("lease_id")?;
+            let task_id: String = row.try_get("task_id")?;
+            let attempt_id: Option<String> = row.try_get("attempt_id")?;
+            let worker_instance_id: Option<String> = row.try_get("worker_instance_id")?;
+            let Some(outcome) = expire_task_lease_tx(
                 &mut tx,
-                &lease.project_id,
-                revision,
-                "task_lease.completed",
-                entity("task_lease", lease_id),
-                json!({"task_id":lease.task_id,"node_id":node_id,"lease_epoch":lease_epoch}),
-                Some(entity("task", &lease.task_id)),
+                TaskLeaseExpiry {
+                    project: project_id,
+                    lease: &lease_id,
+                    task: &task_id,
+                    attempt: attempt_id.as_deref(),
+                    worker_instance: worker_instance_id.as_deref(),
+                },
+                &now,
             )
-            .await?,
-        );
+            .await?
+            else {
+                continue;
+            };
+            event_data.push((lease_id, task_id, attempt_id, outcome.replayable_result));
+        }
+        let revision = bump_revision(&mut tx, project_id).await?;
+        let mut events = Vec::with_capacity(event_data.len());
+        for (lease_id, task_id, attempt_id, replayable_result) in event_data {
+            events.push(append_event(&mut tx, project_id, revision, "task.lease_expired", entity("task_lease", &lease_id), json!({"task_id":task_id,"attempt_id":attempt_id,"replayable_result":replayable_result}), Some(entity("task", &task_id))).await?);
+        }
         tx.commit().await?;
         Ok(events)
     }
+}
+
+async fn load_distributed_lease(
+    store: &SqliteStore,
+    lease_id: &str,
+    node_id: &str,
+    node_token: &str,
+    lease_epoch: i64,
+    require_current: bool,
+) -> StorageResult<(TaskLease, LocalTaskLease)> {
+    let row = sqlx::query("SELECT * FROM task_leases WHERE lease_id=?")
+        .bind(lease_id)
+        .fetch_optional(store.pool())
+        .await?
+        .ok_or_else(|| StorageError::NotFound {
+            kind: "task_lease",
+            id: lease_id.into(),
+        })?;
+    let lease = task_lease_from_row(&row)?;
+    let attempt_id: Option<String> = row.try_get("attempt_id")?;
+    let worker_instance_id: Option<String> = row.try_get("worker_instance_id")?;
+    let lease_token_hash: Option<String> = row.try_get("lease_token_hash")?;
+    if lease.node_id != node_id
+        || lease.lease_epoch != lease_epoch
+        || lease_token_hash.as_deref() != Some(hash_secret(node_token).as_str())
+    {
+        return Err(StorageError::LateSubmission(
+            "lease token, epoch, or owning node is stale".into(),
+        ));
+    }
+    let attempt_id = attempt_id.ok_or_else(|| {
+        StorageError::LateSubmission("distributed lease has no V2 task attempt".into())
+    })?;
+    let worker_instance_id = worker_instance_id.ok_or_else(|| {
+        StorageError::LateSubmission("distributed lease has no V2 worker instance".into())
+    })?;
+    let task = store.get_task(&lease.project_id, &lease.task_id).await?;
+    if require_current
+        && (lease.status != "active"
+            || lease.expires_at < Utc::now()
+            || task.revision != lease.task_revision
+            || task.route_cancellation_epoch != lease.route_epoch)
+    {
+        return Err(StorageError::LateSubmission(
+            "lease is expired or its task revision or route epoch is stale".into(),
+        ));
+    }
+    let local_lease = LocalTaskLease {
+        task,
+        attempt_id,
+        worker_instance_id,
+        lease_id: lease.lease_id.clone(),
+        lease_token: node_token.into(),
+        lease_epoch: lease.lease_epoch,
+        expires_at: lease.expires_at,
+        events: Vec::new(),
+    };
+    Ok((lease, local_lease))
 }
 
 async fn authenticate_node(

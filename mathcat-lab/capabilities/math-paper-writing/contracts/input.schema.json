@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "math-paper-writing/input.schema.json",
+  "title": "Math paper writing request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "task_id",
+    "executor",
+    "workspace",
+    "source_packet",
+    "language"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100,
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "executor": {
+      "enum": [
+        "codex",
+        "deepseek_harness"
+      ]
+    },
+    "workspace": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_packet": {
+      "type": "string",
+      "minLength": 1
+    },
+    "selected_files": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "language": {
+      "enum": [
+        "en",
+        "zh",
+        "bilingual"
+      ]
+    },
+    "title_hint": {
+      "type": "string",
+      "default": ""
+    },
+    "venue": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "requirements": {
+      "type": "string",
+      "default": ""
+    },
+    "time_limit_seconds": {
+      "type": "integer",
+      "minimum": 60,
+      "maximum": 86400,
+      "default": 3600
+    },
+    "workflow_mode": {
+      "enum": [
+        "draft",
+        "revision",
+        "bilingual-sync",
+        "submission-audit"
+      ]
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "publish_current": {
+      "type": "boolean",
+      "default": true
+    }
+  }
+}

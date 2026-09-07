@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "math-paper-writing/artifacts.schema.json",
+  "$defs": {
+    "artifact": {
+      "type": "object",
+      "required": ["type", "path", "size", "sha256"],
+      "properties": {
+        "type": {"type": "string"},
+        "path": {"type": "string"},
+        "size": {"type": "integer", "minimum": 0},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "preview": {"enum": ["text", "pdf", "none"]}
+      }
+    }
+  },
+  "type": "object",
+  "required": ["schema_version", "artifacts"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "artifacts": {"type": "array", "items": {"$ref": "#/$defs/artifact"}}
+  }
+}

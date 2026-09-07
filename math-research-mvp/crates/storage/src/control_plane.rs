@@ -18,7 +18,7 @@ impl SqliteStore {
         rows.iter().map(task_steer_from_row).collect()
     }
 
-    pub async fn consume_pending_task_steers(
+    pub async fn pending_task_steers(
         &self,
         project_id: &str,
         task_id: &str,
@@ -28,7 +28,7 @@ impl SqliteStore {
         let _admission = self
             .admit_write(
                 crate::state_writer::WritePriority::HumanSafety,
-                "consume_task_steers",
+                "inspect_task_steers",
             )
             .await?;
         let mut tx = self.pool().begin().await?;
@@ -56,37 +56,34 @@ impl SqliteStore {
             tx.rollback().await?;
             return Ok((Vec::new(), Vec::new()));
         }
-        let now = Utc::now();
-        let revision = bump_revision(&mut tx, project_id).await?;
         let mut steers = Vec::new();
-        let mut events = Vec::new();
+        let mut stale = Vec::new();
         for row in rows {
-            let mut steer = task_steer_from_row(&row)?;
+            let steer = task_steer_from_row(&row)?;
             if steer.expected_task_revision != task_revision
                 || steer.expected_route_epoch != route_epoch
             {
-                sqlx::query("UPDATE task_steers SET status='stale',applied_at=? WHERE steer_id=?")
-                    .bind(now.to_rfc3339())
-                    .bind(&steer.steer_id)
-                    .execute(&mut *tx)
-                    .await?;
-                sqlx::query("UPDATE human_commands SET status='failed',error='task revision or route epoch changed',applied_at=? WHERE command_id=?")
-                    .bind(now.to_rfc3339()).bind(&steer.command_id).execute(&mut *tx).await?;
-                events.push(append_event(&mut tx, project_id, revision, "task.steer.rejected_stale", entity("task", task_id), json!({"steer_id":steer.steer_id,"expected_task_revision":steer.expected_task_revision,"expected_route_epoch":steer.expected_route_epoch}), Some(entity("command", &steer.command_id))).await?);
-                continue;
+                stale.push(steer);
+            } else {
+                steers.push(steer);
             }
-            sqlx::query("UPDATE task_steers SET status='applied',applied_at=? WHERE steer_id=?")
+        }
+        if stale.is_empty() {
+            tx.rollback().await?;
+            return Ok((steers, Vec::new()));
+        }
+        let now = Utc::now();
+        let revision = bump_revision(&mut tx, project_id).await?;
+        let mut events = Vec::with_capacity(stale.len());
+        for steer in stale {
+            sqlx::query("UPDATE task_steers SET status='stale',applied_at=? WHERE steer_id=?")
                 .bind(now.to_rfc3339())
                 .bind(&steer.steer_id)
                 .execute(&mut *tx)
                 .await?;
-            sqlx::query("UPDATE human_commands SET status='applied',after_revision=?,affected_entities_json=?,applied_at=? WHERE command_id=?")
-                .bind(revision).bind(json_text(&vec![entity("task", task_id)])?)
-                .bind(now.to_rfc3339()).bind(&steer.command_id).execute(&mut *tx).await?;
-            steer.status = "applied".into();
-            steer.applied_at = Some(now);
-            events.push(append_event(&mut tx, project_id, revision, "task.steer.applied", entity("task", task_id), json!({"steer_id":steer.steer_id,"content":steer.content,"task_revision":task_revision,"route_epoch":route_epoch}), Some(entity("command", &steer.command_id))).await?);
-            steers.push(steer);
+            sqlx::query("UPDATE human_commands SET status='failed',error='task revision or route epoch changed',applied_at=? WHERE command_id=?")
+                    .bind(now.to_rfc3339()).bind(&steer.command_id).execute(&mut *tx).await?;
+            events.push(append_event(&mut tx, project_id, revision, "task.steer.rejected_stale", entity("task", task_id), json!({"steer_id":steer.steer_id,"expected_task_revision":steer.expected_task_revision,"expected_route_epoch":steer.expected_route_epoch}), Some(entity("command", &steer.command_id))).await?);
         }
         tx.commit().await?;
         Ok((steers, events))
@@ -191,7 +188,7 @@ impl SqliteStore {
     }
 }
 
-fn task_steer_from_row(row: &sqlx::sqlite::SqliteRow) -> StorageResult<TaskSteer> {
+pub(crate) fn task_steer_from_row(row: &sqlx::sqlite::SqliteRow) -> StorageResult<TaskSteer> {
     Ok(TaskSteer {
         steer_id: row.try_get("steer_id")?,
         project_id: row.try_get("project_id")?,

@@ -1,0 +1,92 @@
+{
+  "source": "workspace skills/math-paper-writing",
+  "source_has_semantic_version": false,
+  "package_version": "0.4.0",
+  "files": [
+    {
+      "source": "agents/openai.yaml",
+      "bundled": "prompts/agents/openai.yaml",
+      "sha256": "95f3286257ee6ca80c03d0bee1396cd9fb7cab230d7eb731dc2e10cea8707c75"
+    },
+    {
+      "source": "references/build-and-submission-audit.md",
+      "bundled": "prompts/references/build-and-submission-audit.md",
+      "sha256": "eb257dc52a02e337be26e69ec6e55ee15a349b2307ba07a4b954cdefc1f2c678"
+    },
+    {
+      "source": "references/citation-and-definition.md",
+      "bundled": "prompts/references/citation-and-definition.md",
+      "sha256": "d0edb4e2b7687bc5287097ac9716e88ecd2c2d4265927deded425bc6c970c39c"
+    },
+    {
+      "source": "references/claim-evidence-ledger.md",
+      "bundled": "prompts/references/claim-evidence-ledger.md",
+      "sha256": "e84f5f51e1db0c5d6e78845c55d277cdc0f35bf1ab3c1b35f34631e3c12ba154"
+    },
+    {
+      "source": "references/CREDITS.md",
+      "bundled": "prompts/references/CREDITS.md",
+      "sha256": "6d52d7b82958539757502016abd221719f0016e0cb96eaa5d1e461da4070f4a5"
+    },
+    {
+      "source": "references/human-revision-and-bilingual-sync.md",
+      "bundled": "prompts/references/human-revision-and-bilingual-sync.md",
+      "sha256": "7abd64851bfa189c94897e7bc8d08ac92da3f956a9f30d8c5553a9c2f0a4cf75"
+    },
+    {
+      "source": "references/intro-checklist.md",
+      "bundled": "prompts/references/intro-checklist.md",
+      "sha256": "39637d0d8159f6a3b1ad150683439623b48ab0f0c8c4eecfab0058c403c09880"
+    },
+    {
+      "source": "references/latex-conventions.md",
+      "bundled": "prompts/references/latex-conventions.md",
+      "sha256": "325770f350e72704d2915091bcbb088b1370be854fa6ab9e27dc3498f7feb7e1"
+    },
+    {
+      "source": "references/notation-formula-audit.md",
+      "bundled": "prompts/references/notation-formula-audit.md",
+      "sha256": "4655b028ffb1b87e89aa6f893d21049db32389a3c73b3b1c1513ab6d611c89db"
+    },
+    {
+      "source": "references/paper-skeleton.md",
+      "bundled": "prompts/references/paper-skeleton.md",
+      "sha256": "dceb6aae6abdae137beeb25272a1846cbf09f2ac9fe5b2ecf8a4fcd2b75c62c8"
+    },
+    {
+      "source": "references/proof-obligation-audit.md",
+      "bundled": "prompts/references/proof-obligation-audit.md",
+      "sha256": "0d069a8e40dae56987b6abdf111c6b8789170dac9aa957e6e84f9a4d89edd253"
+    },
+    {
+      "source": "references/revision-and-review.md",
+      "bundled": "prompts/references/revision-and-review.md",
+      "sha256": "bdf96d4295115ce209209ae52441572852e81606b94f2f27c69e1f1ee24abe93"
+    },
+    {
+      "source": "references/source-packet.md",
+      "bundled": "prompts/references/source-packet.md",
+      "sha256": "1b296b23ab5280a49da2c9172e57f9c978b0113c1286e155018b871a5e04cde8"
+    },
+    {
+      "source": "references/structure.md",
+      "bundled": "prompts/references/structure.md",
+      "sha256": "1ca824224007d57c851a4ae4a19c9da928298993516a9b8358a20ae9fc87d122"
+    },
+    {
+      "source": "references/user-feedback-log.md",
+      "bundled": "prompts/references/user-feedback-log.md",
+      "sha256": "433b9692ac8984f9af7b504fb1b93dab133436309689adb7b347f18bdb960024"
+    },
+    {
+      "source": "scripts/audit_manuscript.py",
+      "bundled": "prompts/scripts/audit_manuscript.py",
+      "sha256": "dc61068c6c7b1548e18c83dfc073aca37a0bc3f4af039721965ef43c7c7ef0ca"
+    },
+    {
+      "source": "SKILL.md",
+      "bundled": "prompts/writing.md",
+      "sha256": "960fe131ff2d67a7866fd35bebbf2613d808d7297ec66a4411de36b5f1a4f003"
+    }
+  ]
+}

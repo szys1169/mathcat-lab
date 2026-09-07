@@ -157,35 +157,15 @@ pub(crate) async fn invalidate_imports_for_source(
     for row in rows {
         let import_id: String = row.try_get("import_id")?;
         let target_project_id: String = row.try_get("target_project_id")?;
-        let impact =
-            crate::fact_governance::compute_fact_impact_tx(tx, &target_project_id, source_fact_id)
-                .await?;
         sqlx::query("UPDATE project_fact_imports SET status='invalidated',invalidated_at=? WHERE import_id=?")
             .bind(now.to_rfc3339()).bind(&import_id).execute(&mut **tx).await?;
-        for fact_id in &impact.affected_fact_ids {
-            sqlx::query(
-                "UPDATE facts SET status='suspended' WHERE fact_id=? AND status!='revoked'",
-            )
-            .bind(fact_id)
-            .execute(&mut **tx)
-            .await?;
-            sqlx::query("UPDATE fact_assurances SET status='invalidated',invalidated_at=? WHERE fact_id=? AND status='active'")
-                .bind(now.to_rfc3339()).bind(fact_id).execute(&mut **tx).await?;
-        }
-        for goal_id in &impact.reopened_goal_ids {
-            sqlx::query("UPDATE goals SET status='open',solved_by_fact_id=NULL WHERE goal_id=?")
-                .bind(goal_id)
-                .execute(&mut **tx)
-                .await?;
-        }
-        for route_id in &impact.paused_route_ids {
-            sqlx::query("UPDATE routes SET status='paused',cancellation_epoch=cancellation_epoch+1 WHERE route_id=? AND status='active'")
-                .bind(route_id).execute(&mut **tx).await?;
-            sqlx::query("UPDATE tasks SET status='cancelled',revision=revision+1 WHERE route_id=? AND status IN ('open','assigned','running','blocked')")
-                .bind(route_id).execute(&mut **tx).await?;
-        }
-        sqlx::query("UPDATE projects SET status='needs_human_review' WHERE project_id=? AND status NOT IN ('stopped_by_human','error')")
-            .bind(&target_project_id).execute(&mut **tx).await?;
+        let impact = crate::fact_governance::invalidate_fact_for_project_tx(
+            tx,
+            &target_project_id,
+            source_fact_id,
+            None,
+        )
+        .await?;
         let revision = bump_revision(tx, &target_project_id).await?;
         events.push(
             append_event(
@@ -199,6 +179,20 @@ pub(crate) async fn invalidate_imports_for_source(
             )
             .await?,
         );
+        for obligation_id in &impact.reopened_obligation_ids {
+            events.push(
+                append_event(
+                    tx,
+                    &target_project_id,
+                    revision,
+                    "proof_obligation.updated",
+                    entity("proof_obligation", obligation_id),
+                    json!({"status":"open","reason":"imported supporting Fact is no longer trusted","source_fact_id":source_fact_id}),
+                    Some(entity("fact", source_fact_id)),
+                )
+                .await?,
+            );
+        }
     }
     Ok(events)
 }

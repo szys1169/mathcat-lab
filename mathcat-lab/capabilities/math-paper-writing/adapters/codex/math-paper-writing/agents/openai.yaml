@@ -1,0 +1,4 @@
+interface:
+  display_name: "Math Paper Writing"
+  short_description: "Write a LaTeX mathematics paper from an approved Source Packet"
+  default_prompt: "Use $math-paper-writing to turn the selected verified materials into a versioned, compilable mathematics paper."

@@ -1,0 +1,17 @@
+{
+  "protocol_version": "1.0",
+  "capability_id": "math-paper-writing",
+  "transport": "process-json-stdout",
+  "executable": "python",
+  "entrypoint": "adapter.py",
+  "skill": "../../SKILL.md",
+  "operations": {
+    "health": ["health"],
+    "preflight": ["preflight", "--request", "{request_file}"],
+    "prepare": ["prepare", "--request", "{request_file}"],
+    "finalize": ["finalize", "--run-dir", "{run_dir}"],
+    "terminate": ["terminate", "--run-dir", "{run_dir}", "--reason", "{reason}", "--message", "{message}"]
+  },
+  "stdout": {"encoding": "ascii-safe-json", "one_document": true, "success_exit_code": 0, "error_exit_code": 2},
+  "contracts": {"request": "../../contracts/input.schema.json", "result": "../../contracts/result.schema.json", "artifacts": "../../contracts/artifacts.schema.json"}
+}

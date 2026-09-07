@@ -1,26 +1,46 @@
-# Local secrets
-**/.env
-**/.env.local
-
-# Runtime state and generated artifacts
-**/runtime/
-**/runtime-data/*
-!**/runtime-data/.gitkeep
-**/output/
-**/tmp/
-**/*.db
-**/*.db-shm
-**/*.db-wal
-**/*.log
-
-# Build and dependency caches
+# Versioned source only; no credentials, user material or generated executables.
+runtime/
+workspaces/
+tests/results/
 **/target/
-**/target-*/
 **/node_modules/
-**/.lake/
+**/runtime-data/
+**/.env.local
+**/__pycache__/
+**/.pytest_cache/
+**/*.pyc
+**/.DS_Store
 
-# OS and editor files
-.DS_Store
-Thumbs.db
-.idea/
-.vscode/
+# Local accounts, execution data and generated deliverables
+**/.env
+**/.env.*
+!**/.env.example
+**/.codex/
+**/auth.json
+**/credentials.json
+**/api-token
+**/runtime-tools/
+**/.venv/
+**/venv/
+**/.lake/
+**/.cache/
+**/.playwright-mcp/
+**/output/
+**/outputs/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.log
+*.pid
+*.exe
+*.dll
+*.pdb
+*.zip
+*.aux
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+**/assets/tsinghua-template/

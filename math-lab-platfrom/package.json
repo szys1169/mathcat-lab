@@ -1,12 +1,12 @@
 {
   "name": "math-lab-platform",
-  "version": "0.1.0",
+  "version": "2.5.0",
   "private": true,
   "type": "module",
   "description": "Local math agent workspace powered by Codex CLI",
   "scripts": {
     "start": "node src/server.mjs",
-    "test": "node --test"
+    "test": "node --test --test-isolation=none"
   },
   "engines": {
     "node": ">=22"

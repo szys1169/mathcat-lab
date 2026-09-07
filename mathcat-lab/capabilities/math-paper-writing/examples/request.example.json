@@ -1,0 +1,13 @@
+{
+  "schema_version": "1.0",
+  "task_id": "paper-example-001",
+  "executor": "deepseek_harness",
+  "workspace": "D:/AI/projects/math-paper-agent",
+  "source_packet": "paper_20260823/source_packet.md",
+  "selected_files": ["paper_20260823/refs.bib"],
+  "language": "zh",
+  "title_hint": "",
+  "venue": null,
+  "requirements": "Generate a complete paper without adding claims beyond the Source Packet.",
+  "time_limit_seconds": 3600
+}

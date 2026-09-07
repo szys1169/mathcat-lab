@@ -2,14 +2,20 @@
 // at the crate/README boundary instead of repeating identical error sections per method.
 #![allow(clippy::missing_errors_doc)]
 
+#[cfg(test)]
+mod planning_budget_tests;
+mod problem_intake;
 mod prompts;
 mod publication;
 mod reporting;
 mod schemas;
 
+pub mod research_v2;
+
 use std::{
     collections::{HashMap, HashSet},
     fmt::Write as _,
+    future::Future,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
@@ -19,21 +25,22 @@ use std::{
 use chrono::{DateTime, Utc};
 use futures::{StreamExt, stream};
 use research_domain::{
-    AcceptanceClass, AlignmentRelation, AlignmentReviewerOutput, Budget, CandidateDraft,
+    AcceptanceClass, AlignmentRelation, AlignmentReviewerOutput, Artifact, Budget,
     CandidateSubmission, CheckStatus, CommandStatus, ContextPacket, DomainEvent, FailureDraft,
-    Formalization, FormalizerOutput, Goal, HumanCommand, HumanRouteProposalRequest,
-    HumanRouteProposalResult, PlannerOutput, ProblemContract, ProblemRevisionRequest,
-    ProblemRevisionResult, Project, ProjectSnapshot, ProjectStatus, ProofHint, ProofNode,
-    ProofNodeStatus, ProofSearchBudget, RankingWeights, ReflectionOutput, ResearchDelta,
-    RouteGeneratorOutput, RouteProposal, SourceDraft, SourceRecord, StrategyDirectorOutput,
-    SupervisorOutput, TacticCandidate, TacticProposalOutput, Task, TaskContract, TaskStatus,
-    VerificationCase, VerificationProfile, VerificationReport, VerificationStage,
-    VerificationVerdict, WorkerOutput,
+    Formalization, FormalizerOutput, Goal, HumanCommand, HumanRouteCreateRequest,
+    HumanRouteCreateResult, HumanRouteProposalRequest, HumanRouteProposalResult, PlannerOutput,
+    ProblemContract, ProblemRevisionRequest, ProblemRevisionResult, Project, ProjectSnapshot,
+    ProjectStatus, ProofHint, ProofNode, ProofNodeStatus, ProofSearchBudget, RankingWeights,
+    ReflectionOutput, ResearchDelta, RouteGeneratorOutput, RouteProposal, SourceDraft,
+    SourceRecord, StrategyDirectorOutput, SupervisorOutput, TacticCandidate, TacticProposalOutput,
+    Task, TaskContract, TaskStatus, Verification, VerificationCase, VerificationProfile,
+    VerificationReport, VerificationStage, VerificationVerdict, WorkerOutput,
 };
 use research_storage::{
-    BackendRunDraft, CheckDraft, CommandDraft, EvidenceDraft, FindingDraft, ModelCallRequest,
-    ProofNodeDraft, SqliteStore, StorageError, SubmissionReceipt, VerificationCaseDraft,
-    VerificationSnapshotDraft,
+    BackendRunDraft, CheckDraft, CommandDraft, EvidenceDraft, FindingDraft, LocalResultSubmission,
+    LocalTaskLease, ModelCallPurpose, ModelCallRequest, ProofNodeDraft, SqliteStore, StorageError,
+    SubmissionReceipt, TaskLeaseCompletionRequest, VerificationCaseDraft,
+    VerificationSnapshotDraft, VerificationWorkerLease,
 };
 use research_worker_runtime::{
     AgentBackend, AgentError, AgentHandle, AgentRunResult, AgentSpec, AgentTask, AgentTaskKind,
@@ -43,34 +50,55 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::process::Command;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, Semaphore, broadcast, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
 
+pub use problem_intake::{
+    MaterialScan, ScannedMaterial, render_problem_document_markdown, scan_problem_materials,
+};
 pub use prompts::{
-    alignment_prompt, formalizer_prompt, planner_prompt, reflection_delta_prompt,
-    reflection_prompt, route_generator_delta_prompt, route_generator_prompt,
-    strategy_director_prompt, supervisor_delta_prompt, supervisor_prompt, tactic_proposal_prompt,
-    verifier_prompt, worker_packet_prompt, worker_prompt,
+    alignment_prompt, formalizer_prompt, problem_generator_prompt, reflection_delta_prompt,
+    route_generator_delta_prompt, strategy_director_prompt, supervisor_delta_prompt,
+    tactic_proposal_prompt, verifier_prompt, worker_packet_prompt,
 };
 pub use publication::{PaperWriterOutput, PublicationResult};
 pub use schemas::{
-    alignment_schema, formalizer_schema, paper_writer_schema, planner_schema, reflection_schema,
-    route_generator_schema, strategy_director_schema, supervisor_schema, tactic_proposal_schema,
-    verifier_schema, worker_schema,
+    alignment_schema, formalizer_schema, paper_writer_schema, planner_schema,
+    problem_generator_schema, reflection_schema, route_generator_schema, strategy_director_schema,
+    supervisor_schema, tactic_proposal_schema, verifier_schema, worker_schema,
 };
+
+/// Verification is intentionally scarce: each admitted candidate may fan out to
+/// several independent reviewers and a formal backend.  Keep the service-wide
+/// limit bounded even when callers construct [`ResearchConfig`] directly.
+pub const HARD_MAX_VERIFICATION_CONCURRENCY: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct ResearchConfig {
     pub runtime_root: PathBuf,
     pub output_root: PathBuf,
+    /// Canonical trust root below which problem-definition material may be scanned.
+    pub material_root: PathBuf,
     pub model: Option<String>,
     pub lean_project_root: Option<PathBuf>,
     pub proof_search_budget: ProofSearchBudget,
     pub ranking_weights: RankingWeights,
     pub planner_timeout_seconds: u64,
+    /// Optional shared wall-clock limit for all planning stages and retries in a round.
+    pub planner_round_timeout_seconds: Option<u64>,
     pub worker_timeout_seconds: u64,
     pub verifier_timeout_seconds: u64,
+    pub problem_generator_timeout_seconds: u64,
+    /// Maximum number of problem-generator backend calls active in this service process.
+    pub problem_generator_max_concurrency: usize,
+    /// Maximum number of candidate verification pipelines active in this service process.
+    pub verification_max_concurrency: usize,
+    pub problem_material_max_depth: usize,
+    pub problem_material_max_entries: usize,
+    pub problem_material_max_files: usize,
+    pub problem_material_max_file_bytes: u64,
+    pub problem_material_max_total_bytes: u64,
 }
 
 struct ReviewerContext<'a> {
@@ -91,18 +119,112 @@ struct PlanningStageRequest<'a> {
     output_schema: Value,
 }
 
+struct ScoredPlan {
+    plan: PlannerOutput,
+    route_scores: Vec<f64>,
+}
+
+struct RouteRanking {
+    output: Value,
+    route_scores: Vec<f64>,
+}
+
+struct VerifiedPackage {
+    manifest_hash: String,
+    lean_source: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct QueuedVerification {
+    verification_id: String,
+    round: i64,
+    task_priority: f64,
+    route_priority: f64,
+    route_id: String,
+    task_id: String,
+    candidate_ordinal: i64,
+}
+
+fn sort_verification_queue(queue: &mut [QueuedVerification]) {
+    queue.sort_by(|left, right| {
+        right
+            .task_priority
+            .total_cmp(&left.task_priority)
+            .then_with(|| right.route_priority.total_cmp(&left.route_priority))
+            // Route/task IDs were fixed by the committed plan before any worker
+            // started, unlike candidate ULIDs whose timestamps reflect completion.
+            .then_with(|| left.route_id.cmp(&right.route_id))
+            .then_with(|| left.task_id.cmp(&right.task_id))
+            // SQLite rowid is the durable ingestion ordinal. Since task_id is
+            // compared first, it only preserves the Worker's declared order among
+            // sibling candidates and never reintroduces cross-worker finish order.
+            .then_with(|| left.candidate_ordinal.cmp(&right.candidate_ordinal))
+            .then_with(|| left.verification_id.cmp(&right.verification_id))
+    });
+}
+
+struct WorkerAgentRun {
+    output: WorkerOutput,
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CertificationMode {
+    NaturalLanguage,
+    FormalReplay,
+    IndependentProof,
+}
+
+struct VerificationPlanSpec {
+    name: &'static str,
+    profile: VerificationProfile,
+    required_acceptance: AcceptanceClass,
+    reviewer_kinds: Vec<&'static str>,
+    certification: CertificationMode,
+    max_attempts: u32,
+}
+
+impl VerificationPlanSpec {
+    fn independent_reviewer_count(&self) -> u32 {
+        let count = self
+            .reviewer_kinds
+            .iter()
+            .filter(|kind| kind.starts_with("math_review_"))
+            .count();
+        u32::try_from(count).unwrap_or(u32::MAX)
+    }
+
+    fn requires_reviewer(&self, kind: &str) -> bool {
+        self.reviewer_kinds.contains(&kind)
+    }
+
+    const fn requires_formal_replay(&self) -> bool {
+        !matches!(self.certification, CertificationMode::NaturalLanguage)
+    }
+}
+
 impl Default for ResearchConfig {
     fn default() -> Self {
         Self {
             runtime_root: PathBuf::from("runtime/projects"),
             output_root: PathBuf::from("output"),
+            material_root: PathBuf::from("."),
             model: None,
             lean_project_root: Some(PathBuf::from("lean-verifier")),
             proof_search_budget: ProofSearchBudget::default(),
             ranking_weights: RankingWeights::default(),
             planner_timeout_seconds: 20 * 60,
+            planner_round_timeout_seconds: None,
             worker_timeout_seconds: 45 * 60,
             verifier_timeout_seconds: 30 * 60,
+            problem_generator_timeout_seconds: 5 * 60,
+            problem_generator_max_concurrency: 2,
+            verification_max_concurrency: 2,
+            problem_material_max_depth: 8,
+            problem_material_max_entries: 2_048,
+            problem_material_max_files: 64,
+            problem_material_max_file_bytes: 128 * 1024,
+            problem_material_max_total_bytes: 512 * 1024,
         }
     }
 }
@@ -121,24 +243,244 @@ pub enum CoreError {
     Io(#[from] std::io::Error),
     #[error("invalid agent output: {0}")]
     InvalidAgentOutput(String),
+    #[error("invalid problem material scope: {0}")]
+    InvalidProblemMaterial(String),
+    #[error("lease heartbeat failed: {0}")]
+    LeaseHeartbeat(String),
 }
 
 pub type CoreResult<T> = Result<T, CoreError>;
 
+const REPORT_SOURCE_REVISION_PREFIX: &str = "report_source_revision:";
+
+fn report_source_revision(artifact: &Artifact) -> Option<i64> {
+    artifact.related_entity_ids.iter().find_map(|related| {
+        related
+            .strip_prefix(REPORT_SOURCE_REVISION_PREFIX)
+            .and_then(|value| value.parse::<i64>().ok())
+    })
+}
+
+async fn load_durable_round_report(
+    artifacts: &[Artifact],
+    round: &research_domain::ResearchRound,
+    round_filename: &str,
+    expected_status_line: &str,
+) -> CoreResult<Option<(i64, Vec<u8>)>> {
+    let mut candidates = Vec::new();
+    for artifact in artifacts.iter().filter(|artifact| {
+        artifact.created_in_round == round.number
+            && ((artifact.kind == "round_report" && artifact.filename == round_filename)
+                || (artifact.kind == "latest_report" && artifact.filename == "LATEST.md"))
+    }) {
+        let Some(source_revision) = report_source_revision(artifact) else {
+            continue;
+        };
+        let bytes = tokio::fs::read(&artifact.storage_path).await?;
+        let observed_hash = hex::encode(Sha256::digest(&bytes));
+        if observed_hash != artifact.sha256 {
+            return Err(StorageError::CorruptData(format!(
+                "report artifact {} failed its SHA-256 check",
+                artifact.artifact_id
+            ))
+            .into());
+        }
+        let text = std::str::from_utf8(&bytes).map_err(|error| {
+            StorageError::CorruptData(format!(
+                "report artifact {} is not UTF-8: {error}",
+                artifact.artifact_id
+            ))
+        })?;
+        if text.lines().any(|line| line == expected_status_line) {
+            candidates.push((source_revision, artifact, bytes));
+        }
+    }
+    candidates.sort_by_key(|(source_revision, _, _)| *source_revision);
+    let Some((source_revision, artifact, bytes)) = candidates.last() else {
+        return Ok(None);
+    };
+    if candidates
+        .iter()
+        .filter(|(revision, _, _)| revision == source_revision)
+        .any(|(_, peer, _)| peer.sha256 != artifact.sha256)
+    {
+        return Err(StorageError::CorruptData(format!(
+            "round {} report artifacts disagree at source revision {}",
+            round.round_id, source_revision
+        ))
+        .into());
+    }
+    Ok(Some((*source_revision, bytes.clone())))
+}
+
+fn command_dispatch_error_is_deterministic(error: &CoreError) -> bool {
+    matches!(
+        error,
+        CoreError::Storage(
+            StorageError::NotFound { .. }
+                | StorageError::RevisionConflict { .. }
+                | StorageError::IdempotencyConflict(_)
+                | StorageError::InvalidProblemRevision(_)
+                | StorageError::InvalidRouteProposal(_)
+                | StorageError::InvalidTransition(_)
+                | StorageError::LateSubmission(_)
+                | StorageError::InvalidDependency(_)
+                | StorageError::DependencyCycle
+                | StorageError::BudgetExhausted(_)
+        )
+    )
+}
+
 struct CountedAgentRun<'a> {
     handle: &'a AgentHandle,
     task: AgentTask,
+    resume_session_id: Option<&'a str>,
     project: &'a Project,
     round: i64,
     worker_id: Option<&'a str>,
     task_id: Option<&'a str>,
+    purpose: ModelCallPurpose<'a>,
     cancellation: CancellationToken,
+}
+
+struct LeaseHeartbeatGuard {
+    stop: CancellationToken,
+    work_cancellation: CancellationToken,
+    failure: oneshot::Receiver<String>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl LeaseHeartbeatGuard {
+    fn for_task(
+        store: SqliteStore,
+        lease: LocalTaskLease,
+        work_cancellation: CancellationToken,
+    ) -> Self {
+        let lease_id = lease.lease_id.clone();
+        Self::spawn(Duration::from_secs(30), work_cancellation, move || {
+            let store = store.clone();
+            let lease = lease.clone();
+            let lease_id = lease_id.clone();
+            async move {
+                store
+                    .heartbeat_local_lease(&lease, 90)
+                    .await
+                    .map_err(|error| format!("task lease {lease_id}: {error}"))
+            }
+        })
+    }
+
+    fn for_verification(
+        store: SqliteStore,
+        lease: VerificationWorkerLease,
+        ttl_seconds: u64,
+        work_cancellation: CancellationToken,
+    ) -> Self {
+        let lease_id = lease.verification_lease_id.clone();
+        Self::spawn(Duration::from_secs(30), work_cancellation, move || {
+            let store = store.clone();
+            let lease = lease.clone();
+            let lease_id = lease_id.clone();
+            async move {
+                store
+                    .heartbeat_verification_worker(&lease, ttl_seconds)
+                    .await
+                    .map_err(|error| format!("verification lease {lease_id}: {error}"))
+            }
+        })
+    }
+
+    fn spawn<Heartbeat, HeartbeatFuture>(
+        period: Duration,
+        work_cancellation: CancellationToken,
+        mut heartbeat: Heartbeat,
+    ) -> Self
+    where
+        Heartbeat: FnMut() -> HeartbeatFuture + Send + 'static,
+        HeartbeatFuture: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        let stop = CancellationToken::new();
+        let runner_stop = stop.clone();
+        let runner_cancellation = work_cancellation.clone();
+        let (failure_sender, failure) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    () = runner_stop.cancelled() => return,
+                    _ = ticker.tick() => {
+                        if let Err(error) = heartbeat().await {
+                            runner_cancellation.cancel();
+                            let _ = failure_sender.send(error);
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        Self {
+            stop,
+            work_cancellation,
+            failure,
+            handle,
+        }
+    }
+
+    async fn run<Output, Work>(mut self, work: Work) -> Result<Output, String>
+    where
+        Work: Future<Output = Output>,
+    {
+        tokio::pin!(work);
+        let mut outcome = tokio::select! {
+            output = &mut work => Ok(output),
+            failure = &mut self.failure => {
+                self.work_cancellation.cancel();
+                Err(failure.unwrap_or_else(|_| "lease heartbeat runner stopped unexpectedly".into()))
+            }
+        };
+        self.stop.cancel();
+        let join_result = (&mut self.handle).await;
+        if outcome.is_ok()
+            && let Ok(error) = self.failure.try_recv()
+        {
+            self.work_cancellation.cancel();
+            outcome = Err(error);
+        }
+        if outcome.is_ok()
+            && let Err(error) = join_result
+        {
+            self.work_cancellation.cancel();
+            outcome = Err(format!("lease heartbeat runner failed: {error}"));
+        }
+        outcome
+    }
+}
+
+impl Drop for LeaseHeartbeatGuard {
+    fn drop(&mut self) {
+        self.stop.cancel();
+        self.work_cancellation.cancel();
+        self.handle.abort();
+    }
 }
 
 #[derive(Debug, Clone)]
 struct SearchFrontier {
     node: ProofNode,
     tactic_path: Vec<String>,
+}
+
+#[derive(Clone)]
+struct CancellationRegistration {
+    project_id: String,
+    token: CancellationToken,
+}
+
+#[derive(Clone)]
+struct ProblemDraftCancellationRegistration {
+    revision: i64,
+    token: CancellationToken,
 }
 
 #[derive(Clone)]
@@ -149,8 +491,14 @@ pub struct ResearchService {
     interactive_proof_backend: Option<Arc<dyn InteractiveProofBackend>>,
     config: ResearchConfig,
     event_bus: broadcast::Sender<DomainEvent>,
-    task_cancellations: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    task_cancellations: Arc<Mutex<HashMap<String, CancellationRegistration>>>,
+    problem_draft_cancellations: Arc<Mutex<HashMap<String, ProblemDraftCancellationRegistration>>>,
+    problem_generator_semaphore: Arc<Semaphore>,
+    verification_semaphore: Arc<Semaphore>,
     project_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    verification_admission_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    projection_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    queued_project_runs: Arc<Mutex<HashSet<String>>>,
 }
 
 impl std::fmt::Debug for ResearchService {
@@ -194,6 +542,11 @@ impl ResearchService {
     }
 
     #[must_use]
+    ///
+    /// # Panics
+    ///
+    /// Panics when `verification_max_concurrency` is outside the supported
+    /// service-wide range.
     pub fn new_with_verification_backends(
         store: SqliteStore,
         backend: Arc<dyn AgentBackend>,
@@ -202,6 +555,14 @@ impl ResearchService {
         config: ResearchConfig,
     ) -> Self {
         let (event_bus, _) = broadcast::channel(4096);
+        let problem_generator_max_concurrency = config
+            .problem_generator_max_concurrency
+            .clamp(1, problem_intake::HARD_MAX_PROBLEM_GENERATOR_CONCURRENCY);
+        assert!(
+            (1..=HARD_MAX_VERIFICATION_CONCURRENCY).contains(&config.verification_max_concurrency),
+            "verification_max_concurrency must be between 1 and {HARD_MAX_VERIFICATION_CONCURRENCY}"
+        );
+        let verification_max_concurrency = config.verification_max_concurrency;
         Self {
             store,
             backend,
@@ -210,7 +571,15 @@ impl ResearchService {
             config,
             event_bus,
             task_cancellations: Arc::new(Mutex::new(HashMap::new())),
+            problem_draft_cancellations: Arc::new(Mutex::new(HashMap::new())),
+            problem_generator_semaphore: Arc::new(Semaphore::new(
+                problem_generator_max_concurrency,
+            )),
+            verification_semaphore: Arc::new(Semaphore::new(verification_max_concurrency)),
             project_locks: Arc::new(Mutex::new(HashMap::new())),
+            verification_admission_locks: Arc::new(Mutex::new(HashMap::new())),
+            projection_locks: Arc::new(Mutex::new(HashMap::new())),
+            queued_project_runs: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -246,21 +615,14 @@ impl ResearchService {
             let tokens = self.task_cancellations.lock().await;
             for affected in &result.data.affected_entities {
                 if affected.kind == "task"
-                    && let Some(token) = tokens.get(&affected.id)
+                    && let Some(registration) = tokens.get(&affected.id)
                 {
-                    token.cancel();
+                    registration.token.cancel();
                 }
             }
         }
         if request.replan {
-            let service = self.clone();
-            let project_id = project_id.to_owned();
-            tokio::spawn(async move {
-                if let Err(error) = Box::pin(service.run_project_until_terminal(&project_id)).await
-                {
-                    error!(%project_id, %error, "research loop stopped after problem revision");
-                }
-            });
+            self.schedule_project_run(project_id.to_owned(), true).await;
         }
         Ok(result)
     }
@@ -278,6 +640,30 @@ impl ResearchService {
             .propose_human_route(project_id, request, requested_by, idempotency_key)
             .await?;
         self.publish_all(std::mem::take(&mut result.events));
+        Ok(result)
+    }
+
+    /// Atomically create and schedule an auditable human-authored V2 route.
+    pub async fn create_human_route(
+        &self,
+        project_id: &str,
+        request: &HumanRouteCreateRequest,
+        requested_by: &str,
+        idempotency_key: &str,
+    ) -> CoreResult<research_storage::BoardMutation<HumanRouteCreateResult>> {
+        // A human-authored route can add an immediately released task to the
+        // current round. Serialize that short mutation with the verification
+        // queue's final safe-point check so a new task cannot appear between
+        // "all released work is terminal" and the first verification claim.
+        let admission_lock = self.verification_admission_lock(project_id).await;
+        let mut result = {
+            let _guard = admission_lock.lock().await;
+            self.store
+                .create_human_route(project_id, request, requested_by, idempotency_key)
+                .await?
+        };
+        self.publish_all(std::mem::take(&mut result.events));
+        self.schedule_project_run(project_id.to_owned(), true).await;
         Ok(result)
     }
 
@@ -329,21 +715,7 @@ impl ResearchService {
         if let Some(event) = publication_event {
             self.publish(event);
         } else if publication_run.status != "running" {
-            if publication_run.status == "failed" {
-                return Err(CoreError::InvalidAgentOutput(
-                    publication_run
-                        .error
-                        .unwrap_or_else(|| "publication failed without a stored reason".into()),
-                ));
-            }
-            return publication_run
-                .result
-                .ok_or_else(|| {
-                    CoreError::InvalidAgentOutput(
-                        "terminal publication run has no stored result".into(),
-                    )
-                })
-                .and_then(|value| serde_json::from_value(value).map_err(CoreError::from));
+            return publication_result_from_terminal_run(&publication_run);
         }
         let writer_root = self
             .config
@@ -370,7 +742,7 @@ impl ResearchService {
                 } else {
                     "blocked_by_evidence"
                 };
-                let (_, event) = self
+                let (completed_run, event) = self
                     .store
                     .complete_publication(
                         &publication_run.publication_id,
@@ -382,7 +754,7 @@ impl ResearchService {
                 if let Some(event) = event {
                     self.publish(event);
                 }
-                Ok(result)
+                publication_result_from_terminal_run(&completed_run)
             }
             Err(error) => {
                 let error_text = error.to_string();
@@ -396,8 +768,13 @@ impl ResearchService {
                     )
                     .await
                 {
-                    Ok((_, Some(event))) => self.publish(event),
-                    Ok((_, None)) => {}
+                    Ok((completed_run, Some(event))) => {
+                        self.publish(event);
+                        debug_assert_eq!(completed_run.status, "failed");
+                    }
+                    Ok((completed_run, None)) => {
+                        return publication_result_from_terminal_run(&completed_run);
+                    }
                     Err(storage_error) => error!(
                         publication_id = %publication_run.publication_id,
                         %storage_error,
@@ -422,6 +799,7 @@ impl ResearchService {
     ) -> CoreResult<PublicationResult> {
         let mut artifact_ids = vec![
             self.persist_publication_file(
+                publication_id,
                 project_id,
                 snapshot.project.current_round,
                 writer_root,
@@ -436,6 +814,7 @@ impl ResearchService {
             let gap_text = format!("# Evidence gaps\n\n- {}\n", gaps.join("\n- "));
             artifact_ids.push(
                 self.persist_publication_file(
+                    publication_id,
                     project_id,
                     snapshot.project.current_round,
                     writer_root,
@@ -455,6 +834,7 @@ impl ResearchService {
             }))?;
             artifact_ids.push(
                 self.persist_publication_file(
+                    publication_id,
                     project_id,
                     snapshot.project.current_round,
                     writer_root,
@@ -498,10 +878,12 @@ impl ResearchService {
                     output_schema: paper_writer_schema(),
                     timeout_seconds: self.config.worker_timeout_seconds,
                 },
+                resume_session_id: None,
                 project: &snapshot.project,
                 round: snapshot.project.current_round,
                 worker_id: None,
                 task_id: None,
+                purpose: ModelCallPurpose::Publication(publication_id),
                 cancellation: CancellationToken::new(),
             })
             .await?;
@@ -543,6 +925,7 @@ impl ResearchService {
         ] {
             artifact_ids.push(
                 self.persist_publication_file(
+                    publication_id,
                     project_id,
                     snapshot.project.current_round,
                     writer_root,
@@ -556,6 +939,7 @@ impl ResearchService {
         if output.status == "ready" {
             artifact_ids.extend(
                 self.compile_and_validate_publication_pdf(
+                    publication_id,
                     project_id,
                     snapshot.project.current_round,
                     writer_root,
@@ -563,7 +947,11 @@ impl ResearchService {
                 .await?,
             );
         }
-        let status = output.status;
+        let status = if output.status == "ready" {
+            "ready".to_owned()
+        } else {
+            "blocked_by_evidence".to_owned()
+        };
         let manifest = serde_json::to_vec_pretty(&serde_json::json!({
             "version": 1,
             "project_id": project_id,
@@ -576,6 +964,7 @@ impl ResearchService {
         }))?;
         artifact_ids.push(
             self.persist_publication_file(
+                publication_id,
                 project_id,
                 snapshot.project.current_round,
                 writer_root,
@@ -604,6 +993,7 @@ impl ResearchService {
     #[allow(clippy::too_many_lines)]
     async fn compile_and_validate_publication_pdf(
         &self,
+        publication_id: &str,
         project_id: &str,
         round: i64,
         writer_root: &std::path::Path,
@@ -628,6 +1018,7 @@ impl ResearchService {
         );
         let mut artifact_ids = vec![
             self.persist_publication_file(
+                publication_id,
                 project_id,
                 round,
                 writer_root,
@@ -638,9 +1029,12 @@ impl ResearchService {
             .await?,
         ];
         if !compile.status.success() {
-            return Err(CoreError::InvalidAgentOutput(
-                "LaTeX quality gate failed; see latexmk.log.txt".into(),
-            ));
+            let mut diagnostic_tail = compile_log.lines().rev().take(40).collect::<Vec<_>>();
+            diagnostic_tail.reverse();
+            return Err(CoreError::InvalidAgentOutput(format!(
+                "LaTeX quality gate failed; see latexmk.log.txt. Diagnostic tail:\n{}",
+                diagnostic_tail.join("\n")
+            )));
         }
         let engine_log = tokio::fs::read_to_string(writer_root.join("article_candidate.log"))
             .await
@@ -662,6 +1056,7 @@ impl ResearchService {
         }
         artifact_ids.push(
             self.persist_publication_file(
+                publication_id,
                 project_id,
                 round,
                 writer_root,
@@ -710,6 +1105,7 @@ impl ResearchService {
         }
         artifact_ids.push(
             self.persist_publication_file(
+                publication_id,
                 project_id,
                 round,
                 writer_root,
@@ -759,6 +1155,7 @@ impl ResearchService {
             let bytes = tokio::fs::read(path).await?;
             artifact_ids.push(
                 self.persist_publication_file(
+                    publication_id,
                     project_id,
                     round,
                     writer_root,
@@ -781,6 +1178,7 @@ impl ResearchService {
         }))?;
         artifact_ids.push(
             self.persist_publication_file(
+                publication_id,
                 project_id,
                 round,
                 writer_root,
@@ -793,8 +1191,10 @@ impl ResearchService {
         Ok(artifact_ids)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn persist_publication_file(
         &self,
+        publication_id: &str,
         project_id: &str,
         round: i64,
         writer_root: &std::path::Path,
@@ -802,11 +1202,11 @@ impl ResearchService {
         filename: &str,
         content: &[u8],
     ) -> CoreResult<String> {
-        tokio::fs::write(writer_root.join(filename), content).await?;
         let (artifact, event) = self
             .store
-            .store_artifact(project_id, kind, filename, content, round, Vec::new())
+            .store_publication_artifact(publication_id, project_id, kind, filename, content, round)
             .await?;
+        tokio::fs::write(writer_root.join(filename), content).await?;
         self.publish(event);
         Ok(artifact.artifact_id)
     }
@@ -866,7 +1266,49 @@ impl ResearchService {
             .create_project_with_route_approval(name, contract, budget, human_route_approval)
             .await?;
         self.publish(event);
-        let initial = reporting::initial_report(&project);
+        self.ensure_initial_project_projection(&project).await?;
+        Ok(self.store.get_project(&project.project_id).await?)
+    }
+
+    pub async fn create_project_with_review_mode(
+        &self,
+        name: String,
+        contract: ProblemContract,
+        budget: Budget,
+        review_mode: research_domain::ReviewMode,
+    ) -> CoreResult<Project> {
+        let (project, event) = self
+            .store
+            .create_project_with_review_mode(name, contract, budget, review_mode)
+            .await?;
+        self.publish(event);
+        self.ensure_initial_project_projection(&project).await?;
+        Ok(self.store.get_project(&project.project_id).await?)
+    }
+
+    async fn ensure_initial_project_projection(&self, project: &Project) -> CoreResult<()> {
+        let projection_lock = {
+            let mut locks = self.projection_locks.lock().await;
+            locks
+                .entry(project.project_id.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _guard = projection_lock.lock().await;
+        if self
+            .store
+            .list_artifacts(&project.project_id)
+            .await?
+            .iter()
+            .any(|artifact| {
+                artifact.kind == "latest_report"
+                    && artifact.filename == "LATEST.md"
+                    && artifact.created_in_round == 0
+            })
+        {
+            return Ok(());
+        }
+        let initial = reporting::initial_report(project);
         self.write_latest_files(&project.project_id, 0, &initial)
             .await?;
         let (_, artifact_event) = self
@@ -881,7 +1323,7 @@ impl ResearchService {
             )
             .await?;
         self.publish(artifact_event);
-        Ok(self.store.get_project(&project.project_id).await?)
+        Ok(())
     }
 
     pub async fn submit_command(
@@ -892,23 +1334,124 @@ impl ResearchService {
         let (command, event) = self.store.enqueue_command(project_id, draft).await?;
         if let Some(event) = event {
             self.publish(event);
-            let service = self.clone();
-            let project_id = project_id.to_owned();
-            let command_id = command.command_id.clone();
-            tokio::spawn(async move {
-                if let Err(error) = service.dispatch_command(&project_id, &command_id).await {
-                    error!(%project_id, %command_id, %error, "command dispatch failed");
-                    if let Ok((_, event)) = service
-                        .store
-                        .fail_command(&project_id, &command_id, &error.to_string())
-                        .await
-                    {
-                        service.publish(event);
-                    }
-                }
-            });
+        }
+        if command.status == CommandStatus::Queued {
+            self.schedule_command_dispatch(project_id, &command.command_id);
         }
         Ok(command)
+    }
+
+    fn schedule_command_dispatch(&self, project_id: &str, command_id: &str) {
+        let service = self.clone();
+        let project_id = project_id.to_owned();
+        let command_id = command_id.to_owned();
+        tokio::spawn(async move {
+            if let Err(error) = service.dispatch_command(&project_id, &command_id).await {
+                match service
+                    .resolve_command_dispatch_error(&project_id, &command_id, &error)
+                    .await
+                {
+                    Ok(Some(command)) if command.status == CommandStatus::Failed => {
+                        error!(%project_id, %command_id, %error, "command was rejected deterministically");
+                    }
+                    Ok(Some(_)) => {
+                        warn!(%project_id, %command_id, %error, "command changed state while its dispatch error was being recorded");
+                    }
+                    Ok(None) => {
+                        warn!(%project_id, %command_id, %error, "transient command dispatch failure left queued for watchdog retry");
+                    }
+                    Err(record_error) => {
+                        error!(%project_id, %command_id, %error, %record_error, "could not record deterministic command dispatch failure");
+                    }
+                }
+            }
+        });
+    }
+
+    /// Re-dispatches durable commands left queued by a process interruption.
+    pub async fn recover_pending_commands(&self) -> CoreResult<usize> {
+        let pending = self.store.pending_command_ids(None).await?;
+        let mut recovered = 0_usize;
+        for (project_id, command_id) in pending {
+            match self.dispatch_command(&project_id, &command_id).await {
+                Ok(command) => {
+                    if command.status != CommandStatus::Queued {
+                        recovered = recovered.saturating_add(1);
+                    }
+                }
+                Err(error) => {
+                    match self
+                        .resolve_command_dispatch_error(&project_id, &command_id, &error)
+                        .await?
+                    {
+                        Some(command) if command.status == CommandStatus::Failed => {
+                            recovered = recovered.saturating_add(1);
+                        }
+                        Some(_) => {}
+                        None => {
+                            warn!(%project_id, %command_id, %error, "transient command dispatch failure left queued for the next recovery tick");
+                            // Dispatch only reads or mutates SQLite. Once one operation reports an
+                            // operational failure, retrying every remaining command in this same
+                            // pass would amplify an outage into a tight database loop.
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(recovered)
+    }
+
+    async fn resolve_command_dispatch_error(
+        &self,
+        project_id: &str,
+        command_id: &str,
+        error: &CoreError,
+    ) -> CoreResult<Option<HumanCommand>> {
+        if !command_dispatch_error_is_deterministic(error) {
+            return Ok(None);
+        }
+        let (command, event) = self
+            .store
+            .fail_command(project_id, command_id, &error.to_string())
+            .await?;
+        if let Some(event) = event {
+            self.publish(event);
+        }
+        Ok(Some(command))
+    }
+
+    /// Schedules all durable projects that were still running when the previous
+    /// process stopped. A held per-project lock suppresses duplicate watchdog
+    /// launches without queuing another waiter behind an active research loop.
+    pub async fn recover_running_projects(&self) -> CoreResult<usize> {
+        let project_ids = sqlx::query_scalar::<_, String>(
+            "SELECT p.project_id FROM projects p \
+             WHERE p.status=? OR (p.status='needs_human_review' AND (EXISTS ( \
+                 SELECT 1 FROM tasks t JOIN routes r ON r.project_id=t.project_id AND r.route_id=t.route_id \
+                 WHERE t.project_id=p.project_id AND t.status IN ('queued','offered','leased','running','checkpointed','result_submitted','ingesting') \
+                   AND r.status IN ('incubating','active','probation','revived') \
+                   AND r.human_review IN ('approved','not_required') \
+             ) OR EXISTS ( \
+                 SELECT 1 FROM verifications v \
+                 JOIN candidates c ON c.candidate_id=v.candidate_id AND c.project_id=v.project_id \
+                 JOIN routes r ON r.project_id=v.project_id AND r.route_id=json_extract(c.submission_json,'$.route_id') \
+                 WHERE v.project_id=p.project_id AND v.status IN ('submitted','prechecking','verifying') \
+                   AND r.status IN ('incubating','active','probation','revived') \
+                   AND r.human_review IN ('approved','not_required') \
+             ))) ORDER BY p.created_at,p.project_id",
+        )
+        .bind(ProjectStatus::Running.to_string())
+        .fetch_all(self.store.read_pool())
+        .await
+        .map_err(StorageError::from)?;
+        let mut scheduled = 0_usize;
+        for project_id in project_ids {
+            if self.schedule_project_run(project_id, false).await {
+                scheduled = scheduled.saturating_add(1);
+            }
+        }
+        Ok(scheduled)
     }
 
     pub async fn dispatch_command(
@@ -916,8 +1459,19 @@ impl ResearchService {
         project_id: &str,
         command_id: &str,
     ) -> CoreResult<HumanCommand> {
-        let before = self.store.get_command(project_id, command_id).await?;
-        let (command, events) = self.store.apply_command(project_id, command_id).await?;
+        // Command application may add or resume work in the current round. Share
+        // this short admission boundary with the verification queue's final
+        // safe-point check so neither operation can slip between that check and
+        // the durable verification claim. Do not use `project_lock` here: it is
+        // deliberately held for an entire research loop and would make human
+        // commands unresponsive while workers or reviewers run.
+        let admission_lock = self.verification_admission_lock(project_id).await;
+        let (before, command, events) = {
+            let _guard = admission_lock.lock().await;
+            let before = self.store.get_command(project_id, command_id).await?;
+            let (command, events) = self.store.apply_command(project_id, command_id).await?;
+            (before, command, events)
+        };
         self.publish_all(events);
         self.cancel_affected(&command).await;
         if command.status == CommandStatus::Applied
@@ -926,20 +1480,20 @@ impl ResearchService {
                 "start_project"
                     | "resume_project"
                     | "trigger_replan"
+                    | "goal_review"
+                    | "review_policy"
+                    | "research_settings"
+                    | "adjust_budget"
+                    | "approve_route"
+                    | "prune_route"
+                    | "answer_question"
                     | "stop_route"
                     | "create_task"
                     | "resume_task"
                     | "reassign_task"
             )
         {
-            let service = self.clone();
-            let project_id = project_id.to_owned();
-            tokio::spawn(async move {
-                if let Err(error) = Box::pin(service.run_project_until_terminal(&project_id)).await
-                {
-                    error!(%project_id, %error, "research loop stopped with error");
-                }
-            });
+            self.schedule_project_run(project_id.to_owned(), true).await;
         }
         Ok(command)
     }
@@ -955,22 +1509,29 @@ impl ResearchService {
             .submit_candidate(project_id, submission, idempotency_key)
             .await?;
         let should_verify = receipt.event.is_some()
-            || matches!(
-                receipt.verification.status,
-                research_domain::CandidateStatus::Submitted
-                    | research_domain::CandidateStatus::Verifying
-            );
+            || receipt.verification.status == research_domain::CandidateStatus::Submitted;
         if let Some(event) = receipt.event.clone() {
             self.publish(event);
         }
         if should_verify {
-            let service = self.clone();
-            let verification_id = receipt.verification.verification_id.clone();
-            tokio::spawn(async move {
-                if let Err(error) = Box::pin(service.verify_candidate(&verification_id)).await {
-                    error!(%verification_id, %error, "candidate verification failed");
-                }
-            });
+            let task = self
+                .store
+                .get_task(project_id, &receipt.candidate.submission.task_id)
+                .await?;
+            let project_lock = self.project_lock(project_id).await;
+            if let Ok(_guard) = project_lock.try_lock_owned()
+                && !self
+                    .store
+                    .round_has_unfinished_released_tasks(project_id, task.round)
+                    .await?
+            {
+                self.verify_submitted_batch(project_id, Some(task.round))
+                    .await?;
+            }
+            // If the round still has sibling work, the candidate remains submitted.
+            // Coalescing a runner guarantees the same stable drain is reconsidered
+            // when the round reaches its next durable safe point.
+            self.schedule_project_run(project_id.to_owned(), true).await;
         }
         Ok(receipt)
     }
@@ -1034,65 +1595,157 @@ impl ResearchService {
 
     pub async fn complete_distributed_task(
         &self,
-        lease_id: &str,
-        node_id: &str,
-        token: &str,
-        node_epoch: i64,
-        lease_epoch: i64,
-        output: &WorkerOutput,
+        request: TaskLeaseCompletionRequest<'_>,
     ) -> CoreResult<()> {
-        let lease = self.store.get_task_lease(lease_id).await?;
-        let events = self
-            .store
-            .complete_task_lease(lease_id, node_id, token, node_epoch, lease_epoch, output)
-            .await?;
-        self.publish_all(events);
+        let lease_id = request.lease_id.to_owned();
+        let completion = self.store.complete_task_lease(request).await?;
+        self.publish_all(completion.events);
+        // Read routing metadata only after the authenticated, fenced completion
+        // succeeds; do not turn this service method into a lease-existence oracle.
+        let completed_lease = self.store.get_task_lease(&lease_id).await?;
         let completed_task = self
             .store
-            .get_task(&lease.project_id, &lease.task_id)
+            .get_task(&completed_lease.project_id, &completed_lease.task_id)
             .await?;
-        Box::pin(self.submit_worker_candidates(&completed_task, output.candidates.clone())).await?;
+        let project_id = completed_lease.project_id;
+        let round = completed_task.round;
+        let project_lock = self.project_lock(&project_id).await;
+        let batch_result = if let Ok(_guard) = project_lock.try_lock_owned() {
+            if self
+                .store
+                .round_has_unfinished_released_tasks(&project_id, round)
+                .await?
+            {
+                Ok(())
+            } else {
+                self.verify_submitted_batch(&project_id, Some(round)).await
+            }
+        } else {
+            // The active project runner owns deterministic draining. Coalesce a
+            // follow-up below instead of racing it from this request path.
+            Ok(())
+        };
+        // Completion can release the last dependency of a committed round. Wake
+        // its project runner even if verification hit a retryable infrastructure
+        // error; durable submitted rows remain available to that recovery path.
+        self.schedule_project_run(project_id, true).await;
+        batch_result?;
         Ok(())
     }
 
     pub async fn run_project_until_terminal(&self, project_id: &str) -> CoreResult<()> {
-        let project_lock = {
-            let mut locks = self.project_locks.lock().await;
-            locks
-                .entry(project_id.to_owned())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
+        let project_lock = self.project_lock(project_id).await;
         let _guard = project_lock.lock().await;
-        let _ = Box::pin(self.recover_project_state(project_id)).await?;
+        Box::pin(self.run_project_until_terminal_unlocked(project_id)).await
+    }
+
+    async fn project_lock(&self, project_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.project_locks.lock().await;
+        locks
+            .entry(project_id.to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    async fn verification_admission_lock(&self, project_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.verification_admission_locks.lock().await;
+        locks
+            .entry(project_id.to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    async fn schedule_project_run(&self, project_id: String, coalesce_if_busy: bool) -> bool {
+        let project_lock = self.project_lock(&project_id).await;
+        if let Ok(guard) = project_lock.clone().try_lock_owned() {
+            let service = self.clone();
+            tokio::spawn(async move {
+                let _guard = guard;
+                if let Err(error) =
+                    Box::pin(service.run_project_until_terminal_unlocked(&project_id)).await
+                {
+                    error!(%project_id, %error, "research loop stopped with error");
+                }
+            });
+            return true;
+        }
+
+        if !coalesce_if_busy {
+            return false;
+        }
+
+        // Coalesce commands that arrive while the project runner owns its lock. In
+        // particular, a final route approval may arrive while an earlier approved
+        // route's worker is still active. One queued waiter guarantees that newly
+        // released work is observed as soon as the current runner yields the lock.
+        if !self
+            .queued_project_runs
+            .lock()
+            .await
+            .insert(project_id.clone())
+        {
+            return false;
+        }
+        let service = self.clone();
+        tokio::spawn(async move {
+            let guard = project_lock.lock_owned().await;
+            service.queued_project_runs.lock().await.remove(&project_id);
+            let _guard = guard;
+            if let Err(error) =
+                Box::pin(service.run_project_until_terminal_unlocked(&project_id)).await
+            {
+                error!(%project_id, %error, "queued research loop stopped with error");
+            }
+        });
+        true
+    }
+
+    async fn run_project_until_terminal_unlocked(&self, project_id: &str) -> CoreResult<()> {
+        let resumed_interrupted_round = Box::pin(self.recover_project_state(project_id)).await?;
+        self.recover_round_report_projection(project_id).await?;
         let project = self.store.get_project(project_id).await?;
         if project.status != ProjectStatus::Running {
+            return Ok(());
+        }
+        if resumed_interrupted_round
+            && self
+                .store
+                .current_round(project_id)
+                .await?
+                .is_some_and(|round| {
+                    !matches!(
+                        round.status,
+                        research_domain::RoundStatus::Completed
+                            | research_domain::RoundStatus::Failed
+                            | research_domain::RoundStatus::Interrupted
+                    )
+                })
+        {
+            // A released route may have run while sibling routes remain pending, or a
+            // retryable task may still be queued. Do not create a replacement round on
+            // top of that committed plan.
             return Ok(());
         }
         if self.store.total_model_calls(project_id).await?
             >= i64::from(project.budget.max_total_model_calls)
         {
-            self.publish(self.store.mark_budget_exhausted(project_id).await?);
+            self.mark_budget_exhausted_and_report(project_id).await?;
             return Ok(());
         }
-        for verification in self.store.list_verifications(project_id).await? {
-            if verification.status == research_domain::CandidateStatus::Submitted {
-                Box::pin(self.verify_candidate(&verification.verification_id)).await?;
-            }
-        }
+        self.verify_submitted_batch(project_id, None).await?;
         loop {
             let project = self.store.get_project(project_id).await?;
             if project.status != ProjectStatus::Running {
                 return Ok(());
             }
             if project.current_round >= i64::from(project.budget.max_rounds) {
-                self.publish(self.store.mark_budget_exhausted(project_id).await?);
+                self.mark_budget_exhausted_and_report(project_id).await?;
                 return Ok(());
             }
             if self.store.total_model_calls(project_id).await?
                 >= i64::from(project.budget.max_total_model_calls)
             {
-                self.publish(self.store.mark_budget_exhausted(project_id).await?);
+                self.mark_budget_exhausted_and_report(project_id).await?;
                 return Ok(());
             }
             self.run_round_unlocked(project_id).await?;
@@ -1100,32 +1753,31 @@ impl ResearchService {
     }
 
     pub async fn run_one_round(&self, project_id: &str) -> CoreResult<()> {
-        let project_lock = {
-            let mut locks = self.project_locks.lock().await;
-            locks
-                .entry(project_id.to_owned())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
+        let project_lock = self.project_lock(project_id).await;
         let _guard = project_lock.lock().await;
         let resumed_interrupted_round = Box::pin(self.recover_project_state(project_id)).await?;
+        self.recover_round_report_projection(project_id).await?;
         let project = self.store.get_project(project_id).await?;
+        if project.status != ProjectStatus::Running {
+            return Ok(());
+        }
         if self.store.total_model_calls(project_id).await?
             >= i64::from(project.budget.max_total_model_calls)
         {
-            self.publish(self.store.mark_budget_exhausted(project_id).await?);
+            self.mark_budget_exhausted_and_report(project_id).await?;
             return Ok(());
         }
         if resumed_interrupted_round {
             return Ok(());
         }
+        self.verify_submitted_batch(project_id, None).await?;
         self.run_round_unlocked(project_id).await?;
         let project = self.store.get_project(project_id).await?;
         if project.status == ProjectStatus::Running
             && self.store.total_model_calls(project_id).await?
                 >= i64::from(project.budget.max_total_model_calls)
         {
-            self.publish(self.store.mark_budget_exhausted(project_id).await?);
+            self.mark_budget_exhausted_and_report(project_id).await?;
         }
         Ok(())
     }
@@ -1133,22 +1785,22 @@ impl ResearchService {
     async fn recover_project_state(&self, project_id: &str) -> CoreResult<bool> {
         for envelope_id in self.store.pending_result_envelopes(project_id).await? {
             match self.store.ingest_local_result_envelope(&envelope_id).await {
-                Ok((output, events)) => {
-                    let envelope_task_id = events.iter().find_map(|event| {
-                        event
-                            .data
-                            .get("task_id")
-                            .and_then(Value::as_str)
-                            .map(ToOwned::to_owned)
-                    });
-                    self.publish_all(events);
-                    if let Some(task_id) = envelope_task_id {
-                        let task = self.store.get_task(project_id, &task_id).await?;
-                        Box::pin(self.submit_worker_candidates(&task, output.candidates)).await?;
-                    }
-                }
+                Ok(ingestion) => self.publish_all(ingestion.events),
                 Err(StorageError::LateSubmission(reason)) => {
                     warn!(%project_id, %envelope_id, %reason, "startup reconciler rejected a stale result envelope");
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        for envelope_id in self
+            .store
+            .pending_verification_result_envelopes(project_id)
+            .await?
+        {
+            match self.store.ingest_verification_result(&envelope_id).await {
+                Ok((_, events)) => self.publish_all(events),
+                Err(StorageError::LateSubmission(reason)) => {
+                    warn!(%project_id, %envelope_id, %reason, "startup reconciler rejected a stale verification result envelope");
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -1158,14 +1810,20 @@ impl ResearchService {
             .run_reconciliation(Some(project_id), "service_startup")
             .await?;
         self.publish_all(self.store.recover_project(project_id).await?);
-        for verification in self.store.list_verifications(project_id).await? {
-            if verification.status == research_domain::CandidateStatus::Submitted {
-                Box::pin(self.verify_candidate(&verification.verification_id)).await?;
-            }
-        }
         self.resume_interrupted_v2_round(project_id).await
     }
 
+    /// A partially released immutable plan stays open until every route decision
+    /// is resolved and every task in the round reaches a terminal state.
+    async fn round_must_stay_open(&self, project_id: &str, round: i64) -> CoreResult<bool> {
+        Ok(self.store.has_pending_route_reviews(project_id).await?
+            || self
+                .store
+                .round_has_unfinished_tasks(project_id, round)
+                .await?)
+    }
+
+    #[allow(clippy::too_many_lines)]
     async fn resume_interrupted_v2_round(&self, project_id: &str) -> CoreResult<bool> {
         let Some(round) = self.store.current_round(project_id).await? else {
             return Ok(false);
@@ -1193,11 +1851,8 @@ impl ResearchService {
         let project = self.store.get_project(project_id).await?;
         let executable_tasks = self
             .store
-            .list_tasks(project_id)
-            .await?
-            .into_iter()
-            .filter(|task| task.round == round.number && task.status == TaskStatus::Queued)
-            .collect::<Vec<_>>();
+            .list_released_queued_tasks(project_id, round.number)
+            .await?;
         let max_parallel = usize::try_from(project.budget.max_parallel_workers.max(1)).unwrap_or(1);
         let results: Vec<CoreResult<()>> = stream::iter(executable_tasks.into_iter().map(|task| {
             let service = self.clone();
@@ -1211,7 +1866,23 @@ impl ResearchService {
                 warn!(%project_id, %error, "recovered V2 task ended without a trusted result");
             }
         }
+        // Candidate ingestion happens inside each worker, but verification starts
+        // only after every currently released local or distributed worker in this
+        // round reaches a terminal safe point. Routes awaiting human approval are
+        // a later batch. The durable queue makes the order independent of worker
+        // completion time.
+        if !self
+            .store
+            .round_has_unfinished_released_tasks(project_id, round.number)
+            .await?
+        {
+            self.verify_submitted_batch(project_id, Some(round.number))
+                .await?;
+        }
         self.publish_all(self.store.compress_failures(project_id, 3).await?);
+        if self.round_must_stay_open(project_id, round.number).await? {
+            return Ok(true);
+        }
         let plan_view = PlannerOutput {
             rationale_summary: format!(
                 "Recovered committed plan revision {}: {}",
@@ -1222,45 +1893,13 @@ impl ResearchService {
             targeted_uncertainty_ids: Vec::new(),
             suggestion_decisions: Vec::new(),
         };
-        let latest_snapshot = self.store.snapshot(project_id).await?;
-        let report = reporting::round_report(&latest_snapshot, &plan_view);
-        self.write_latest_files(project_id, round.number, &report)
-            .await?;
-        for (kind, filename) in [
-            (
-                "round_report",
-                format!("round_{:03}_recovered_summary.md", round.number),
-            ),
-            ("latest_report", "LATEST.md".into()),
-        ] {
-            let (_, event) = self
-                .store
-                .store_artifact(
-                    project_id,
-                    kind,
-                    &filename,
-                    report.as_bytes(),
-                    round.number,
-                    vec![
-                        round.round_id.clone(),
-                        plan_revision.plan_revision_id.clone(),
-                    ],
-                )
-                .await?;
-            self.publish(event);
-        }
         self.publish_all(
             self.store
-                .complete_round(
-                    project_id,
-                    &round.round_id,
-                    &format!(
-                        "Recovered and completed committed plan revision {}",
-                        plan_revision.plan_revision_id
-                    ),
-                )
+                .complete_round(project_id, &round.round_id, &plan_view.rationale_summary)
                 .await?,
         );
+        self.ensure_round_report_projection(project_id, &round, &plan_view)
+            .await?;
         Ok(true)
     }
 
@@ -1271,13 +1910,18 @@ impl ResearchService {
         let snapshot = self.store.snapshot(project_id).await?;
         let delta = self.store.collect_research_delta(project_id).await?;
         let bottlenecks = self.store.list_bottlenecks(project_id).await?;
+        let obligations = self.store.list_proof_obligations(project_id).await?;
         let failure_patterns = self.store.list_failure_patterns(project_id).await?;
-        let suggestions = self.store.pending_suggestions(project_id).await?;
+        let suggestions = self
+            .store
+            .pending_suggestions(project_id, round.number)
+            .await?;
         let route_proposals = self.store.list_human_route_proposals(project_id).await?;
         let planning_context = planning_context(
             &snapshot,
             &delta,
             &bottlenecks,
+            &obligations,
             &failure_patterns,
             &suggestions,
             &route_proposals,
@@ -1301,27 +1945,27 @@ impl ResearchService {
                 "planner circuit breaker is open".into(),
             ))
         };
-        let (plan, planner_mode, fallback_reason) = match planner_result {
-            Ok(plan) if primary_plan_is_executable(&plan) => (plan, "primary", None),
+        let (plan, route_scores, planner_mode, fallback_reason) = match planner_result {
+            Ok(scored_plan) if primary_plan_is_executable(&scored_plan.plan) => {
+                (scored_plan.plan, scored_plan.route_scores, "primary", None)
+            }
             Ok(_) => {
                 let reason =
                     "planner returned no policy-eligible route or no assignment".to_owned();
-                (
-                    continuity_plan(&snapshot, &bottlenecks, &reason)
-                        .unwrap_or_else(|| degraded_waiting_plan(&reason)),
-                    "deterministic_continuity",
-                    Some(reason),
-                )
+                let plan = continuity_plan(&snapshot, &bottlenecks, &obligations, &reason)
+                    .unwrap_or_else(|| degraded_waiting_plan(&reason));
+                let route_scores =
+                    unreviewed_route_scores(&plan.routes, self.config.ranking_weights);
+                (plan, route_scores, "deterministic_continuity", Some(reason))
             }
             Err(error) => {
                 warn!(%project_id, %error, "planner failed; entering bounded continuity mode");
                 let reason = error.to_string();
-                (
-                    continuity_plan(&snapshot, &bottlenecks, &reason)
-                        .unwrap_or_else(|| degraded_waiting_plan(&reason)),
-                    "deterministic_continuity",
-                    Some(reason),
-                )
+                let plan = continuity_plan(&snapshot, &bottlenecks, &obligations, &reason)
+                    .unwrap_or_else(|| degraded_waiting_plan(&reason));
+                let route_scores =
+                    unreviewed_route_scores(&plan.routes, self.config.ranking_weights);
+                (plan, route_scores, "deterministic_continuity", Some(reason))
             }
         };
         if let Some(reason) = &fallback_reason {
@@ -1339,6 +1983,7 @@ impl ResearchService {
                 project_id,
                 &round,
                 &plan,
+                &route_scores,
                 &delta,
                 planner_mode,
                 Some(&planner_packet.context_packet_id),
@@ -1347,37 +1992,29 @@ impl ResearchService {
         self.publish_all(saved.events);
         if planner_mode == "primary" {
             self.publish(self.store.record_planner_success(project_id).await?);
-        } else if let Some(reason) = &fallback_reason {
+        } else if let Some(reason) = fallback_reason.as_ref().filter(|_| planner_permitted) {
             self.publish(
                 self.store
                     .record_planner_failure(project_id, reason)
                     .await?,
             );
         }
-        let mut executable_tasks = saved.tasks;
-        let mut known_task_ids = executable_tasks
-            .iter()
-            .map(|task| task.task_id.clone())
-            .collect::<HashSet<_>>();
-        for task in self.store.list_tasks(project_id).await? {
-            if task.status == TaskStatus::Queued && known_task_ids.insert(task.task_id.clone()) {
-                executable_tasks.push(task);
-            }
+        // Admission is route-local: already approved routes may execute even while
+        // sibling routes still await review. Pending routes remain durably queued.
+        let executable_tasks = self
+            .store
+            .list_released_queued_tasks(project_id, round.number)
+            .await?;
+        if executable_tasks.is_empty()
+            && self.store.get_project(project_id).await?.status == ProjectStatus::NeedsHumanReview
+        {
+            return Ok(());
         }
-        if executable_tasks.is_empty() && planner_mode != "primary" {
-            self.publish(
-                self.store
-                    .record_planner_degraded_waiting(
-                        project_id,
-                        fallback_reason
-                            .as_deref()
-                            .unwrap_or("no legal narrow continuation task"),
-                    )
-                    .await?,
-            );
-        }
-        let max_parallel =
-            usize::try_from(snapshot.project.budget.max_parallel_workers.max(1)).unwrap_or(1);
+        let degraded_waiting = executable_tasks.is_empty() && planner_mode != "primary";
+        // Settings changed during planning govern subsequent admissions. Already
+        // running attempts are never cancelled merely because this limit falls.
+        let latest_budget = self.store.get_project(project_id).await?.budget;
+        let max_parallel = usize::try_from(latest_budget.max_parallel_workers.max(1)).unwrap_or(1);
         let results: Vec<CoreResult<()>> = stream::iter(executable_tasks.into_iter().map(|task| {
             let service = self.clone();
             async move { Box::pin(service.execute_task(task)).await }
@@ -1390,36 +2027,41 @@ impl ResearchService {
                 warn!(%project_id, %error, "worker task ended without a trusted result");
             }
         }
-        self.publish_all(self.store.compress_failures(project_id, 3).await?);
-        let latest_snapshot = self.store.snapshot(project_id).await?;
-        let report = reporting::round_report(&latest_snapshot, &plan);
-        self.write_latest_files(project_id, round.number, &report)
-            .await?;
-        for (kind, filename) in [
-            (
-                "round_report",
-                format!("round_{:03}_summary.md", round.number),
-            ),
-            ("latest_report", "LATEST.md".into()),
-        ] {
-            let (_, event) = self
-                .store
-                .store_artifact(
-                    project_id,
-                    kind,
-                    &filename,
-                    report.as_bytes(),
-                    round.number,
-                    vec![round.round_id.clone()],
-                )
+        // Do not let whichever local or distributed worker finishes first consume
+        // verification budget first. Drain only after the currently released
+        // execution batch reaches a terminal safe point; a route awaiting human
+        // approval is a later batch, and the unclaimed tail remains durable.
+        if !self
+            .store
+            .round_has_unfinished_released_tasks(project_id, round.number)
+            .await?
+        {
+            self.verify_submitted_batch(project_id, Some(round.number))
                 .await?;
-            self.publish(event);
+        }
+        self.publish_all(self.store.compress_failures(project_id, 3).await?);
+        if self.round_must_stay_open(project_id, round.number).await? {
+            return Ok(());
         }
         self.publish_all(
             self.store
                 .complete_round(project_id, &round.round_id, &plan.rationale_summary)
                 .await?,
         );
+        if degraded_waiting {
+            self.publish(
+                self.store
+                    .record_planner_degraded_waiting(
+                        project_id,
+                        fallback_reason
+                            .as_deref()
+                            .unwrap_or("no legal narrow continuation task"),
+                    )
+                    .await?,
+            );
+        }
+        self.ensure_round_report_projection(project_id, &round, &plan)
+            .await?;
         Ok(())
     }
 
@@ -1429,7 +2071,7 @@ impl ResearchService {
         round: &research_domain::ResearchRound,
         snapshot: &ProjectSnapshot,
         planning_context: &Value,
-    ) -> CoreResult<PlannerOutput> {
+    ) -> CoreResult<ScoredPlan> {
         let (strategy, strategy_context) = self
             .establish_strategy_state(round, snapshot, planning_context)
             .await?;
@@ -1516,7 +2158,10 @@ impl ResearchService {
             &proximity,
         )
         .await?;
-        let ranking = rank_routes(&routes, &reflection, self.config.ranking_weights);
+        let RouteRanking {
+            output: ranking,
+            route_scores,
+        } = rank_routes(&routes, &reflection, self.config.ranking_weights);
         self.record_planning_stage(
             round,
             "ranking",
@@ -1562,23 +2207,32 @@ impl ResearchService {
             ));
         }
         ensure_adversarial_assignment(&routes, &mut supervisor);
+        let known_goal_ids = snapshot
+            .goals
+            .iter()
+            .map(|goal| goal.goal_id.as_str())
+            .collect::<HashSet<_>>();
+        sanitize_assignment_goal_ids(&known_goal_ids, &mut supervisor);
         if supervisor.assignments.is_empty() {
             return Err(CoreError::InvalidAgentOutput(
                 "supervisor produced no policy-eligible assignments".into(),
             ));
         }
-        Ok(PlannerOutput {
-            rationale_summary: format!(
-                "Strategy: {} | Generator: {} | Reflection: {} | Supervisor: {}",
-                strategy.verdict_summary,
-                generator.rationale_summary,
-                reflection.summary,
-                supervisor.rationale_summary
-            ),
-            routes,
-            assignments: supervisor.assignments,
-            targeted_uncertainty_ids: supervisor.targeted_uncertainty_ids,
-            suggestion_decisions: supervisor.suggestion_decisions,
+        Ok(ScoredPlan {
+            plan: PlannerOutput {
+                rationale_summary: format!(
+                    "Strategy: {} | Generator: {} | Reflection: {} | Supervisor: {}",
+                    strategy.verdict_summary,
+                    generator.rationale_summary,
+                    reflection.summary,
+                    supervisor.rationale_summary
+                ),
+                routes,
+                assignments: supervisor.assignments,
+                targeted_uncertainty_ids: supervisor.targeted_uncertainty_ids,
+                suggestion_decisions: supervisor.suggestion_decisions,
+            },
+            route_scores,
         })
     }
 
@@ -1682,18 +2336,16 @@ impl ResearchService {
         &self,
         request: PlanningStageRequest<'_>,
     ) -> CoreResult<Value> {
-        let input_hash = sha256_json(request.input)?;
+        let input_hash = sha256_json(&serde_json::json!({
+            "planning_stage_contract":"2026-09-04-route-presentation-v2",
+            "stage":request.stage,
+            "input":request.input,
+            "prompt":&request.prompt,
+            "output_schema":&request.output_schema,
+        }))?;
         if let Some(output) = self
-            .store
-            .list_planning_stages(&request.round.project_id, &request.round.round_id)
+            .completed_planning_stage_output(&request, &input_hash)
             .await?
-            .into_iter()
-            .find(|run| {
-                run.get("stage").and_then(Value::as_str) == Some(request.stage)
-                    && run.get("input_hash").and_then(Value::as_str) == Some(input_hash.as_str())
-                    && run.get("status").and_then(Value::as_str) == Some("completed")
-            })
-            .and_then(|run| run.get("output").cloned())
         {
             return Ok(output);
         }
@@ -1702,6 +2354,11 @@ impl ResearchService {
         for attempt_number in 1..=2 {
             let (soft_timeout_seconds, hard_timeout_seconds) =
                 planning_attempt_timeouts(self.config.planner_timeout_seconds, attempt_number);
+            let remaining = self.planning_round_remaining_seconds(request.round).await?;
+            let hard_timeout_seconds = remaining.map_or(hard_timeout_seconds, |remaining| {
+                hard_timeout_seconds.min(remaining)
+            });
+            let soft_timeout_seconds = soft_timeout_seconds.min(hard_timeout_seconds);
             let (attempt_id, event) = self
                 .store
                 .begin_planning_stage_attempt(
@@ -1720,6 +2377,7 @@ impl ResearchService {
                 self.publish(event);
             }
             let run = self.run_planning_agent(
+                request.round,
                 request.snapshot,
                 request.role,
                 request.prompt.clone(),
@@ -1745,7 +2403,11 @@ impl ResearchService {
                             Some(&error.to_string()),
                         )
                         .await?;
+                    let should_retry = attempt_number < 2 && planning_error_is_retryable(&error);
                     last_error = Some(error);
+                    if !should_retry {
+                        break;
+                    }
                 }
             }
         }
@@ -1754,14 +2416,78 @@ impl ResearchService {
                 CoreError::InvalidAgentOutput("planning stage produced no attempt".into())
             })
         })?;
-        self.record_planning_stage(
-            request.round,
-            request.stage,
-            request.input,
-            &result.structured_output,
-        )
-        .await?;
+        if let Some(event) = self
+            .store
+            .record_planning_stage(
+                &request.round.project_id,
+                &request.round.round_id,
+                request.stage,
+                &input_hash,
+                &result.structured_output,
+            )
+            .await?
+        {
+            self.publish(event);
+        }
         Ok(result.structured_output)
+    }
+
+    async fn completed_planning_stage_output(
+        &self,
+        request: &PlanningStageRequest<'_>,
+        input_hash: &str,
+    ) -> CoreResult<Option<Value>> {
+        let checkpoint = self
+            .store
+            .list_planning_stages(&request.round.project_id, &request.round.round_id)
+            .await?
+            .into_iter()
+            .find(|run| {
+                run.get("stage").and_then(Value::as_str) == Some(request.stage)
+                    && run.get("status").and_then(Value::as_str) == Some("completed")
+            });
+        let Some(checkpoint) = checkpoint else {
+            return Ok(None);
+        };
+        let checkpoint_hash = checkpoint.get("input_hash").and_then(Value::as_str);
+        let full_hash_matches = checkpoint_hash == Some(input_hash);
+        // Older completed records hashed only the input. A completed attempt
+        // must attest to the full prompt/schema hash before reusing one.
+        let legacy_hash_matches = checkpoint_hash == Some(sha256_json(request.input)?.as_str())
+            && self
+                .store
+                .planning_stage_attempt_completed(
+                    &request.round.project_id,
+                    &request.round.round_id,
+                    request.stage,
+                    input_hash,
+                )
+                .await?;
+        Ok((full_hash_matches || legacy_hash_matches)
+            .then(|| checkpoint.get("output").cloned())
+            .flatten())
+    }
+
+    async fn planning_round_remaining_seconds(
+        &self,
+        round: &research_domain::ResearchRound,
+    ) -> CoreResult<Option<u64>> {
+        let Some(limit) = self.config.planner_round_timeout_seconds else {
+            return Ok(None);
+        };
+        let started = self
+            .store
+            .planning_round_started_at(&round.project_id, &round.round_id)
+            .await?;
+        let remaining = planning_round_remaining_seconds(limit, started, Utc::now());
+        if remaining == 0 {
+            return Err(StorageError::BudgetExhausted(format!(
+                "planner round {} exhausted its shared {limit}-second wall-clock budget",
+                round.round_id
+            ))
+            .into());
+        }
+        Ok(Some(remaining))
     }
 
     async fn await_planning_attempt<F>(
@@ -1802,6 +2528,7 @@ impl ResearchService {
 
     async fn run_planning_agent(
         &self,
+        round: &research_domain::ResearchRound,
         snapshot: &ProjectSnapshot,
         role: &str,
         prompt: String,
@@ -1823,6 +2550,11 @@ impl ResearchService {
                     .join(role),
             })
             .await?;
+        // Backend creation or a reused attempt must not grant a new round allowance.
+        let timeout_seconds = self
+            .planning_round_remaining_seconds(round)
+            .await?
+            .map_or(timeout_seconds, |remaining| timeout_seconds.min(remaining));
         self.run_agent_counted(CountedAgentRun {
             handle: &handle,
             task: AgentTask {
@@ -1831,10 +2563,12 @@ impl ResearchService {
                 output_schema,
                 timeout_seconds,
             },
+            resume_session_id: None,
             project: &snapshot.project,
             round: snapshot.project.current_round,
             worker_id: None,
             task_id: None,
+            purpose: ModelCallPurpose::Research,
             cancellation: CancellationToken::new(),
         })
         .await
@@ -1903,7 +2637,7 @@ impl ResearchService {
                 return Err(error.into());
             }
         };
-        let lease = self
+        let lease = match self
             .store
             .accept_local_handshake(
                 &offer,
@@ -1918,74 +2652,54 @@ impl ResearchService {
                 }),
                 90,
             )
-            .await?;
+            .await
+        {
+            Ok(lease) => lease,
+            Err(error) => {
+                match self
+                    .store
+                    .fail_local_attempt(None, &offer, &format!("worker handshake failed: {error}"))
+                    .await
+                {
+                    Ok(events) => self.publish_all(events),
+                    Err(cleanup_error) => warn!(
+                        %cleanup_error,
+                        task_id = %task.task_id,
+                        "worker offer cleanup was fenced by newer state"
+                    ),
+                }
+                return Err(error.into());
+            }
+        };
         self.publish_all(lease.events.clone());
-        let checkpoint_payload = serde_json::json!({
-            "checkpoint_kind":"worker_start_safe_point",
-            "task_id":task.task_id,
-            "attempt_id":lease.attempt_id,
-            "lease_epoch":lease.lease_epoch,
-            "task_contract_id":offer.contract.task_contract_id,
-            "task_contract_hash":offer.contract.content_hash,
-            "context_packet_id":offer.context_packet.context_packet_id,
-            "context_packet_hash":offer.context_packet.content_hash,
-            "resume_from":offer.resume_checkpoint,
-            "note":"This checkpoint records resumable execution inputs and is not a mathematical premise."
-        });
-        let checkpoint_bytes = serde_json::to_vec_pretty(&checkpoint_payload)?;
-        let (checkpoint_artifact, checkpoint_artifact_event) = self
-            .store
-            .store_artifact(
-                &task.project_id,
-                "task_checkpoint",
-                &format!(
-                    "{}-{}-start-checkpoint.json",
-                    task.task_id, lease.attempt_id
-                ),
-                &checkpoint_bytes,
-                task.round,
-                vec![task.task_id.clone(), lease.attempt_id.clone()],
-            )
-            .await?;
-        self.publish(checkpoint_artifact_event);
-        self.publish(
-            self.store
-                .save_local_checkpoint(
-                    &lease,
-                    &checkpoint_artifact.artifact_id,
-                    "worker handshake completed; immutable contract and context are resumable",
-                )
-                .await?,
-        );
+        // Contract and context packet are already immutable restart inputs. Keep
+        // checkpoints for genuine incremental worker state instead of copying
+        // those same inputs into a new artifact on every attempt.
         let running_task = lease.task.clone();
         let cancellation = CancellationToken::new();
-        self.task_cancellations
-            .lock()
-            .await
-            .insert(task.task_id.clone(), cancellation.clone());
-        let heartbeat_stop = CancellationToken::new();
-        let heartbeat_handle = {
-            let store = self.store.clone();
-            let lease = lease.clone();
-            let stop = heartbeat_stop.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        () = stop.cancelled() => break,
-                        () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                            if store.heartbeat_local_lease(&lease, 90).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            })
-        };
-        let mut steering = Vec::new();
-        let result = loop {
+        self.task_cancellations.lock().await.insert(
+            task.task_id.clone(),
+            CancellationRegistration {
+                project_id: running_task.project_id.clone(),
+                token: cancellation.clone(),
+            },
+        );
+        let heartbeat =
+            LeaseHeartbeatGuard::for_task(self.store.clone(), lease.clone(), cancellation.clone());
+        let project = self.store.get_project(&running_task.project_id).await?;
+        let task_timeout_seconds =
+            task_contract_timeout_seconds(&offer.contract, project.budget.max_minutes_per_task);
+        let attempt_started = Instant::now();
+        let work = async {
+            let attempts = self
+                .store
+                .list_task_attempts(&running_task.project_id, &running_task.task_id)
+                .await?;
+            let task_timeout_seconds =
+                remaining_retry_budget_seconds(task_timeout_seconds, &attempts, &lease.attempt_id);
             let (pending, events) = self
                 .store
-                .consume_pending_task_steers(
+                .pending_task_steers(
                     &running_task.project_id,
                     &running_task.task_id,
                     running_task.revision,
@@ -1993,56 +2707,140 @@ impl ResearchService {
                 )
                 .await?;
             self.publish_all(events);
-            steering.extend(pending.into_iter().map(|steer| steer.content));
-            let output = self
-                .call_worker(
-                    &handle,
-                    &running_task,
-                    &offer.contract,
-                    &offer.context_packet,
-                    offer.resume_checkpoint.as_ref(),
-                    cancellation.clone(),
-                    &steering,
-                )
-                .await;
-            let output = match output {
-                Ok(output) => output,
-                Err(error) => break Err(error),
-            };
-            let (arrived_during_run, events) = self
-                .store
-                .consume_pending_task_steers(
-                    &running_task.project_id,
+            let mut incorporated_steers = pending;
+            let mut cumulative_steering = incorporated_steers
+                .iter()
+                .map(|steer| steer.content.clone())
+                .collect::<Vec<_>>();
+            let mut steering_batch = cumulative_steering.clone();
+            let mut resume_session_id = None;
+            let mut superseded_ordinal = 0_u32;
+            loop {
+                let remaining_seconds = remaining_task_seconds(
+                    attempt_started,
+                    task_timeout_seconds,
                     &running_task.task_id,
-                    running_task.revision,
-                    running_task.route_cancellation_epoch,
+                )?;
+                let steering = if resume_session_id.is_some() {
+                    &steering_batch
+                } else {
+                    &cumulative_steering
+                };
+                let run = self
+                    .call_worker(
+                        &handle,
+                        &running_task,
+                        &offer.contract,
+                        &offer.context_packet,
+                        offer.resume_checkpoint.as_ref(),
+                        cancellation.clone(),
+                        resume_session_id.as_deref(),
+                        steering,
+                        remaining_seconds,
+                    )
+                    .await;
+                let WorkerAgentRun {
+                    mut output,
+                    session_id,
+                } = match run {
+                    Ok(run) => run,
+                    Err(error)
+                        if resume_session_id.is_some()
+                            && worker_resume_can_fallback_to_fresh(&error) =>
+                    {
+                        resume_session_id = None;
+                        steering_batch.clear();
+                        continue;
+                    }
+                    Err(error) => break Err(error),
+                };
+                let remaining = remaining_task_duration(
+                    attempt_started,
+                    task_timeout_seconds,
+                    &running_task.task_id,
+                )?;
+                match tokio::time::timeout(
+                    remaining,
+                    self.archive_source_fulltexts(&handle, &running_task, &mut output),
                 )
-                .await?;
-            self.publish_all(events);
-            if arrived_during_run.is_empty() {
-                break Ok(output);
+                .await
+                {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        break Err(CoreError::Agent(AgentError::Timeout(task_timeout_seconds)));
+                    }
+                }
+                let incorporated_ids = incorporated_steers
+                    .iter()
+                    .map(|steer| steer.steer_id.clone())
+                    .collect::<Vec<_>>();
+                let pending = self
+                    .store
+                    .submit_local_result_envelope_after_steers(&lease, &output, &incorporated_ids)
+                    .await?;
+                let arrived_during_run = match pending {
+                    LocalResultSubmission::Submitted {
+                        result_envelope_id,
+                        events,
+                    } => {
+                        self.publish_all(events);
+                        break Ok(result_envelope_id);
+                    }
+                    LocalResultSubmission::SteeringPending { steers } => steers,
+                };
+                superseded_ordinal = superseded_ordinal.saturating_add(1);
+                let effective_session_id = session_id
+                    .as_deref()
+                    .or(resume_session_id.as_deref())
+                    .map(str::to_owned);
+                let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+                    "task_id":running_task.task_id,
+                    "attempt_id":lease.attempt_id,
+                    "session_id":effective_session_id,
+                    "task_contract_hash":offer.contract.content_hash,
+                    "context_packet_hash":offer.context_packet.content_hash,
+                    "incorporated_steer_ids":incorporated_ids,
+                    "new_pending_steer_ids":arrived_during_run.iter().map(|steer| &steer.steer_id).collect::<Vec<_>>(),
+                    "output":output,
+                }))?;
+                let (_, event) = self
+                    .store
+                    .store_artifact(
+                        &running_task.project_id,
+                        "superseded_worker_output",
+                        &format!(
+                            "{}-pre-steer-{superseded_ordinal:03}.json",
+                            running_task.task_id
+                        ),
+                        &bytes,
+                        running_task.round,
+                        vec![
+                            running_task.task_id.clone(),
+                            lease.attempt_id.clone(),
+                            offer.contract.task_contract_id.clone(),
+                            offer.context_packet.context_packet_id.clone(),
+                        ],
+                    )
+                    .await?;
+                self.publish(event);
+                steering_batch = arrived_during_run
+                    .iter()
+                    .map(|steer| steer.content.clone())
+                    .collect();
+                cumulative_steering.extend(steering_batch.iter().cloned());
+                incorporated_steers.extend(arrived_during_run);
+                resume_session_id = if self.backend.capabilities().resumable_session {
+                    effective_session_id
+                } else {
+                    None
+                };
             }
-            let bytes = serde_json::to_vec_pretty(&output)?;
-            let (_, event) = self
-                .store
-                .store_artifact(
-                    &running_task.project_id,
-                    "superseded_worker_output",
-                    &format!("{}-pre-steer.json", running_task.task_id),
-                    &bytes,
-                    running_task.round,
-                    vec![running_task.task_id.clone()],
-                )
-                .await?;
-            self.publish(event);
-            steering.extend(arrived_during_run.into_iter().map(|steer| steer.content));
         };
-        heartbeat_stop.cancel();
-        let _ = heartbeat_handle.await;
+        let result = heartbeat.run(work).await;
         self.task_cancellations.lock().await.remove(&task.task_id);
-        let mut output = match result {
-            Ok(output) => output,
-            Err(error) => {
+        let result_envelope_id = match result {
+            Ok(Ok(result_envelope_id)) => result_envelope_id,
+            Ok(Err(error)) => {
                 self.publish_all(
                     self.store
                         .fail_local_attempt(Some(&lease), &offer, &error.to_string())
@@ -2050,33 +2848,24 @@ impl ResearchService {
                 );
                 return Err(error);
             }
+            Err(error) => {
+                self.publish_all(
+                    self.store
+                        .fail_local_attempt(Some(&lease), &offer, &error)
+                        .await?,
+                );
+                return Err(CoreError::LeaseHeartbeat(error));
+            }
         };
-        if let Err(error) = self
-            .archive_source_fulltexts(&handle, &running_task, &mut output)
-            .await
-        {
-            self.publish_all(
-                self.store
-                    .fail_local_attempt(Some(&lease), &offer, &error.to_string())
-                    .await?,
-            );
-            return Err(error);
-        }
-        let (result_envelope_id, events) = self
-            .store
-            .submit_local_result_envelope(&lease, &output)
-            .await?;
-        self.publish_all(events);
-        let (output, events) = self
+        let ingestion = self
             .store
             .ingest_local_result_envelope(&result_envelope_id)
             .await?;
-        self.publish_all(events);
-        let completed_task = self
-            .store
-            .get_task(&running_task.project_id, &running_task.task_id)
-            .await?;
-        Box::pin(self.submit_worker_candidates(&completed_task, output.candidates)).await?;
+        self.publish_all(ingestion.events);
+        // `run_round_unlocked` and `resume_interrupted_v2_round` drain these
+        // durable submissions only after all sibling workers reach a safe point.
+        // Dropping this in-memory list is safe because the verification rows were
+        // committed in the same ingestion transaction.
         Ok(())
     }
 
@@ -2107,47 +2896,11 @@ impl ResearchService {
                 continue;
             }
             if source.fulltext_path.is_none() {
-                if source.fulltext_sha256.is_some() {
-                    archival_failures.push(source_archival_failure(
-                        source,
-                        "fulltext_sha256_without_fulltext_path",
-                    ));
-                } else if task.worker_role == "literature_researcher" {
-                    if let Some(url) = source.url.as_deref() {
-                        match fetch_public_source_fulltext(url).await {
-                            Ok((filename, bytes, actual_hash)) => {
-                                let (artifact, event) = self
-                                    .store
-                                    .store_artifact(
-                                        &task.project_id,
-                                        "source_fulltext",
-                                        &filename,
-                                        &bytes,
-                                        task.round,
-                                        vec![task.task_id.clone()],
-                                    )
-                                    .await?;
-                                self.publish(event);
-                                source.fulltext_sha256 = Some(actual_hash);
-                                source.fulltext_artifact_id = Some(artifact.artifact_id);
-                                source.status = "reported_unverified".into();
-                                source.applicability = format!(
-                                    "{} Trusted runtime fetched the public HTTPS document; mathematical applicability remains unverified.",
-                                    source.applicability.trim()
-                                );
-                                continue;
-                            }
-                            Err(reason) => archival_failures.push(source_archival_failure(
-                                source,
-                                format!("trusted_fulltext_fetch_failed:{reason}"),
-                            )),
-                        }
-                    } else if source.status != "not_applicable" {
-                        archival_failures.push(source_archival_failure(
-                            source,
-                            "reported_literature_source_missing_fulltext_and_url",
-                        ));
-                    }
+                if let Some(failure) = self
+                    .archive_source_without_worker_file(task, source)
+                    .await?
+                {
+                    archival_failures.push(failure);
                 }
                 continue;
             }
@@ -2184,52 +2937,57 @@ impl ResearchService {
         Ok(())
     }
 
-    async fn submit_worker_candidates(
+    async fn archive_source_without_worker_file(
         &self,
-        completed_task: &Task,
-        candidates: Vec<CandidateDraft>,
-    ) -> CoreResult<()> {
-        for (candidate_index, draft) in candidates.into_iter().enumerate() {
-            let submission = CandidateSubmission {
-                task_id: completed_task.task_id.clone(),
-                route_id: completed_task.route_id.clone(),
-                target_goal_ids: if draft.target_goal_ids.is_empty() {
-                    completed_task.goal_ids.clone()
-                } else {
-                    draft.target_goal_ids
-                },
-                statement: draft.statement,
-                assumptions: draft.assumptions,
-                proof_markdown: draft.proof_markdown,
-                dependency_fact_ids: draft.dependency_fact_ids,
-                definitions_introduced: draft.definitions_introduced,
-                external_source_ids: draft.external_source_ids,
-                candidate_type: draft.candidate_type,
-                task_revision: completed_task.revision,
-                route_cancellation_epoch: completed_task.route_cancellation_epoch,
-            };
-            let idempotency_key = format!(
-                "worker-{}-{}-{candidate_index}",
-                completed_task.task_id, completed_task.revision
-            );
-            let receipt = self
-                .store
-                .submit_candidate(&completed_task.project_id, submission, &idempotency_key)
-                .await?;
-            let should_verify = receipt.event.is_some()
-                || matches!(
-                    receipt.verification.status,
-                    research_domain::CandidateStatus::Submitted
-                        | research_domain::CandidateStatus::Verifying
-                );
-            if let Some(event) = receipt.event {
-                self.publish(event);
-            }
-            if should_verify {
-                Box::pin(self.verify_candidate(&receipt.verification.verification_id)).await?;
-            }
+        task: &Task,
+        source: &mut SourceDraft,
+    ) -> CoreResult<Option<FailureDraft>> {
+        if source.fulltext_sha256.take().is_some() {
+            return Ok(Some(source_archival_failure(
+                source,
+                "fulltext_sha256_without_fulltext_path",
+            )));
         }
-        Ok(())
+        if task.worker_role != "literature_researcher"
+            || !matches!(source.status.as_str(), "reported" | "possibly_applicable")
+        {
+            return Ok(None);
+        }
+        let Some(url) = source.url.as_deref() else {
+            return Ok(Some(source_archival_failure(
+                source,
+                "reported_literature_source_missing_fulltext_and_url",
+            )));
+        };
+        let (filename, bytes, actual_hash) = match fetch_public_source_fulltext(url).await {
+            Ok(fetched) => fetched,
+            Err(reason) => {
+                return Ok(Some(source_archival_failure(
+                    source,
+                    format!("trusted_fulltext_fetch_failed:{reason}"),
+                )));
+            }
+        };
+        let (artifact, event) = self
+            .store
+            .store_artifact(
+                &task.project_id,
+                "source_fulltext",
+                &filename,
+                &bytes,
+                task.round,
+                vec![task.task_id.clone()],
+            )
+            .await?;
+        self.publish(event);
+        source.fulltext_sha256 = Some(actual_hash);
+        source.fulltext_artifact_id = Some(artifact.artifact_id);
+        source.status = "reported_unverified".into();
+        source.applicability = format!(
+            "{} Trusted runtime fetched the public HTTPS document; mathematical applicability remains unverified.",
+            source.applicability.trim()
+        );
+        Ok(None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2241,16 +2999,25 @@ impl ResearchService {
         context_packet: &ContextPacket,
         resume_checkpoint: Option<&Value>,
         cancellation: CancellationToken,
+        resume_session_id: Option<&str>,
         steering: &[String],
-    ) -> CoreResult<WorkerOutput> {
+        remaining_task_seconds: u64,
+    ) -> CoreResult<WorkerAgentRun> {
         let project = self.store.get_project(&task.project_id).await?;
-        let mut prompt = worker_packet_prompt(task, task_contract, context_packet)?;
-        if let Some(checkpoint) = resume_checkpoint {
-            prompt.push_str("\n\nA prior attempt left the following resumable checkpoint. Verify its artifact hash before using it. It is execution state, not a mathematical premise:\n");
-            prompt.push_str(&serde_json::to_string_pretty(checkpoint)?);
-        }
+        let mut prompt = if resume_session_id.is_some() {
+            String::from(
+                "Continue the existing worker session. Keep the prior immutable Task Contract and Context Packet as the only allowed mathematical inputs. A new human-steering batch arrived after the previous structured output. Reconsider that output in light of this guidance and return a complete replacement WorkerOutput that satisfies the original schema. Steering is research guidance, never a fact or proof.\n",
+            )
+        } else {
+            let mut prompt = worker_packet_prompt(task, task_contract, context_packet)?;
+            if let Some(checkpoint) = resume_checkpoint {
+                prompt.push_str("\n\nA prior attempt left the following resumable checkpoint. Verify its artifact hash before using it. It is execution state, not a mathematical premise:\n");
+                prompt.push_str(&serde_json::to_string_pretty(checkpoint)?);
+            }
+            prompt
+        };
         if !steering.is_empty() {
-            prompt.push_str("\n\nHuman steering applied at a safe point. Treat it as research guidance, not as a fact or proof:\n");
+            prompt.push_str("\n\nHuman steering applied at a safe point:\n");
             for (index, item) in steering.iter().enumerate() {
                 let _ = writeln!(prompt, "{}. {}", index + 1, item);
             }
@@ -2262,31 +3029,145 @@ impl ResearchService {
             timeout_seconds: self
                 .config
                 .worker_timeout_seconds
-                .min(u64::from(project.budget.max_minutes_per_task).saturating_mul(60)),
+                .min(remaining_task_seconds),
         };
         let result = self
             .run_agent_counted(CountedAgentRun {
                 handle,
                 task: agent_task,
+                resume_session_id,
                 project: &project,
                 round: task.round,
                 worker_id: task.worker_id.as_deref(),
                 task_id: Some(&task.task_id),
+                purpose: ModelCallPurpose::RouteScopedResearch(&task.route_id),
                 cancellation,
             })
             .await?;
-        serde_json::from_value(result.structured_output).map_err(|error| {
+        let output = serde_json::from_value(result.structured_output).map_err(|error| {
             CoreError::InvalidAgentOutput(format!("worker {}: {error}", task.task_id))
+        })?;
+        Ok(WorkerAgentRun {
+            output,
+            session_id: result.session_id,
         })
+    }
+
+    async fn submitted_verification_queue(
+        &self,
+        project_id: &str,
+        round: Option<i64>,
+    ) -> CoreResult<Vec<QueuedVerification>> {
+        let mut queue = Vec::new();
+        for verification in self.store.list_verifications(project_id).await? {
+            if verification.status != research_domain::CandidateStatus::Submitted {
+                continue;
+            }
+            let candidate = self.store.get_candidate(&verification.candidate_id).await?;
+            let task = self
+                .store
+                .get_task(project_id, &candidate.submission.task_id)
+                .await?;
+            if round.is_some_and(|number| number != task.round) {
+                continue;
+            }
+            let route = self
+                .store
+                .get_route(project_id, &candidate.submission.route_id)
+                .await?;
+            let candidate_ordinal: i64 =
+                sqlx::query_scalar("SELECT rowid FROM candidates WHERE candidate_id=?")
+                    .bind(&candidate.candidate_id)
+                    .fetch_one(self.store.read_pool())
+                    .await
+                    .map_err(StorageError::from)?;
+            queue.push(QueuedVerification {
+                verification_id: verification.verification_id,
+                round: task.round,
+                task_priority: task.priority,
+                route_priority: route.priority,
+                route_id: route.route_id,
+                task_id: task.task_id,
+                candidate_ordinal,
+            });
+        }
+        sort_verification_queue(&mut queue);
+        Ok(queue)
+    }
+
+    /// Drain a stable snapshot of submitted work without claiming the tail up
+    /// front. If one verification fails due to budget or backend infrastructure,
+    /// the current claim is released and later rows remain `submitted` for the
+    /// normal recovery path.
+    async fn verify_submitted_batch(&self, project_id: &str, round: Option<i64>) -> CoreResult<()> {
+        for queued in self.submitted_verification_queue(project_id, round).await? {
+            // Wait for global capacity before entering the short admission
+            // boundary. A command may add or resume round work while we wait.
+            let _permit = self.verification_semaphore.acquire().await.map_err(|_| {
+                CoreError::InvalidAgentOutput("verification semaphore was closed".into())
+            })?;
+            let admission_lock = self.verification_admission_lock(project_id).await;
+            let claimed = {
+                let _guard = admission_lock.lock().await;
+                // Recheck for every item, including project-wide recovery drains.
+                // The command dispatcher holds the same lock while applying state
+                // changes, so a task cannot appear between this check and claim.
+                if self
+                    .store
+                    .round_has_unfinished_released_tasks(project_id, queued.round)
+                    .await?
+                {
+                    return Ok(());
+                }
+                self.store
+                    .try_mark_verification_started(&queued.verification_id)
+                    .await?
+            };
+            let Some((verification, event)) = claimed else {
+                continue;
+            };
+            self.publish(event);
+            Box::pin(self.complete_claimed_verification(&verification)).await?;
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
     pub async fn verify_candidate(&self, verification_id: &str) -> CoreResult<()> {
-        let (verification, event) = self
+        // The permit wraps the entire pipeline, not just individual reviewer
+        // calls.  Consequently API submissions, recovery, distributed workers,
+        // and local rounds all share the same service-level backpressure.
+        let _permit = self.verification_semaphore.acquire().await.map_err(|_| {
+            CoreError::InvalidAgentOutput("verification semaphore was closed".into())
+        })?;
+        let Some((verification, event)) = self
             .store
-            .mark_verification_started(verification_id)
-            .await?;
+            .try_mark_verification_started(verification_id)
+            .await?
+        else {
+            return Ok(());
+        };
         self.publish(event);
+        Box::pin(self.complete_claimed_verification(&verification)).await
+    }
+
+    async fn complete_claimed_verification(&self, verification: &Verification) -> CoreResult<()> {
+        let verification_id = verification.verification_id.as_str();
+        let result = Box::pin(self.verify_claimed_candidate(verification)).await;
+        if let Err(error) = &result
+            && let Some(event) = self
+                .store
+                .release_verification_claim(verification_id, &error.to_string())
+                .await?
+        {
+            self.publish(event);
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn verify_claimed_candidate(&self, verification: &Verification) -> CoreResult<()> {
+        let verification_id = verification.verification_id.as_str();
         let candidate = self.store.get_candidate(&verification.candidate_id).await?;
         let project = self.store.get_project(&verification.project_id).await?;
         let task = self
@@ -2327,50 +3208,43 @@ impl ResearchService {
             .await?;
         let independent_proof_requested =
             governance_kind.as_deref() == Some("request_independent_proof");
-        let formal_required = requires_formal_verification(&project, &candidate.submission)
-            || matches!(
-                governance_kind.as_deref(),
-                Some("request_formalization" | "request_independent_proof")
-            );
-        let required_checks = required_checks(
-            !sources.is_empty(),
-            formal_required,
-            independent_proof_requested,
-        );
-        let (profile, required_acceptance, policy_name) = if independent_proof_requested {
-            (
-                VerificationProfile::CriticalCertification,
-                AcceptanceClass::FullyCertified,
-                "independent_proof_certification_v1",
-            )
+        let formal_required =
+            requires_formal_verification(&project, &candidate.submission, &target_goals)
+                || matches!(
+                    governance_kind.as_deref(),
+                    Some("request_formalization" | "request_independent_proof")
+                );
+        let certification = if independent_proof_requested {
+            CertificationMode::IndependentProof
         } else if formal_required {
-            (
-                VerificationProfile::CriticalCertification,
-                AcceptanceClass::FullyCertified,
-                "critical_certification_v2",
-            )
+            CertificationMode::FormalReplay
         } else {
-            (
-                VerificationProfile::StandardReview,
-                AcceptanceClass::Reviewed,
-                "standard_review_v1",
-            )
+            CertificationMode::NaturalLanguage
         };
+        let plan_spec = verification_plan_spec(
+            !sources.is_empty(),
+            !candidate.submission.dependency_fact_ids.is_empty(),
+            certification,
+        );
+        let independent_reviewer_count = plan_spec.independent_reviewer_count();
+        let require_citation_review = plan_spec.requires_reviewer("citation_review");
+        let require_adversarial_review = plan_spec.requires_reviewer("adversarial_review");
+        let require_formal_replay = plan_spec.requires_formal_replay();
         let (case, case_event) = self
             .store
             .ensure_verification_case(
                 verification_id,
                 VerificationCaseDraft {
-                    name: policy_name.into(),
-                    profile,
-                    required_acceptance,
-                    required_checks,
-                    independent_reviewer_count: if independent_proof_requested { 3 } else { 2 },
-                    require_citation_review: !sources.is_empty(),
-                    require_adversarial_review: true,
-                    require_alignment_review: formal_required,
-                    require_fresh_replay: formal_required,
-                    max_attempts: 3,
+                    name: plan_spec.name.into(),
+                    profile: plan_spec.profile,
+                    required_acceptance: plan_spec.required_acceptance,
+                    required_checks: required_checks(&plan_spec),
+                    independent_reviewer_count,
+                    require_citation_review,
+                    require_adversarial_review,
+                    require_alignment_review: require_formal_replay,
+                    require_fresh_replay: require_formal_replay,
+                    max_attempts: plan_spec.max_attempts,
                     risk_score: v1_risk_score(&project, &candidate.submission),
                     risk_reasons: v1_risk_reasons(&project, &candidate.submission),
                 },
@@ -2379,7 +3253,15 @@ impl ResearchService {
         if let Some(event) = case_event {
             self.publish(event);
         }
-        let toolchain_hash = if formal_required {
+        // Existing cases may carry a policy created by an earlier process. Always
+        // execute the persisted policy rather than rebuilding a second, hard-coded
+        // reviewer list in the orchestrator.
+        let execution_policy = self.store.verification_policy(&case.case_id).await?;
+        let execution_requirements = execution_policy
+            .canonical_requirements()
+            .map_err(CoreError::InvalidAgentOutput)?;
+        let formal_pipeline_required = execution_requirements.requires_formal_pipeline();
+        let toolchain_hash = if formal_pipeline_required {
             self.verification_toolchain_hash().await.ok()
         } else {
             None
@@ -2392,7 +3274,7 @@ impl ResearchService {
                     VerificationSnapshotDraft {
                         toolchain_hash,
                         extra_payload: serde_json::json!({
-                            "verification_layer": if formal_required { "v2" } else { "v1" },
+                            "verification_layer": if formal_pipeline_required { "v2" } else { "v1" },
                             "backend": self.backend.name(),
                             "governance_request": governance_kind,
                         }),
@@ -2460,35 +3342,7 @@ impl ResearchService {
                 .await?,
         );
 
-        let reviewer_kinds: Vec<String> = if sources.is_empty() && independent_proof_requested {
-            vec![
-                "math_review_1".into(),
-                "math_review_2".into(),
-                "math_review_3".into(),
-                "adversarial_review".into(),
-            ]
-        } else if sources.is_empty() {
-            vec![
-                "math_review_1".into(),
-                "math_review_2".into(),
-                "adversarial_review".into(),
-            ]
-        } else if independent_proof_requested {
-            vec![
-                "math_review_1".into(),
-                "math_review_2".into(),
-                "math_review_3".into(),
-                "citation_review".into(),
-                "adversarial_review".into(),
-            ]
-        } else {
-            vec![
-                "math_review_1".into(),
-                "math_review_2".into(),
-                "citation_review".into(),
-                "adversarial_review".into(),
-            ]
-        };
+        let reviewer_kinds = execution_requirements.reviewer_kinds().to_vec();
         let service = self;
         let project_ref = &project;
         let submission_ref = &candidate.submission;
@@ -2517,7 +3371,7 @@ impl ResearchService {
         .collect::<Vec<_>>()
         .await;
         completed_reviews.sort_by_key(|(index, _, _)| *index);
-        let mut reviews = Vec::with_capacity(completed_reviews.len() + 1);
+        let mut reviews = Vec::with_capacity(completed_reviews.len());
         let mut reviewer_reports = Vec::with_capacity(completed_reviews.len());
         for (_, reviewer_kind, report) in completed_reviews {
             let check_status = verdict_check_status(report.verdict);
@@ -2541,46 +3395,23 @@ impl ResearchService {
             reviewer_reports.push((reviewer_kind, report.clone()));
             reviews.push(report);
         }
-        let independence = assess_reviewer_independence(&reviewer_reports);
-        let (_, event) = self
-            .store
-            .record_verification_check(
-                &case.case_id,
-                CheckDraft {
-                    attempt_id: None,
-                    kind: "reviewer_independence".into(),
-                    status: if independence.duplicate_groups.is_empty() {
-                        CheckStatus::Passed
-                    } else {
-                        CheckStatus::Failed
-                    },
-                    mandatory: true,
-                    summary: independence.summary.clone(),
-                    details: serde_json::to_value(&independence)?,
-                },
-            )
-            .await?;
-        self.publish(event);
-        if !independence.duplicate_groups.is_empty() {
-            reviews.push(VerificationReport {
-                verdict: VerificationVerdict::Unknown,
-                summary: independence.summary,
-                critical_errors: Vec::new(),
-                gaps: Vec::new(),
-                uncertainties: vec![
-                    "two mathematical reviewers returned byte-equivalent normalized findings"
-                        .into(),
-                ],
-                repair_actions: vec![
-                    "rerun the duplicated reviewer roles with an independently varied audit contract"
-                        .into(),
-                ],
-                checked_fact_ids: candidate.submission.dependency_fact_ids.clone(),
-                checked_source_ids: candidate.submission.external_source_ids.clone(),
-                evidence_level: "reviewer_independence_unresolved".into(),
-            });
+        let mut reviewer_independence_passed = true;
+        if let Some(independence_check) = reviewer_independence_check_draft(&reviewer_reports)? {
+            reviewer_independence_passed = independence_check.status == CheckStatus::Passed;
+            let (_, event) = self
+                .store
+                .record_verification_check(&case.case_id, independence_check)
+                .await?;
+            self.publish(event);
         }
-        if !target_goals.is_empty() {
+        let mut report = adjudicate_reviews(&candidate.submission, &reviews);
+        if !reviewer_independence_passed && report.verdict == VerificationVerdict::Accepted {
+            report = reviewer_independence_unknown_report(&candidate.submission, report);
+        }
+        // Goal coverage is downstream of mathematical validity. A rejected or
+        // unresolved candidate cannot close a Goal, so another model call here
+        // would only amplify verification cost and backend failures.
+        if report.verdict == VerificationVerdict::Accepted && !target_goals.is_empty() {
             let coverage_report = if candidate.submission.candidate_type
                 != research_domain::CandidateType::Counterexample
                 && target_goals.iter().all(|goal| {
@@ -2632,8 +3463,7 @@ impl ResearchService {
                 .await?;
             self.publish(event);
         }
-        let mut report = adjudicate_reviews(&candidate.submission, &reviews);
-        if formal_required && report.verdict == VerificationVerdict::Accepted {
+        if formal_pipeline_required && report.verdict == VerificationVerdict::Accepted {
             self.publish(
                 self.store
                     .transition_verification_case(
@@ -2746,15 +3576,48 @@ impl ResearchService {
             .iter()
             .map(|fact| fact.fact_id.clone())
             .collect::<Vec<_>>();
+        let case = match self
+            .store
+            .verification_case_for_verification(verification_id)
+            .await
+        {
+            Ok(case) => case,
+            Err(error) => {
+                return unavailable_verification_report(
+                    submission,
+                    &format!("{reviewer_kind} case unavailable: {error}"),
+                );
+            }
+        };
+        match self
+            .store
+            .replay_ingested_verification_result(
+                &case.case_id,
+                reviewer_kind,
+                &verification_context,
+            )
+            .await
+        {
+            Ok(Some((_attempt_id, payload))) => {
+                return serde_json::from_value(payload).unwrap_or_else(|error| {
+                    unavailable_verification_report(
+                        submission,
+                        &format!("invalid recovered {reviewer_kind} output: {error}"),
+                    )
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return unavailable_verification_report(
+                    submission,
+                    &format!("{reviewer_kind} recovered result unavailable: {error}"),
+                );
+            }
+        }
         let offer = match self
             .store
             .offer_verification_worker(
-                &self
-                    .store
-                    .verification_case_for_verification(verification_id)
-                    .await
-                    .map(|case| case.case_id)
-                    .unwrap_or_default(),
+                &case.case_id,
                 reviewer_kind,
                 self.backend.name(),
                 self.config.model.as_deref(),
@@ -2838,23 +3701,13 @@ impl ResearchService {
                 );
             }
         };
-        let heartbeat_stop = CancellationToken::new();
-        let heartbeat_handle = {
-            let store = self.store.clone();
-            let lease = lease.clone();
-            let stop = heartbeat_stop.clone();
-            let ttl = self.config.verifier_timeout_seconds.saturating_add(60);
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        () = stop.cancelled() => break,
-                        () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                            if store.heartbeat_verification_worker(&lease,ttl).await.is_err() { break; }
-                        }
-                    }
-                }
-            })
-        };
+        let cancellation = CancellationToken::new();
+        let heartbeat = LeaseHeartbeatGuard::for_verification(
+            self.store.clone(),
+            lease.clone(),
+            self.config.verifier_timeout_seconds.saturating_add(60),
+            cancellation.clone(),
+        );
         let task = AgentTask {
             kind: AgentTaskKind::Verifier,
             prompt: format!(
@@ -2867,21 +3720,37 @@ impl ResearchService {
             output_schema: verifier_schema(),
             timeout_seconds: self.config.verifier_timeout_seconds,
         };
-        let run_result = self
-            .run_agent_counted(CountedAgentRun {
+        let run_result = match heartbeat
+            .run(self.run_agent_counted(CountedAgentRun {
                 handle: &handle,
                 task,
+                resume_session_id: None,
                 project,
                 round: project.current_round,
                 worker_id: None,
                 // Verification has its own policy budget; it must not consume the producing
                 // worker task's model-call allowance.
                 task_id: None,
-                cancellation: CancellationToken::new(),
-            })
-            .await;
-        heartbeat_stop.cancel();
-        let _ = heartbeat_handle.await;
+                purpose: ModelCallPurpose::Verification(verification_id),
+                cancellation,
+            }))
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                if let Ok(events) = self
+                    .store
+                    .fail_verification_worker(&offer, Some(&lease), &error)
+                    .await
+                {
+                    self.publish_all(events);
+                }
+                return unavailable_verification_report(
+                    submission,
+                    &format!("{reviewer_kind} lease heartbeat failed: {error}"),
+                );
+            }
+        };
         match run_result {
             Ok(result) => {
                 let (envelope_id, events) = match self
@@ -3438,8 +4307,8 @@ impl ResearchService {
             .store_verification_package(&case.case_id, manifest, &package_path_text)
             .await?;
         self.publish(event);
-        let observed_manifest_hash = match self.verify_package_integrity(&package).await {
-            Ok(hash) => hash,
+        let verified_package = match self.read_verified_package(&package).await {
+            Ok(package) => package,
             Err(error) => {
                 let reason = format!("verification package could not be re-read: {error}");
                 self.record_case_check(
@@ -3455,6 +4324,7 @@ impl ResearchService {
                 ));
             }
         };
+        let observed_manifest_hash = verified_package.manifest_hash;
         let package_ok = observed_manifest_hash == package.manifest_hash;
         self.record_case_check(
             &case.case_id,
@@ -3499,7 +4369,9 @@ impl ResearchService {
                     case_id: case.case_id.clone(),
                     attempt_id: None,
                     theorem_name: certified_formalization.theorem_name.clone(),
-                    source: certified_formalization.lean_source.clone(),
+                    // Replay the exact bytes re-read from the immutable package,
+                    // not the in-memory formalization used for the first run.
+                    source: verified_package.lean_source,
                     working_directory: self
                         .config
                         .runtime_root
@@ -3678,24 +4550,14 @@ impl ResearchService {
             }
         };
         self.publish_all(lease.events.clone());
-        let stop = CancellationToken::new();
-        let heartbeat = {
-            let store = self.store.clone();
-            let lease = lease.clone();
-            let stop = stop.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        () = stop.cancelled() => break,
-                        () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                            if store.heartbeat_verification_worker(&lease,ttl).await.is_err() { break; }
-                        }
-                    }
-                }
-            })
-        };
-        let result = self
-            .run_interactive_proof_search_inner(
+        let heartbeat = LeaseHeartbeatGuard::for_verification(
+            self.store.clone(),
+            lease.clone(),
+            ttl,
+            CancellationToken::new(),
+        );
+        let result = match heartbeat
+            .run(Box::pin(self.run_interactive_proof_search_inner(
                 backend,
                 case,
                 verification_id,
@@ -3703,10 +4565,21 @@ impl ResearchService {
                 submission,
                 dependencies,
                 formalization,
-            )
-            .await;
-        stop.cancel();
-        let _ = heartbeat.await;
+            )))
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                if let Ok(events) = self
+                    .store
+                    .fail_verification_worker(&offer, Some(&lease), &error)
+                    .await
+                {
+                    self.publish_all(events);
+                }
+                return Err(format!("interactive proof lease heartbeat failed: {error}"));
+            }
+        };
         let result = match result {
             Ok(result) => result,
             Err(error) => {
@@ -3811,10 +4684,13 @@ impl ResearchService {
             .await
             .map_err(|error| error.to_string())?;
         self.publish_all(events);
-        self.task_cancellations
-            .lock()
-            .await
-            .insert(search.search_id.clone(), cancellation.clone());
+        self.task_cancellations.lock().await.insert(
+            search.search_id.clone(),
+            CancellationRegistration {
+                project_id: project.project_id.clone(),
+                token: cancellation.clone(),
+            },
+        );
         if root_state.is_closed() {
             let (finished, event) = self
                 .store
@@ -4243,35 +5119,41 @@ impl ResearchService {
             }
         };
         self.publish_all(lease.events.clone());
-        let stop = CancellationToken::new();
-        let heartbeat = {
-            let store = self.store.clone();
-            let lease = lease.clone();
-            let stop = stop.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        () = stop.cancelled() => break,
-                        () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                            if store.heartbeat_verification_worker(&lease,ttl).await.is_err() { break; }
-                        }
-                    }
-                }
-            })
-        };
-        let run = self
-            .run_agent_counted(CountedAgentRun {
+        let cancellation = CancellationToken::new();
+        let heartbeat = LeaseHeartbeatGuard::for_verification(
+            self.store.clone(),
+            lease.clone(),
+            ttl,
+            cancellation.clone(),
+        );
+        let run = match heartbeat
+            .run(self.run_agent_counted(CountedAgentRun {
                 handle: &handle,
                 task,
+                resume_session_id: None,
                 project,
                 round: project.current_round,
                 worker_id: None,
                 task_id: None,
-                cancellation: CancellationToken::new(),
-            })
-            .await;
-        stop.cancel();
-        let _ = heartbeat.await;
+                purpose: ModelCallPurpose::Verification(verification_id),
+                cancellation,
+            }))
+            .await
+        {
+            Ok(run) => run,
+            Err(error) => {
+                if let Ok(events) = self
+                    .store
+                    .fail_verification_worker(&offer, Some(&lease), &error)
+                    .await
+                {
+                    self.publish_all(events);
+                }
+                return Err(format!(
+                    "verification agent lease heartbeat failed: {error}"
+                ));
+            }
+        };
         let mut result = match run {
             Ok(result) => result,
             Err(error) => {
@@ -4421,8 +5303,8 @@ impl ResearchService {
             .store
             .cancel_proof_search(search_id, expected_epoch, requested_by, idempotency_key)
             .await?;
-        if let Some(token) = self.task_cancellations.lock().await.get(search_id) {
-            token.cancel();
+        if let Some(registration) = self.task_cancellations.lock().await.get(search_id) {
+            registration.token.cancel();
         }
         if let Some(event) = event {
             self.publish(event);
@@ -4642,26 +5524,29 @@ impl ResearchService {
         };
         self.publish_all(lease.events.clone());
         request.attempt_id = Some(offer.attempt_id.clone());
-        let stop = CancellationToken::new();
-        let heartbeat = {
-            let store = self.store.clone();
-            let lease = lease.clone();
-            let stop = stop.clone();
-            let ttl = request.timeout_seconds.saturating_add(60);
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        () = stop.cancelled() => break,
-                        () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                            if store.heartbeat_verification_worker(&lease,ttl).await.is_err() { break; }
-                        }
-                    }
+        let ttl = request.timeout_seconds.saturating_add(60);
+        let cancellation = CancellationToken::new();
+        let heartbeat = LeaseHeartbeatGuard::for_verification(
+            self.store.clone(),
+            lease.clone(),
+            ttl,
+            cancellation.clone(),
+        );
+        let outcome = match heartbeat.run(backend.verify(request, cancellation)).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if let Ok(events) = self
+                    .store
+                    .fail_verification_worker(&offer, Some(&lease), &error)
+                    .await
+                {
+                    self.publish_all(events);
                 }
-            })
+                return Err(format!(
+                    "verification backend lease heartbeat failed: {error}"
+                ));
+            }
         };
-        let outcome = backend.verify(request, CancellationToken::new()).await;
-        stop.cancel();
-        let _ = heartbeat.await;
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -4816,10 +5701,10 @@ impl ResearchService {
         Ok((manifest, package_path))
     }
 
-    async fn verify_package_integrity(
+    async fn read_verified_package(
         &self,
         package: &research_domain::VerificationPackage,
-    ) -> CoreResult<String> {
+    ) -> CoreResult<VerifiedPackage> {
         let root = PathBuf::from(&package.storage_path);
         let manifest_bytes = tokio::fs::read(root.join("manifest.json")).await?;
         let manifest: Value = serde_json::from_slice(&manifest_bytes)?;
@@ -4827,6 +5712,7 @@ impl ResearchService {
             .get("files")
             .and_then(Value::as_object)
             .ok_or_else(|| CoreError::InvalidAgentOutput("package manifest has no files".into()))?;
+        let mut lean_source = None;
         for (filename, metadata) in files {
             let expected = metadata
                 .get("sha256")
@@ -4835,26 +5721,49 @@ impl ResearchService {
             let bytes = tokio::fs::read(root.join(filename)).await?;
             let observed = hex::encode(Sha256::digest(&bytes));
             if observed != expected {
-                return Ok(format!("file_mismatch:{filename}:{observed}"));
+                return Ok(VerifiedPackage {
+                    manifest_hash: format!("file_mismatch:{filename}:{observed}"),
+                    lean_source: String::new(),
+                });
+            }
+            if filename == "Verification.lean" {
+                lean_source = Some(String::from_utf8(bytes).map_err(|error| {
+                    CoreError::InvalidAgentOutput(format!(
+                        "package Verification.lean is not UTF-8: {error}"
+                    ))
+                })?);
             }
         }
-        Ok(sha256_json(&manifest)?)
+        let lean_source = lean_source.ok_or_else(|| {
+            CoreError::InvalidAgentOutput(
+                "package manifest does not include Verification.lean".into(),
+            )
+        })?;
+        Ok(VerifiedPackage {
+            manifest_hash: sha256_json(&manifest)?,
+            lean_source,
+        })
     }
 
     async fn run_agent_counted(&self, request: CountedAgentRun<'_>) -> CoreResult<AgentRunResult> {
         let CountedAgentRun {
             handle,
             task,
+            resume_session_id,
             project,
             round,
             worker_id,
             task_id,
+            purpose,
             cancellation,
         } = request;
-        self.task_cancellations
-            .lock()
-            .await
-            .insert(handle.handle_id.clone(), cancellation.clone());
+        self.task_cancellations.lock().await.insert(
+            handle.handle_id.clone(),
+            CancellationRegistration {
+                project_id: project.project_id.clone(),
+                token: cancellation.clone(),
+            },
+        );
         let reservation = match self
             .store
             .reserve_model_call(ModelCallRequest {
@@ -4863,6 +5772,7 @@ impl ResearchService {
                 worker_id,
                 task_id,
                 model: self.config.model.as_deref(),
+                purpose,
                 max_total_calls: project.budget.max_total_model_calls,
                 max_task_calls: project.budget.max_model_calls_per_task,
             })
@@ -4877,8 +5787,31 @@ impl ResearchService {
                 return Err(error.into());
             }
         };
+        if cancellation.is_cancelled() {
+            self.task_cancellations
+                .lock()
+                .await
+                .remove(&handle.handle_id);
+            self.store
+                .fail_model_call(
+                    &reservation.usage_id,
+                    0,
+                    "cancelled",
+                    "model call cancelled before backend launch",
+                )
+                .await?;
+            return Err(AgentError::Cancelled.into());
+        }
         let started = Instant::now();
-        let result = self.backend.run(handle, task, cancellation).await;
+        let result = if let Some(session_id) = resume_session_id {
+            let mut resume_handle = handle.clone();
+            resume_handle.session_id = Some(session_id.to_owned());
+            self.backend
+                .resume(&resume_handle, task, cancellation)
+                .await
+        } else {
+            self.backend.run(handle, task, cancellation).await
+        };
         self.task_cancellations
             .lock()
             .await
@@ -4897,12 +5830,139 @@ impl ResearchService {
                 Ok(result)
             }
             Err(error) => {
+                let (input_tokens, output_tokens) = error.token_usage();
                 self.store
-                    .finish_model_call(&reservation.usage_id, elapsed_ms)
+                    .fail_model_call_with_tokens(
+                        &reservation.usage_id,
+                        elapsed_ms,
+                        agent_error_kind(&error),
+                        &error.to_string(),
+                        input_tokens,
+                        output_tokens,
+                    )
                     .await?;
                 Err(error.into())
             }
         }
+    }
+
+    /// Rebuild the disposable report projection after a crash that happened
+    /// after a round or budget terminalization but before all files were written.
+    async fn recover_round_report_projection(&self, project_id: &str) -> CoreResult<()> {
+        let Some(round) = self.store.current_round(project_id).await? else {
+            return Ok(());
+        };
+        let project_status = self.store.get_project(project_id).await?.status;
+        let terminal_budget_projection = matches!(
+            project_status,
+            ProjectStatus::PartialSuccess | ProjectStatus::EnvironmentFailed
+        );
+        if round.status != research_domain::RoundStatus::Completed && !terminal_budget_projection {
+            return Ok(());
+        }
+        let plan = PlannerOutput {
+            rationale_summary: round
+                .summary
+                .clone()
+                .unwrap_or_else(|| "Recovered completed round".into()),
+            routes: Vec::new(),
+            assignments: Vec::new(),
+            targeted_uncertainty_ids: Vec::new(),
+            suggestion_decisions: Vec::new(),
+        };
+        self.ensure_round_report_projection(project_id, &round, &plan)
+            .await
+    }
+
+    async fn mark_budget_exhausted_and_report(&self, project_id: &str) -> CoreResult<()> {
+        self.publish(self.store.mark_budget_exhausted(project_id).await?);
+        if let Some(round) = self.store.current_round(project_id).await? {
+            let plan = PlannerOutput {
+                rationale_summary: round
+                    .summary
+                    .clone()
+                    .unwrap_or_else(|| "The configured research budget was exhausted".into()),
+                routes: Vec::new(),
+                assignments: Vec::new(),
+                targeted_uncertainty_ids: Vec::new(),
+                suggestion_decisions: Vec::new(),
+            };
+            self.ensure_round_report_projection(project_id, &round, &plan)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Persist immutable report artifacts before writing the user-facing output
+    /// tree. Artifact publication is recoverable and idempotent per round/source
+    /// revision; the output tree is a projection that may safely be rewritten.
+    async fn ensure_round_report_projection(
+        &self,
+        project_id: &str,
+        round: &research_domain::ResearchRound,
+        plan: &PlannerOutput,
+    ) -> CoreResult<()> {
+        let snapshot = self.store.snapshot(project_id).await?;
+        let expected_status_line = format!("- 状态：`{}`", snapshot.project.status);
+        let round_filename = format!("round_{:03}_summary.md", round.number);
+        let artifacts = self.store.list_artifacts(project_id).await?;
+        let durable =
+            load_durable_round_report(&artifacts, round, &round_filename, &expected_status_line)
+                .await?;
+        let (source_revision, report_bytes) = durable.unwrap_or_else(|| {
+            (
+                snapshot.project_revision,
+                reporting::round_report(&snapshot, plan).into_bytes(),
+            )
+        });
+        let report_hash = hex::encode(Sha256::digest(&report_bytes));
+        let source_revision_marker = format!("{REPORT_SOURCE_REVISION_PREFIX}{source_revision}");
+
+        for (kind, filename) in [
+            ("round_report", round_filename),
+            ("latest_report", "LATEST.md".into()),
+        ] {
+            let matching = artifacts.iter().filter(|artifact| {
+                artifact.created_in_round == round.number
+                    && artifact.kind == kind
+                    && artifact.filename == filename
+                    && artifact
+                        .related_entity_ids
+                        .iter()
+                        .any(|related| related == &source_revision_marker)
+            });
+            let mut present = false;
+            for artifact in matching {
+                if artifact.sha256 != report_hash {
+                    return Err(StorageError::CorruptData(format!(
+                        "{} {} conflicts with the durable report for source revision {}",
+                        artifact.kind, artifact.filename, source_revision
+                    ))
+                    .into());
+                }
+                present = true;
+            }
+            if !present {
+                let (_, event) = self
+                    .store
+                    .store_artifact(
+                        project_id,
+                        kind,
+                        &filename,
+                        &report_bytes,
+                        round.number,
+                        vec![round.round_id.clone(), source_revision_marker.clone()],
+                    )
+                    .await?;
+                self.publish(event);
+            }
+        }
+
+        let report = std::str::from_utf8(&report_bytes).map_err(|error| {
+            StorageError::CorruptData(format!("durable round report is not UTF-8: {error}"))
+        })?;
+        self.write_latest_files(project_id, round.number, report)
+            .await
     }
 
     async fn write_latest_files(
@@ -4938,7 +5998,7 @@ impl ResearchService {
         )
         .await?;
         let mut bibliography = String::from(
-            "# Source ledger\n\n`reported_unverified` entries are research leads only. `admitted` means the source was cited by an accepted Fact after the mandatory citation review; only admitted entries may be used by the paper writer.\n",
+            "# Source ledger\n\n`lead_unverified` entries are discovery leads without evidence standing. `reported_unverified` entries have archived material but still await mandatory citation review. `admitted` means the source was cited by an accepted Fact after that review; only admitted entries may be used by the paper writer.\n",
         );
         for source in &sources {
             let authors = if source.authors.is_empty() {
@@ -4975,15 +6035,18 @@ impl ResearchService {
     async fn cancel_affected(&self, command: &HumanCommand) {
         let tokens = self.task_cancellations.lock().await;
         if command.command_type == "stop_project" {
-            for token in tokens.values() {
-                token.cancel();
+            for registration in tokens
+                .values()
+                .filter(|registration| registration.project_id == command.project_id)
+            {
+                registration.token.cancel();
             }
             return;
         }
         for affected in &command.affected_entities {
             if affected.kind == "task" {
-                if let Some(token) = tokens.get(&affected.id) {
-                    token.cancel();
+                if let Some(registration) = tokens.get(&affected.id) {
+                    registration.token.cancel();
                 }
             }
         }
@@ -4998,6 +6061,121 @@ impl ResearchService {
             self.publish(event);
         }
     }
+}
+
+fn publication_result_from_terminal_run(
+    run: &research_domain::PublicationRun,
+) -> CoreResult<PublicationResult> {
+    if run.status == "failed" {
+        return Err(CoreError::InvalidAgentOutput(
+            run.error
+                .clone()
+                .unwrap_or_else(|| "publication failed without a stored reason".into()),
+        ));
+    }
+    if !matches!(run.status.as_str(), "ready" | "blocked_by_evidence") {
+        return Err(CoreError::InvalidAgentOutput(format!(
+            "publication {} has non-terminal status {}",
+            run.publication_id, run.status
+        )));
+    }
+    let result: PublicationResult =
+        serde_json::from_value(run.result.clone().ok_or_else(|| {
+            CoreError::InvalidAgentOutput("terminal publication run has no stored result".into())
+        })?)?;
+    if result.publication_id != run.publication_id
+        || result.project_id != run.project_id
+        || result.status != run.status
+    {
+        return Err(CoreError::InvalidAgentOutput(format!(
+            "publication {} durable result does not match its owning run",
+            run.publication_id
+        )));
+    }
+    Ok(result)
+}
+
+fn agent_error_kind(error: &AgentError) -> &'static str {
+    match error {
+        AgentError::Process(_) => "process",
+        AgentError::SessionUnavailable(_) => "session_unavailable",
+        AgentError::InvalidOutput(_) => "invalid_output",
+        AgentError::Timeout(_) => "timeout",
+        AgentError::Cancelled => "cancelled",
+        AgentError::Unsupported(_) => "unsupported",
+        AgentError::Io(_) => "io",
+        AgentError::Json(_) => "json",
+        AgentError::WithUsage { error, .. } => agent_error_kind(error),
+    }
+}
+
+const fn worker_resume_can_fallback_to_fresh(error: &CoreError) -> bool {
+    match error {
+        CoreError::Agent(AgentError::WithUsage { error, .. }) => {
+            worker_agent_error_can_fallback_to_fresh(error)
+        }
+        CoreError::Agent(error) => worker_agent_error_can_fallback_to_fresh(error),
+        _ => false,
+    }
+}
+
+const fn worker_agent_error_can_fallback_to_fresh(error: &AgentError) -> bool {
+    match error {
+        AgentError::SessionUnavailable(_) => true,
+        AgentError::WithUsage { error, .. } => worker_agent_error_can_fallback_to_fresh(error),
+        _ => false,
+    }
+}
+
+fn task_contract_timeout_seconds(task_contract: &TaskContract, project_minutes: u32) -> u64 {
+    let project_limit = u64::from(project_minutes.clamp(1, 1_440));
+    task_contract
+        .budget
+        .get("max_minutes")
+        .and_then(Value::as_u64)
+        .filter(|minutes| *minutes > 0 && *minutes <= 1_440)
+        .unwrap_or(project_limit)
+        .min(project_limit)
+        .saturating_mul(60)
+}
+
+/// Retries consume the same task time budget. Completed attempts already have
+/// durable timestamps, so restarting the service cannot grant a fresh allowance.
+fn remaining_retry_budget_seconds(
+    limit_seconds: u64,
+    attempts: &[research_domain::TaskAttempt],
+    current_attempt_id: &str,
+) -> u64 {
+    let spent_ms = attempts
+        .iter()
+        .filter(|attempt| attempt.attempt_id != current_attempt_id)
+        .filter_map(|attempt| {
+            let started = attempt.started_at?;
+            let finished = attempt.completed_at.unwrap_or_else(Utc::now);
+            Some(u64::try_from((finished - started).num_milliseconds()).unwrap_or(0))
+        })
+        .fold(0_u64, u64::saturating_add);
+    limit_seconds.saturating_sub(spent_ms.div_ceil(1_000))
+}
+
+fn remaining_task_duration(
+    started: Instant,
+    limit_seconds: u64,
+    task_id: &str,
+) -> CoreResult<Duration> {
+    let remaining = Duration::from_secs(limit_seconds)
+        .checked_sub(started.elapsed())
+        .filter(|remaining| !remaining.is_zero());
+    if let Some(remaining) = remaining {
+        return Ok(remaining);
+    }
+    warn!(%task_id, limit_seconds, "worker attempt exhausted its total wall-clock budget");
+    Err(CoreError::Agent(AgentError::Timeout(limit_seconds)))
+}
+
+fn remaining_task_seconds(started: Instant, limit_seconds: u64, task_id: &str) -> CoreResult<u64> {
+    remaining_task_duration(started, limit_seconds, task_id)
+        .map(|remaining| remaining.as_secs().max(1))
 }
 
 fn source_archival_failure(source: &SourceDraft, reason: impl Into<String>) -> FailureDraft {
@@ -5444,16 +6622,7 @@ fn deterministic_precheck(
 ) -> Option<VerificationReport> {
     let proof = submission.proof_markdown.trim();
     let lower_proof = proof.to_lowercase();
-    let placeholders = [
-        "todo",
-        "tbd",
-        "待证明",
-        "此处略",
-        "proof omitted",
-        "类似可得",
-        "同理可得",
-        "显然可得",
-    ];
+    let placeholders = ["todo", "tbd", "待证明", "此处略", "proof omitted"];
     let mut critical_errors = Vec::new();
     if submission.statement.trim().is_empty() || proof.is_empty() {
         critical_errors.push("empty_required_field".to_owned());
@@ -5517,6 +6686,12 @@ fn deterministic_precheck(
     if sources.len() != submission.external_source_ids.len() {
         critical_errors.push("missing_source_dependency".to_owned());
     }
+    if sources
+        .iter()
+        .any(|source| !matches!(source.status.as_str(), "reported_unverified" | "admitted"))
+    {
+        critical_errors.push("source_not_eligible_as_evidence".to_owned());
+    }
     if sources.iter().any(|source| {
         source.title.trim().is_empty()
             || source.applicability.trim().is_empty()
@@ -5549,28 +6724,77 @@ fn deterministic_precheck(
     None
 }
 
-fn required_checks(
+fn verification_plan_spec(
     has_sources: bool,
-    formal_required: bool,
-    independent_proof_requested: bool,
-) -> Vec<String> {
-    let mut checks = vec![
-        "deterministic_precheck".into(),
-        "math_review_1".into(),
-        "math_review_2".into(),
-        "reviewer_independence".into(),
-        "adversarial_review".into(),
-    ];
-    if has_sources {
-        checks.push("citation_review".into());
+    has_fact_dependencies: bool,
+    certification: CertificationMode,
+) -> VerificationPlanSpec {
+    if certification == CertificationMode::IndependentProof {
+        let mut reviewer_kinds = vec!["math_review_1", "math_review_2", "math_review_3"];
+        if has_sources {
+            reviewer_kinds.push("citation_review");
+        }
+        reviewer_kinds.push("adversarial_review");
+        VerificationPlanSpec {
+            name: "independent_proof_certification_v2",
+            profile: VerificationProfile::CriticalCertification,
+            required_acceptance: AcceptanceClass::FullyCertified,
+            reviewer_kinds,
+            certification,
+            max_attempts: 3,
+        }
+    } else if certification == CertificationMode::FormalReplay {
+        let mut reviewer_kinds = vec!["math_review_1", "math_review_2"];
+        if has_sources {
+            reviewer_kinds.push("citation_review");
+        }
+        reviewer_kinds.push("adversarial_review");
+        VerificationPlanSpec {
+            name: "critical_certification_v3",
+            profile: VerificationProfile::CriticalCertification,
+            required_acceptance: AcceptanceClass::FullyCertified,
+            reviewer_kinds,
+            certification,
+            max_attempts: 3,
+        }
+    } else if has_sources || has_fact_dependencies {
+        let mut reviewer_kinds = vec!["math_review_1", "math_review_2"];
+        if has_sources {
+            reviewer_kinds.push("citation_review");
+        }
+        reviewer_kinds.push("adversarial_review");
+        VerificationPlanSpec {
+            name: "standard_review_v2",
+            profile: VerificationProfile::StandardReview,
+            required_acceptance: AcceptanceClass::Reviewed,
+            reviewer_kinds,
+            certification,
+            max_attempts: 3,
+        }
+    } else {
+        // A self-contained intermediate claim still receives two independent
+        // perspectives (one constructive and one adversarial), but does not spend
+        // a second constructive-review call intended for higher-risk promotion.
+        VerificationPlanSpec {
+            name: "exploratory_review_v1",
+            profile: VerificationProfile::Exploratory,
+            required_acceptance: AcceptanceClass::Reviewed,
+            reviewer_kinds: vec!["math_review_1", "adversarial_review"],
+            certification,
+            max_attempts: 2,
+        }
     }
-    if independent_proof_requested {
-        checks.push("math_review_3".into());
+}
+
+fn required_checks(spec: &VerificationPlanSpec) -> Vec<String> {
+    let mut checks = vec!["deterministic_precheck".into()];
+    checks.extend(spec.reviewer_kinds.iter().map(|kind| (*kind).to_owned()));
+    if spec.independent_reviewer_count() > 1 {
+        checks.push("reviewer_independence".into());
     }
-    if formal_required {
+    if spec.requires_formal_replay() {
+        checks.extend(["semantic_contract".into(), "alignment_review".into()]);
         checks.extend([
-            "semantic_contract".into(),
-            "alignment_review".into(),
             "lean_kernel".into(),
             "package_integrity".into(),
             "fresh_replay".into(),
@@ -5579,9 +6803,24 @@ fn required_checks(
     checks
 }
 
-fn requires_formal_verification(project: &Project, submission: &CandidateSubmission) -> bool {
+fn requires_formal_verification(
+    project: &Project,
+    submission: &CandidateSubmission,
+    target_goals: &[research_domain::Goal],
+) -> bool {
     statements_match_target(&project.contract.target_statement, &submission.statement)
         || submission.candidate_type == research_domain::CandidateType::Counterexample
+        || candidate_claims_main_goal(submission, target_goals)
+}
+
+fn candidate_claims_main_goal(
+    submission: &CandidateSubmission,
+    target_goals: &[research_domain::Goal],
+) -> bool {
+    matches!(
+        submission.candidate_type,
+        research_domain::CandidateType::Theorem | research_domain::CandidateType::Proposition
+    ) && target_goals.iter().any(|goal| goal.priority >= 1.0)
 }
 
 fn v1_risk_score(project: &Project, submission: &CandidateSubmission) -> f64 {
@@ -5681,6 +6920,8 @@ struct ReviewerIndependenceAssessment {
     summary: String,
     reviewer_fingerprints: Vec<Value>,
     duplicate_groups: Vec<Vec<String>>,
+    output_similarity_warning: bool,
+    bounded_rereview_max_attempts: u8,
 }
 
 fn assess_reviewer_independence(
@@ -5726,22 +6967,76 @@ fn assess_reviewer_independence(
         .into_values()
         .filter(|kinds| kinds.len() > 1)
         .collect::<Vec<_>>();
-    let summary = if duplicate_groups.is_empty() {
-        "数学审查角色使用不同审计契约，且规范化审查结果没有完全重复。".into()
-    } else {
+    let output_similarity_warning = !duplicate_groups.is_empty();
+    let summary = if output_similarity_warning {
         format!(
-            "检测到完全重复的数学审查结果，不能把这些运行计作认知独立：{}",
+            "数学审查角色使用不同审计契约，但检测到规范化输出完全相同，无法把这些结果计作独立证据，本次门禁保守置为 unknown：{}",
             duplicate_groups
                 .iter()
                 .map(|group| group.join("/"))
                 .collect::<Vec<_>>()
                 .join(", ")
         )
+    } else {
+        "数学审查角色使用不同审计契约，且规范化审查结果没有完全重复。".into()
     };
     ReviewerIndependenceAssessment {
         summary,
         reviewer_fingerprints,
         duplicate_groups,
+        output_similarity_warning,
+        bounded_rereview_max_attempts: u8::from(output_similarity_warning),
+    }
+}
+
+fn reviewer_independence_check_draft(
+    reviewer_reports: &[(String, VerificationReport)],
+) -> CoreResult<Option<CheckDraft>> {
+    let mathematical_reviewer_count = reviewer_reports
+        .iter()
+        .filter(|(kind, _)| kind.starts_with("math_review_"))
+        .count();
+    if mathematical_reviewer_count <= 1 {
+        return Ok(None);
+    }
+    let assessment = assess_reviewer_independence(reviewer_reports);
+    let status = if assessment.output_similarity_warning {
+        CheckStatus::Unknown
+    } else {
+        CheckStatus::Passed
+    };
+    Ok(Some(CheckDraft {
+        attempt_id: None,
+        kind: "reviewer_independence".into(),
+        // Distinct calls and role prompts do not establish independent evidence when
+        // the normalized mathematical reports are byte-equivalent. Fail closed: a
+        // later attempt may retry with a decorrelated reviewer, but this attempt may
+        // not promote the candidate.
+        status,
+        mandatory: true,
+        summary: assessment.summary.clone(),
+        details: serde_json::to_value(assessment)?,
+    }))
+}
+
+fn reviewer_independence_unknown_report(
+    submission: &CandidateSubmission,
+    accepted_report: VerificationReport,
+) -> VerificationReport {
+    debug_assert_eq!(accepted_report.verdict, VerificationVerdict::Accepted);
+    VerificationReport {
+        verdict: VerificationVerdict::Unknown,
+        summary: format!(
+            "审查独立性门禁未通过，原 accepted 裁决不得晋升：{}",
+            accepted_report.summary
+        ),
+        critical_errors: accepted_report.critical_errors,
+        gaps: accepted_report.gaps,
+        uncertainties: vec!["数学 reviewer 的规范化输出完全重复，尚无足够独立证据".into()],
+        repair_actions: vec!["使用去相关 reviewer 重新执行独立数学审查".into()],
+        checked_fact_ids: submission.dependency_fact_ids.clone(),
+        checked_source_ids: submission.external_source_ids.clone(),
+        evidence_level: "unknown".into(),
     }
 }
 
@@ -6042,7 +7337,8 @@ fn rank_routes(
     routes: &[RouteProposal],
     reflection: &ReflectionOutput,
     weights: RankingWeights,
-) -> Value {
+) -> RouteRanking {
+    let mut route_scores = vec![0.0; routes.len()];
     let mut ranked = routes
         .iter()
         .enumerate()
@@ -6084,6 +7380,7 @@ fn rank_routes(
                         }
                     })
                 - reflection_penalty;
+            route_scores[index] = score;
             serde_json::json!({
                 "route_index":index,
                 "title":route.title,
@@ -6124,7 +7421,22 @@ fn rank_routes(
     for (rank, route) in ranked.iter_mut().enumerate() {
         route["rank"] = serde_json::json!(rank + 1);
     }
-    serde_json::json!({"weights":weights,"ranked_routes":ranked})
+    RouteRanking {
+        output: serde_json::json!({"weights":weights,"ranked_routes":ranked}),
+        route_scores,
+    }
+}
+
+fn unreviewed_route_scores(routes: &[RouteProposal], weights: RankingWeights) -> Vec<f64> {
+    rank_routes(
+        routes,
+        &ReflectionOutput {
+            summary: "deterministic continuity routes have no reflection output".into(),
+            reviews: Vec::new(),
+        },
+        weights,
+    )
+    .route_scores
 }
 
 fn ensure_adversarial_assignment(routes: &[RouteProposal], supervisor: &mut SupervisorOutput) {
@@ -6158,6 +7470,18 @@ fn ensure_adversarial_assignment(routes: &[RouteProposal], supervisor: &mut Supe
             completion_contract: "提交可验证反例候选，或记录覆盖范围和仍未排除的情形".into(),
             priority: 0.8,
         });
+}
+
+fn sanitize_assignment_goal_ids(known_goal_ids: &HashSet<&str>, supervisor: &mut SupervisorOutput) {
+    for assignment in &mut supervisor.assignments {
+        assignment
+            .goal_ids
+            .retain(|goal_id| known_goal_ids.contains(goal_id.as_str()));
+        let mut seen = HashSet::new();
+        assignment
+            .goal_ids
+            .retain(|goal_id| seen.insert(goal_id.clone()));
+    }
 }
 
 fn bind_strategy_to_assignments(
@@ -6267,6 +7591,26 @@ const fn planning_attempt_timeouts(max_hard_seconds: u64, attempt_number: i64) -
     let half_soft = hard_seconds / 2;
     let soft_seconds = if half_soft == 0 { 1 } else { half_soft };
     (soft_seconds, hard_seconds)
+}
+
+fn planning_round_remaining_seconds(
+    limit_seconds: u64,
+    started: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> u64 {
+    let elapsed = started.map_or(0, |started| {
+        u64::try_from((now - started).num_seconds()).unwrap_or(0)
+    });
+    limit_seconds.saturating_sub(elapsed)
+}
+
+const fn planning_error_is_retryable(error: &CoreError) -> bool {
+    matches!(
+        error,
+        CoreError::Agent(AgentError::Timeout(_) | AgentError::InvalidOutput(_))
+            | CoreError::InvalidAgentOutput(_)
+            | CoreError::Json(_)
+    )
 }
 
 fn conservative_strategy_state(
@@ -6457,14 +7801,45 @@ fn strategy_audit_decision(
     }
 }
 
+fn human_planning_directives(delta: &ResearchDelta) -> Vec<Value> {
+    delta
+        .human_commands
+        .iter()
+        .filter(|command| {
+            matches!(
+                command.get("type").and_then(Value::as_str),
+                Some("goal_review" | "trigger_replan" | "add_suggestion")
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+fn open_proof_obligations_for_planning(
+    obligations: &[research_domain::ProofObligation],
+) -> Vec<&research_domain::ProofObligation> {
+    obligations
+        .iter()
+        .filter(|obligation| {
+            matches!(
+                obligation.status,
+                research_domain::ProofObligationStatus::Open
+                    | research_domain::ProofObligationStatus::Blocked
+            )
+        })
+        .collect()
+}
+
 fn planning_context(
     snapshot: &ProjectSnapshot,
     delta: &ResearchDelta,
     bottlenecks: &[research_domain::Bottleneck],
+    obligations: &[research_domain::ProofObligation],
     failure_patterns: &[Value],
     suggestions: &[Value],
     route_proposals: &[research_domain::HumanRouteProposal],
 ) -> Value {
+    let human_planning_directives = human_planning_directives(delta);
     let live_routes = snapshot
         .routes
         .iter()
@@ -6500,6 +7875,7 @@ fn planning_context(
         .iter()
         .filter(|bottleneck| bottleneck.status == "open")
         .collect::<Vec<_>>();
+    let open_obligations = open_proof_obligations_for_planning(obligations);
     let relevant_uncertainties = snapshot
         .uncertainties
         .iter()
@@ -6516,7 +7892,9 @@ fn planning_context(
         "problem_contract":snapshot.project.contract,
         "budget":snapshot.project.budget,
         "research_delta":delta,
+        "human_planning_directives":human_planning_directives,
         "open_bottlenecks":open_bottlenecks,
+        "open_proof_obligations":open_obligations,
         "live_routes":live_routes,
         "live_tasks":live_tasks,
         "active_facts":active_facts,
@@ -6525,7 +7903,7 @@ fn planning_context(
         "human_suggestions":suggestions,
         "human_route_proposals":route_proposals.iter().filter(|proposal| proposal.status == "queued").collect::<Vec<_>>(),
         "hard_limits":{"max_live_routes":6,"max_new_routes":2,"max_routes_per_goal":3,"max_live_routes_per_family":1},
-        "trust_rule":"Only active_facts are mathematical premises; summaries, routes, bottlenecks, suggestions, and deltas are planning evidence only.",
+        "trust_rule":"Only active_facts are mathematical premises; human directives, summaries, routes, bottlenecks, proof obligations, suggestions, and deltas are planning or coverage evidence only. Advisory obligations never become logical requirements automatically.",
         "omitted":["raw artifacts","complete event history","terminal task logs not referenced by delta","unrelated sources"],
     })
 }
@@ -6533,12 +7911,25 @@ fn planning_context(
 fn continuity_plan(
     snapshot: &ProjectSnapshot,
     bottlenecks: &[research_domain::Bottleneck],
+    obligations: &[research_domain::ProofObligation],
     reason: &str,
 ) -> Option<PlannerOutput> {
-    let bottleneck = bottlenecks
-        .iter()
-        .filter(|bottleneck| bottleneck.status == "open")
-        .max_by(|left, right| left.priority.total_cmp(&right.priority))?;
+    let highest_obligation = open_proof_obligations_for_planning(obligations)
+        .into_iter()
+        .max_by(|left, right| left.priority.total_cmp(&right.priority));
+    let obligation_bottleneck = highest_obligation
+        .and_then(|obligation| obligation.source_bottleneck_id.as_deref())
+        .and_then(|bottleneck_id| {
+            bottlenecks
+                .iter()
+                .find(|item| item.bottleneck_id == bottleneck_id && item.status == "open")
+        });
+    let bottleneck = obligation_bottleneck.or_else(|| {
+        bottlenecks
+            .iter()
+            .filter(|bottleneck| bottleneck.status == "open")
+            .max_by(|left, right| left.priority.total_cmp(&right.priority))
+    })?;
     let route = snapshot.routes.iter().find(|route| {
         matches!(
             route.status.to_string().as_str(),
@@ -6555,28 +7946,13 @@ fn continuity_plan(
     } else {
         "prover"
     };
+    let proposal = continuity_route_proposal(route, bottleneck, reason);
     Some(PlannerOutput {
         rationale_summary: format!(
             "Deterministic continuity plan for bottleneck {} after planner failure: {reason}",
             bottleneck.bottleneck_id
         ),
-        routes: vec![RouteProposal {
-            title: route.title.clone(),
-            method_summary: route.method_summary.clone(),
-            target_goal_ids: route.target_goal_ids.clone(),
-            required_fact_ids: route.required_fact_ids.clone(),
-            expected_subgoals: vec![bottleneck.precise_statement.clone()],
-            expected_goal_progress: 0.4,
-            uncertainty_reduction: 0.4,
-            human_suggestion_alignment: 0.0,
-            evidence_support: 0.5,
-            route_diversity: 0.0,
-            verifiability: 0.9,
-            novelty: 0.0,
-            failure_similarity_penalty: 0.0,
-            cost_penalty: 0.1,
-            risks: vec![format!("planner unavailable: {reason}")],
-        }],
+        routes: vec![proposal],
         assignments: vec![research_domain::AssignmentDraft {
             route_index: 0,
             worker_role: worker_role.into(),
@@ -6589,11 +7965,82 @@ fn continuity_plan(
             priority: bottleneck.priority.clamp(0.0, 1.0),
         }],
         targeted_uncertainty_ids: vec![],
-        suggestion_decisions: vec![format!(
-            "planner unavailable; continued only persisted bottleneck {}",
-            bottleneck.bottleneck_id
-        )],
+        suggestion_decisions: vec![],
     })
+}
+
+fn continuity_route_proposal(
+    route: &research_domain::Route,
+    bottleneck: &research_domain::Bottleneck,
+    reason: &str,
+) -> RouteProposal {
+    let route_steps = route
+        .attributes
+        .get("steps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    RouteProposal {
+        title: route.title.clone(),
+        method_summary: route.method_summary.clone(),
+        approach_kind: route_attribute_or(route, "approach_kind", "other"),
+        route_role: route_attribute_or(route, "route_role", "primary"),
+        user_title: route_attribute_or(route, "user_title", &route.title),
+        plain_language_summary: route_attribute_or(
+            route,
+            "plain_language_summary",
+            &route.method_summary,
+        ),
+        why_this_route: route_attribute_or(
+            route,
+            "why_this_route",
+            "继续已有路线，避免在规划器暂时不可用时丢失研究进度。",
+        ),
+        expected_output: route_attribute_or(
+            route,
+            "expected_output",
+            &bottleneck.precise_statement,
+        ),
+        relation_to_goal: route_attribute_or(
+            route,
+            "relation_to_goal",
+            "这条连续性路线只延续既有目标，不扩大或改写原命题。",
+        ),
+        steps: if route_steps.len() >= 2 {
+            route_steps
+        } else {
+            vec![
+                "恢复已有路线及其最新检查点".into(),
+                "完成当前瓶颈的可核验产出".into(),
+            ]
+        },
+        target_goal_ids: route.target_goal_ids.clone(),
+        required_fact_ids: route.required_fact_ids.clone(),
+        expected_subgoals: vec![bottleneck.precise_statement.clone()],
+        expected_goal_progress: 0.4,
+        uncertainty_reduction: 0.4,
+        human_suggestion_alignment: 0.0,
+        evidence_support: 0.5,
+        route_diversity: 0.0,
+        verifiability: 0.9,
+        novelty: 0.0,
+        failure_similarity_penalty: 0.0,
+        cost_penalty: 0.1,
+        risks: vec![format!("planner unavailable: {reason}")],
+    }
+}
+
+fn route_attribute_or(route: &research_domain::Route, key: &str, fallback: &str) -> String {
+    route
+        .attributes
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(fallback)
+        .to_owned()
 }
 
 fn degraded_waiting_plan(reason: &str) -> PlannerOutput {
@@ -6604,28 +8051,656 @@ fn degraded_waiting_plan(reason: &str) -> PlannerOutput {
         routes: vec![],
         assignments: vec![],
         targeted_uncertainty_ids: vec![],
-        suggestion_decisions: vec![
-            "no new generic research task was manufactured while the planner was unavailable"
-                .into(),
-        ],
+        suggestion_decisions: vec![],
+    }
+}
+
+#[cfg(test)]
+mod verification_queue_tests {
+    use std::sync::Arc;
+
+    use research_domain::{
+        AssignmentDraft, Budget, CandidateStatus, CandidateSubmission, CandidateType, CommandMode,
+        CommandStatus, PlannerOutput, ProblemContract, RouteProposal,
+    };
+    use research_storage::{CommandDraft, SqliteStore};
+    use research_worker_runtime::MockBackend;
+    use serde_json::json;
+
+    use super::{
+        HARD_MAX_VERIFICATION_CONCURRENCY, QueuedVerification, ResearchConfig, ResearchService,
+        sort_verification_queue,
+    };
+    use crate::session_resume_tests::RecordingBackend;
+
+    fn item(
+        id: &str,
+        task_priority: f64,
+        route_priority: f64,
+        route_id: &str,
+        task_id: &str,
+        candidate_ordinal: i64,
+    ) -> QueuedVerification {
+        QueuedVerification {
+            verification_id: id.into(),
+            round: 1,
+            task_priority,
+            route_priority,
+            route_id: route_id.into(),
+            task_id: task_id.into(),
+            candidate_ordinal,
+        }
+    }
+
+    fn route() -> RouteProposal {
+        RouteProposal {
+            title: "stable verification queue".into(),
+            method_summary: "produce independently reviewable lemmas".into(),
+            approach_kind: String::new(),
+            route_role: String::new(),
+            user_title: String::new(),
+            plain_language_summary: String::new(),
+            why_this_route: String::new(),
+            expected_output: String::new(),
+            relation_to_goal: String::new(),
+            steps: vec![],
+            target_goal_ids: vec![],
+            required_fact_ids: vec![],
+            expected_subgoals: vec![],
+            expected_goal_progress: 0.2,
+            uncertainty_reduction: 0.3,
+            human_suggestion_alignment: 0.0,
+            evidence_support: 0.5,
+            route_diversity: 0.5,
+            verifiability: 0.9,
+            novelty: 0.1,
+            failure_similarity_penalty: 0.0,
+            cost_penalty: 0.1,
+            risks: vec![],
+        }
+    }
+
+    #[test]
+    fn completion_order_does_not_change_verification_order() {
+        let expected = vec![
+            item("verification-z", 10.0, 1.0, "route-z", "task-z", 9),
+            item("verification-z-late", 5.0, 3.0, "route-a", "task-a", 3),
+            item("verification-a-early", 5.0, 3.0, "route-a", "task-a", 4),
+            item("verification-d", 5.0, 2.0, "route-d", "task-d", 1),
+        ];
+        let mut forward = vec![
+            item("verification-d", 5.0, 2.0, "route-d", "task-d", 1),
+            item("verification-a-early", 5.0, 3.0, "route-a", "task-a", 4),
+            item("verification-z", 10.0, 1.0, "route-z", "task-z", 9),
+            item("verification-z-late", 5.0, 3.0, "route-a", "task-a", 3),
+        ];
+        let mut reverse = forward.iter().cloned().rev().collect::<Vec<_>>();
+
+        sort_verification_queue(&mut forward);
+        sort_verification_queue(&mut reverse);
+
+        assert_eq!(forward, expected);
+        assert_eq!(reverse, expected);
+    }
+
+    #[tokio::test]
+    async fn verification_gate_is_shared_across_service_clones() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::connect("sqlite::memory:", temp.path().join("artifacts"))
+            .await
+            .expect("store");
+        let service = ResearchService::new(
+            store,
+            Arc::new(RecordingBackend::default()),
+            ResearchConfig {
+                verification_max_concurrency: 2,
+                ..ResearchConfig::default()
+            },
+        );
+        let clone = service.clone();
+        assert!(Arc::ptr_eq(
+            &service.verification_semaphore,
+            &clone.verification_semaphore
+        ));
+        let first = service
+            .verification_semaphore
+            .clone()
+            .try_acquire_owned()
+            .expect("first permit");
+        let second = clone
+            .verification_semaphore
+            .clone()
+            .try_acquire_owned()
+            .expect("second permit");
+        assert!(
+            service
+                .verification_semaphore
+                .clone()
+                .try_acquire_owned()
+                .is_err(),
+            "a third verification pipeline must be backpressured"
+        );
+        drop(first);
+        assert!(
+            clone
+                .verification_semaphore
+                .clone()
+                .try_acquire_owned()
+                .is_ok()
+        );
+        drop(second);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "verification_max_concurrency must be between")]
+    async fn verification_gate_rejects_configuration_above_the_hard_cap() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::connect("sqlite::memory:", temp.path().join("artifacts"))
+            .await
+            .expect("store");
+        let _ = ResearchService::new(
+            store,
+            Arc::new(RecordingBackend::default()),
+            ResearchConfig {
+                verification_max_concurrency: HARD_MAX_VERIFICATION_CONCURRENCY + 1,
+                ..ResearchConfig::default()
+            },
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn interrupted_batch_leaves_unclaimed_tail_submitted_and_recoverable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::connect("sqlite::memory:", temp.path().join("artifacts"))
+            .await
+            .expect("store");
+        let config = ResearchConfig {
+            runtime_root: temp.path().join("runtime"),
+            output_root: temp.path().join("output"),
+            lean_project_root: None,
+            verification_max_concurrency: 1,
+            ..ResearchConfig::default()
+        };
+        let interrupted = ResearchService::new(
+            store.clone(),
+            Arc::new(RecordingBackend::default()),
+            config.clone(),
+        );
+        let project = interrupted
+            .create_project(
+                "recover submitted verification batch".into(),
+                ProblemContract {
+                    original_problem: "Prove two elementary lemmas".into(),
+                    target_statement: "Two elementary lemmas".into(),
+                    assumptions: vec![],
+                    success_criteria: "both candidates are reviewed".into(),
+                    version: 1,
+                },
+                Budget::default(),
+            )
+            .await
+            .expect("create project");
+        let (start, _) = store
+            .enqueue_command(
+                &project.project_id,
+                CommandDraft {
+                    command_type: "start_project".into(),
+                    target_kind: "project".into(),
+                    target_id: project.project_id.clone(),
+                    mode: CommandMode::Immediate,
+                    payload: json!({}),
+                    expected_project_revision: project.revision,
+                    idempotency_key: "start-recoverable-verification-batch".into(),
+                    reason: "test".into(),
+                    requested_by: "test".into(),
+                },
+            )
+            .await
+            .expect("enqueue start");
+        store
+            .apply_command(&project.project_id, &start.command_id)
+            .await
+            .expect("start project");
+        let (round, _) = store.begin_round(&project.project_id).await.expect("round");
+        let delta = store
+            .collect_research_delta(&project.project_id)
+            .await
+            .expect("planning delta");
+        let plan = PlannerOutput {
+            rationale_summary: "one producer with an ordered candidate stream".into(),
+            routes: vec![route()],
+            assignments: vec![AssignmentDraft {
+                route_index: 0,
+                worker_role: "prover".into(),
+                strategic_role: "local_milestone".into(),
+                addresses_interface_debt: false,
+                goal_ids: vec![],
+                objective: "produce two lemmas".into(),
+                completion_contract: "two candidate proofs".into(),
+                priority: 1.0,
+            }],
+            targeted_uncertainty_ids: vec![],
+            suggestion_decisions: vec![],
+        };
+        let saved = store
+            .save_plan_v2(
+                &project.project_id,
+                &round,
+                &plan,
+                &[plan.routes[0].score()],
+                &delta,
+                "verification recovery regression",
+                None,
+            )
+            .await
+            .expect("save plan");
+        sqlx::query("UPDATE tasks SET status='running',revision=revision+1 WHERE task_id=?")
+            .bind(&saved.tasks[0].task_id)
+            .execute(store.pool())
+            .await
+            .expect("fault fixture marks task running");
+        let task = store
+            .get_task(&project.project_id, &saved.tasks[0].task_id)
+            .await
+            .expect("running task");
+
+        // A command that can mutate round state cannot cross the stable queue's
+        // check-and-claim boundary. Hold that boundary explicitly to make the
+        // race deterministic rather than relying on scheduler timing.
+        let (steer, _) = store
+            .enqueue_command(
+                &project.project_id,
+                CommandDraft {
+                    command_type: "steer_task".into(),
+                    target_kind: "task".into(),
+                    target_id: task.task_id.clone(),
+                    mode: CommandMode::SafePoint,
+                    payload: json!({
+                        "content":"check the divisibility witness",
+                        "expected_task_revision":task.revision,
+                        "expected_route_epoch":task.route_cancellation_epoch,
+                    }),
+                    expected_project_revision: store
+                        .get_project(&project.project_id)
+                        .await
+                        .expect("project revision before steer")
+                        .revision,
+                    idempotency_key: "verification-admission-steer".into(),
+                    reason: "race regression".into(),
+                    requested_by: "test".into(),
+                },
+            )
+            .await
+            .expect("enqueue steer");
+        let admission_lock = interrupted
+            .verification_admission_lock(&project.project_id)
+            .await;
+        let admission_guard = admission_lock.lock_owned().await;
+        let dispatch_service = interrupted.clone();
+        let dispatch_project_id = project.project_id.clone();
+        let dispatch_command_id = steer.command_id.clone();
+        let dispatch = tokio::spawn(async move {
+            dispatch_service
+                .dispatch_command(&dispatch_project_id, &dispatch_command_id)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !dispatch.is_finished(),
+            "command application must wait for the verification admission boundary"
+        );
+        assert_eq!(
+            store
+                .get_command(&project.project_id, &steer.command_id)
+                .await
+                .expect("queued steer")
+                .status,
+            CommandStatus::Queued
+        );
+        drop(admission_guard);
+        assert_eq!(
+            dispatch
+                .await
+                .expect("dispatch task")
+                .expect("dispatch steer")
+                .status,
+            CommandStatus::WaitingSafePoint
+        );
+
+        let mut verification_ids = Vec::new();
+        for (ordinal, statement) in [
+            "Every multiple of four is even.",
+            "Every multiple of six is even.",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let receipt = store
+                .submit_candidate(
+                    &project.project_id,
+                    CandidateSubmission {
+                        task_id: task.task_id.clone(),
+                        route_id: task.route_id.clone(),
+                        target_goal_ids: vec![],
+                        statement: statement.into(),
+                        assumptions: vec![],
+                        proof_markdown: "Write n = 2k using the given multiple as the witness."
+                            .into(),
+                        dependency_fact_ids: vec![],
+                        definitions_introduced: std::collections::BTreeMap::new(),
+                        external_source_ids: vec![],
+                        candidate_type: CandidateType::Lemma,
+                        task_revision: task.revision,
+                        route_cancellation_epoch: task.route_cancellation_epoch,
+                    },
+                    &format!("recoverable-candidate-{ordinal}"),
+                )
+                .await
+                .expect("submit candidate");
+            verification_ids.push(receipt.verification.verification_id);
+        }
+        sqlx::query("UPDATE tasks SET status='completed',revision=revision+1 WHERE task_id=?")
+            .bind(&task.task_id)
+            .execute(store.pool())
+            .await
+            .expect("fault fixture completes producer task");
+        // Production result-envelope ingestion records candidates against the
+        // task's post-completion revision in the same transaction. This test
+        // inserts candidates through the public pre-completion API, so align
+        // the fixture with that durable state before simulating interruption.
+        let completed_task_revision = store
+            .get_task(&project.project_id, &task.task_id)
+            .await
+            .expect("completed producer task")
+            .revision;
+        for verification_id in &verification_ids {
+            sqlx::query("UPDATE candidates SET submission_json=json_set(submission_json,'$.task_revision',?) WHERE candidate_id=(SELECT candidate_id FROM verifications WHERE verification_id=?)")
+                .bind(completed_task_revision)
+                .bind(verification_id)
+                .execute(store.pool())
+                .await
+                .expect("align candidate with completed task revision");
+        }
+
+        interrupted.verification_semaphore.close();
+        interrupted
+            .verify_submitted_batch(&project.project_id, Some(round.number))
+            .await
+            .expect_err("closed service gate simulates an infrastructure interruption");
+        for verification_id in &verification_ids {
+            assert_eq!(
+                store
+                    .get_verification(verification_id)
+                    .await
+                    .expect("pending verification")
+                    .status,
+                CandidateStatus::Submitted,
+                "an interrupted batch must not claim or fail its unvisited tail"
+            );
+        }
+
+        let accepted_review = json!({
+            "verdict":"accepted",
+            "summary":"The divisibility witness is complete and independently checkable.",
+            "critical_errors":[],"gaps":[],"uncertainties":[],"repair_actions":[],
+            "checked_fact_ids":[],"checked_source_ids":[],
+            "evidence_level":"independent_llm_check"
+        });
+        let recovered = ResearchService::new(
+            store.clone(),
+            Arc::new(MockBackend::from_responses(std::iter::repeat_n(
+                accepted_review,
+                6,
+            ))),
+            config,
+        );
+        recovered
+            .verify_submitted_batch(&project.project_id, Some(round.number))
+            .await
+            .expect("a fresh service recovers the durable submitted tail");
+        for verification_id in &verification_ids {
+            assert_eq!(
+                store
+                    .get_verification(verification_id)
+                    .await
+                    .expect("recovered verification")
+                    .status,
+                CandidateStatus::Accepted
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_guard_tests {
+    use std::time::Duration;
+
+    use tokio_util::sync::CancellationToken;
+
+    use super::LeaseHeartbeatGuard;
+
+    #[tokio::test]
+    async fn heartbeat_failure_cancels_work_and_is_returned() {
+        let cancellation = CancellationToken::new();
+        let guard =
+            LeaseHeartbeatGuard::spawn(Duration::from_millis(1), cancellation.clone(), || async {
+                Err("synthetic stale lease".into())
+            });
+        let result = guard
+            .run(async { std::future::pending::<()>().await })
+            .await;
+
+        assert_eq!(
+            result.expect_err("heartbeat must fail"),
+            "synthetic stale lease"
+        );
+        assert!(cancellation.is_cancelled());
+    }
+}
+
+#[cfg(test)]
+mod service_recovery_tests {
+    use std::{sync::Arc, time::Duration};
+
+    use research_domain::{Budget, CommandMode, CommandStatus, ProblemContract, ProjectStatus};
+    use research_storage::{CommandDraft, SqliteStore, StorageError};
+    use research_worker_runtime::MockBackend;
+    use serde_json::json;
+
+    use super::{CoreError, ResearchConfig, ResearchService};
+
+    fn contract() -> ProblemContract {
+        ProblemContract {
+            original_problem: "Prove A".into(),
+            target_statement: "A".into(),
+            assumptions: vec![],
+            success_criteria: "accepted".into(),
+            version: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_dispatch_failure_keeps_the_durable_command_queued() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::connect("sqlite::memory:", temp.path().join("artifacts"))
+            .await
+            .expect("store");
+        let (project, _) = store
+            .create_project("command recovery".into(), contract(), Budget::default())
+            .await
+            .expect("project");
+        let service = ResearchService::new(
+            store.clone(),
+            Arc::new(MockBackend::default()),
+            ResearchConfig::default(),
+        );
+        let (command, _) = store
+            .enqueue_command(
+                &project.project_id,
+                CommandDraft {
+                    command_type: "start_project".into(),
+                    target_kind: "project".into(),
+                    target_id: project.project_id.clone(),
+                    mode: CommandMode::Immediate,
+                    payload: json!({}),
+                    expected_project_revision: project.revision,
+                    idempotency_key: "transient-command-recovery".into(),
+                    reason: "test".into(),
+                    requested_by: "test".into(),
+                },
+            )
+            .await
+            .expect("enqueue command");
+
+        let transient = CoreError::Storage(StorageError::Database(sqlx::Error::PoolClosed));
+        assert!(
+            service
+                .resolve_command_dispatch_error(
+                    &project.project_id,
+                    &command.command_id,
+                    &transient,
+                )
+                .await
+                .expect("classify transient failure")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_command(&project.project_id, &command.command_id)
+                .await
+                .expect("queued command")
+                .status,
+            CommandStatus::Queued
+        );
+
+        let deterministic = CoreError::Storage(StorageError::InvalidTransition(
+            "unsupported command transition".into(),
+        ));
+        let failed = service
+            .resolve_command_dispatch_error(
+                &project.project_id,
+                &command.command_id,
+                &deterministic,
+            )
+            .await
+            .expect("record deterministic failure")
+            .expect("deterministic disposition");
+        assert_eq!(failed.status, CommandStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_resumes_a_running_project_without_queuing_duplicate_runners() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::connect("sqlite::memory:", temp.path().join("artifacts"))
+            .await
+            .expect("store");
+        let (project, _) = store
+            .create_project(
+                "crash recovery".into(),
+                contract(),
+                Budget {
+                    max_rounds: 1,
+                    ..Budget::default()
+                },
+            )
+            .await
+            .expect("project");
+        let (start, _) = store
+            .enqueue_command(
+                &project.project_id,
+                CommandDraft {
+                    command_type: "start_project".into(),
+                    target_kind: "project".into(),
+                    target_id: project.project_id.clone(),
+                    mode: CommandMode::Immediate,
+                    payload: json!({}),
+                    expected_project_revision: project.revision,
+                    idempotency_key: "crash-recovery-start".into(),
+                    reason: "test".into(),
+                    requested_by: "test".into(),
+                },
+            )
+            .await
+            .expect("enqueue start");
+        store
+            .apply_command(&project.project_id, &start.command_id)
+            .await
+            .expect("start project");
+        store
+            .begin_round(&project.project_id)
+            .await
+            .expect("leave an interrupted round");
+
+        let restarted = ResearchService::new(
+            store.clone(),
+            Arc::new(MockBackend::default()),
+            ResearchConfig::default(),
+        );
+        let project_lock = restarted.project_lock(&project.project_id).await;
+        let guard = project_lock.lock().await;
+        assert_eq!(
+            restarted
+                .recover_running_projects()
+                .await
+                .expect("busy recovery scan"),
+            0,
+            "an active per-project runner must not gain queued watchdog waiters"
+        );
+        drop(guard);
+        assert_eq!(
+            restarted
+                .recover_running_projects()
+                .await
+                .expect("startup recovery scan"),
+            1
+        );
+
+        let status = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = store
+                    .get_project(&project.project_id)
+                    .await
+                    .expect("recovered project")
+                    .status;
+                if status != ProjectStatus::Running {
+                    break status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recovery runner timed out");
+        assert_eq!(status, ProjectStatus::PartialSuccess);
     }
 }
 
 #[cfg(test)]
 mod strategy_audit_tests {
+    use std::collections::HashSet;
+
     use chrono::{Duration, Utc};
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use research_domain::{
-        AssignmentDraft, CandidateSubmission, CandidateType, PlannerOutput, RouteProposal,
-        RouteReflection, SourceRecord, StrategyDirectorOutput, StrategyInterfaceDebt,
-        SupervisorOutput, Task, TaskStatus, VerificationReport, VerificationVerdict,
+        AssignmentDraft, CandidateSubmission, CandidateType, CheckStatus, Goal, GoalStatus,
+        PlannerOutput, ProofObligation, ProofObligationNecessity, ProofObligationStatus,
+        ResearchDelta, RouteProposal, RouteReflection, SourceRecord, StrategyDirectorOutput,
+        StrategyInterfaceDebt, SupervisorOutput, Task, TaskContract, TaskStatus,
+        VerificationProfile, VerificationReport, VerificationVerdict,
     };
+    use research_worker_runtime::AgentError;
 
     use super::{
-        assess_reviewer_independence, bind_strategy_to_assignments, deterministic_precheck,
-        planning_attempt_timeouts, primary_plan_is_executable, reflection_route_is_policy_eligible,
-        reviewer_role_contract, statements_match_target, strategy_audit_decision,
+        CertificationMode, CoreError, adjudicate_reviews, agent_error_kind,
+        assess_reviewer_independence, bind_strategy_to_assignments, candidate_claims_main_goal,
+        deterministic_precheck, human_planning_directives, open_proof_obligations_for_planning,
+        planning_attempt_timeouts, planning_error_is_retryable, primary_plan_is_executable,
+        reflection_route_is_policy_eligible, remaining_retry_budget_seconds, required_checks,
+        reviewer_independence_check_draft, reviewer_independence_unknown_report,
+        reviewer_role_contract, sanitize_assignment_goal_ids, statements_match_target,
+        strategy_audit_decision, task_contract_timeout_seconds, verification_plan_spec,
+        worker_resume_can_fallback_to_fresh,
     };
 
     fn review() -> RouteReflection {
@@ -6662,6 +8737,31 @@ mod strategy_audit_tests {
         unverified.uses_unverified_claims = true;
         assert!(!reflection_route_is_policy_eligible(&unverified, true));
         assert!(!reflection_route_is_policy_eligible(&valid, false));
+    }
+
+    #[test]
+    fn reflection_allows_explicit_research_debt_but_never_overrides_illegal_premises() {
+        let mut pending_bridge = review();
+        pending_bridge.assumption_debt = 1.0;
+        pending_bridge.blockers = vec!["The proposed bridge has not yet been proved.".into()];
+        pending_bridge.remaining_goal_gaps_if_successful =
+            vec!["A finite search does not establish the universal claim.".into()];
+        pending_bridge.suggestions =
+            vec!["Prove or refute the bridge before using it in a candidate.".into()];
+        assert!(reflection_route_is_policy_eligible(&pending_bridge, true));
+
+        // Debt and research intent never license overriding a review that actually
+        // reports an illicit premise, changed target, or conflicting active Fact.
+        let mut illegal_premise = pending_bridge.clone();
+        illegal_premise.uses_unverified_claims = true;
+        assert!(!reflection_route_is_policy_eligible(&illegal_premise, true));
+        let mut changed_target = pending_bridge.clone();
+        changed_target.changes_problem = true;
+        assert!(!reflection_route_is_policy_eligible(&changed_target, true));
+        let mut conflict = pending_bridge.clone();
+        conflict.conflicts_with_facts = true;
+        assert!(!reflection_route_is_policy_eligible(&conflict, true));
+        assert!(!reflection_route_is_policy_eligible(&pending_bridge, false));
     }
 
     #[test]
@@ -6753,11 +8853,130 @@ mod strategy_audit_tests {
     }
 
     #[test]
+    fn assignment_goal_ids_cannot_contain_bottleneck_identifiers() {
+        let mut supervisor = SupervisorOutput {
+            rationale_summary: "test".into(),
+            assignments: vec![AssignmentDraft {
+                route_index: 0,
+                worker_role: "prover".into(),
+                strategic_role: "central_bridge".into(),
+                addresses_interface_debt: true,
+                goal_ids: vec![
+                    "goal-main".into(),
+                    "bottleneck-not-a-goal".into(),
+                    "goal-main".into(),
+                ],
+                objective: "prove a bridge".into(),
+                completion_contract: "submit a candidate".into(),
+                priority: 1.0,
+            }],
+            targeted_uncertainty_ids: vec![],
+            suggestion_decisions: vec![],
+            deferred_route_indices: vec![],
+        };
+        let known = HashSet::from(["goal-main"]);
+
+        sanitize_assignment_goal_ids(&known, &mut supervisor);
+
+        assert_eq!(supervisor.assignments[0].goal_ids, vec!["goal-main"]);
+    }
+
+    #[test]
     fn first_planning_attempt_fails_fast_but_retry_keeps_full_budget() {
         assert_eq!(planning_attempt_timeouts(1_200, 1), (300, 600));
         assert_eq!(planning_attempt_timeouts(1_200, 2), (600, 1_200));
         assert_eq!(planning_attempt_timeouts(1, 1), (1, 1));
         assert_eq!(planning_attempt_timeouts(0, 2), (1, 1));
+    }
+
+    #[test]
+    fn planning_retries_only_repairable_attempt_failures() {
+        assert!(planning_error_is_retryable(&CoreError::Agent(
+            AgentError::Timeout(30)
+        )));
+        assert!(planning_error_is_retryable(&CoreError::Agent(
+            AgentError::InvalidOutput("truncated JSON".into())
+        )));
+        assert!(!planning_error_is_retryable(&CoreError::Agent(
+            AgentError::Process("HTTP 404 model route not found".into())
+        )));
+        assert!(!planning_error_is_retryable(&CoreError::Agent(
+            AgentError::Unsupported("structured output")
+        )));
+    }
+
+    #[test]
+    fn worker_resume_falls_back_only_when_the_session_is_unavailable() {
+        assert!(worker_resume_can_fallback_to_fresh(&CoreError::Agent(
+            AgentError::SessionUnavailable("session expired".into())
+        )));
+        assert!(worker_resume_can_fallback_to_fresh(&CoreError::Agent(
+            AgentError::WithUsage {
+                error: Box::new(AgentError::SessionUnavailable("session expired".into())),
+                input_tokens: 10,
+                output_tokens: 5,
+            }
+        )));
+        assert_eq!(
+            agent_error_kind(&AgentError::SessionUnavailable("missing".into())),
+            "session_unavailable"
+        );
+        assert_eq!(
+            agent_error_kind(&AgentError::WithUsage {
+                error: Box::new(AgentError::SessionUnavailable("missing".into())),
+                input_tokens: 1,
+                output_tokens: 1,
+            }),
+            "session_unavailable"
+        );
+
+        for error in [
+            AgentError::Process("authentication failed".into()),
+            AgentError::InvalidOutput("protocol violation".into()),
+            AgentError::Unsupported("resume"),
+            AgentError::Timeout(30),
+            AgentError::Cancelled,
+        ] {
+            assert!(!worker_resume_can_fallback_to_fresh(&CoreError::Agent(
+                error
+            )));
+        }
+        assert!(!worker_resume_can_fallback_to_fresh(&CoreError::Agent(
+            AgentError::Io(std::io::Error::other("broken pipe"))
+        )));
+        assert!(!worker_resume_can_fallback_to_fresh(&CoreError::Agent(
+            AgentError::Json(serde_json::from_str::<Value>("{").expect_err("invalid JSON fixture"))
+        )));
+    }
+
+    #[test]
+    fn verification_plan_escalates_only_when_candidate_risk_requires_it() {
+        let exploratory = verification_plan_spec(false, false, CertificationMode::NaturalLanguage);
+        assert_eq!(exploratory.profile, VerificationProfile::Exploratory);
+        assert_eq!(exploratory.independent_reviewer_count(), 1);
+        assert!(exploratory.requires_reviewer("adversarial_review"));
+        assert!(!required_checks(&exploratory).contains(&"reviewer_independence".into()));
+
+        let dependency_backed =
+            verification_plan_spec(false, true, CertificationMode::NaturalLanguage);
+        assert_eq!(
+            dependency_backed.profile,
+            VerificationProfile::StandardReview
+        );
+        assert_eq!(dependency_backed.independent_reviewer_count(), 2);
+        assert!(required_checks(&dependency_backed).contains(&"reviewer_independence".into()));
+
+        let source_backed = verification_plan_spec(true, false, CertificationMode::NaturalLanguage);
+        assert_eq!(source_backed.profile, VerificationProfile::StandardReview);
+        assert!(source_backed.requires_reviewer("citation_review"));
+
+        let formal = verification_plan_spec(false, false, CertificationMode::FormalReplay);
+        assert_eq!(formal.profile, VerificationProfile::CriticalCertification);
+        assert!(formal.requires_formal_replay());
+
+        let independent_proof =
+            verification_plan_spec(false, false, CertificationMode::IndependentProof);
+        assert_eq!(independent_proof.independent_reviewer_count(), 3);
     }
 
     #[test]
@@ -6778,6 +8997,196 @@ mod strategy_audit_tests {
     }
 
     #[test]
+    fn semantic_main_goal_claim_is_escalated_without_literal_matching() {
+        let (_, mut submission) = precheck_fixture("A complete proof is supplied.");
+        submission.candidate_type = CandidateType::Theorem;
+        submission.target_goal_ids = vec!["goal-main".into()];
+        submission.statement =
+            "Every object satisfying H also satisfies the stronger property Q.".into();
+        let main_goal = Goal {
+            goal_id: "goal-main".into(),
+            project_id: "project-test".into(),
+            statement: "Every object satisfying H satisfies P.".into(),
+            parent_goal_ids: vec![],
+            status: GoalStatus::Open,
+            priority: 1.0,
+            blocked_by: vec![],
+            solved_by_fact_id: None,
+            created_in_round: 0,
+        };
+
+        assert!(!statements_match_target(
+            &main_goal.statement,
+            &submission.statement
+        ));
+        assert!(candidate_claims_main_goal(
+            &submission,
+            std::slice::from_ref(&main_goal)
+        ));
+
+        let mut intermediate = submission;
+        intermediate.candidate_type = CandidateType::Lemma;
+        assert!(!candidate_claims_main_goal(&intermediate, &[main_goal]));
+    }
+
+    #[test]
+    fn goal_review_focus_is_preserved_verbatim_as_a_planning_directive() {
+        let focus = "重新梳理主目标，并优先讨论交换代数中的局部化与深度方法";
+        let delta = ResearchDelta {
+            delta_id: "delta-focus".into(),
+            project_id: "project-focus".into(),
+            from_revision: 10,
+            to_revision: 11,
+            accepted_fact_ids: vec![],
+            rejected_candidate_ids: vec![],
+            new_proof_debt_ids: vec![],
+            solved_goal_ids: vec![],
+            reopened_goal_ids: vec![],
+            changed_uncertainty_ids: vec![],
+            new_failure_pattern_ids: vec![],
+            changed_source_ids: vec![],
+            completed_task_attempt_ids: vec![],
+            failed_or_expired_attempt_ids: vec![],
+            human_command_ids: vec!["cmd-focus".into(), "cmd-settings".into()],
+            human_commands: vec![
+                json!({
+                    "command_id":"cmd-focus",
+                    "type":"goal_review",
+                    "payload":{"focus":focus},
+                    "reason":"whiteboard request"
+                }),
+                json!({
+                    "command_id":"cmd-settings",
+                    "type":"research_settings",
+                    "payload":{"review_mode":"automatic"}
+                }),
+            ],
+            route_state_changes: vec![],
+            status: "open".into(),
+            consumed_by_plan_revision_id: None,
+            created_at: Utc::now(),
+            consumed_at: None,
+        };
+
+        let directives = human_planning_directives(&delta);
+        assert_eq!(directives.len(), 1);
+        assert_eq!(directives[0]["type"], "goal_review");
+        assert_eq!(directives[0]["payload"]["focus"], focus);
+        assert!(
+            serde_json::to_string(&directives)
+                .expect("planning context JSON")
+                .contains(focus)
+        );
+    }
+
+    #[test]
+    fn planner_projection_exposes_open_and_blocked_proof_obligations() {
+        let obligation = |id: &str, status| ProofObligation {
+            obligation_id: id.into(),
+            project_id: "project-obligations".into(),
+            goal_id: Some("goal-main".into()),
+            parent_obligation_id: None,
+            source_kind: "verification_gap".into(),
+            statement: format!("close {id}"),
+            completion_criteria: "independent evidence".into(),
+            necessity: ProofObligationNecessity::Advisory,
+            status,
+            priority: 1.0,
+            source_verification_id: None,
+            source_bottleneck_id: Some("bottleneck-main".into()),
+            source_fingerprint: id.into(),
+            provenance: json!({"test":true}),
+            satisfied_by_fact_id: None,
+            created_revision: 1,
+            updated_revision: 1,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let obligations = vec![
+            obligation("open", ProofObligationStatus::Open),
+            obligation("blocked", ProofObligationStatus::Blocked),
+            obligation("done", ProofObligationStatus::Satisfied),
+        ];
+        let visible = open_proof_obligations_for_planning(&obligations);
+        assert_eq!(visible.len(), 2);
+        let packet = json!({"open_proof_obligations":visible});
+        assert_eq!(packet["open_proof_obligations"][0]["obligation_id"], "open");
+        assert_eq!(
+            packet["open_proof_obligations"][1]["obligation_id"],
+            "blocked"
+        );
+    }
+
+    #[test]
+    fn task_timeout_respects_both_immutable_contract_and_current_project_cap() {
+        let contract = TaskContract {
+            task_contract_id: "contract-timeout".into(),
+            project_id: "project-timeout".into(),
+            task_id: "task-timeout".into(),
+            plan_revision_id: "plan-timeout".into(),
+            contract_version: 1,
+            route_id: "route-timeout".into(),
+            target_goal_ids: vec!["goal-timeout".into()],
+            bottleneck_id: None,
+            task_kind: "prover".into(),
+            precise_objective: "prove P".into(),
+            allowed_input_ids: vec![],
+            context_packet_id: Some("context-timeout".into()),
+            allowed_tools: vec![],
+            forbidden_actions: vec![],
+            completion_contract: json!({}),
+            budget: json!({"max_minutes":7,"max_model_calls":2}),
+            checkpoint_policy: json!({}),
+            retry_policy: json!({}),
+            fallback_policy: json!({}),
+            route_cancellation_epoch: 0,
+            content_hash: "hash".into(),
+            created_at: Utc::now(),
+        };
+
+        assert_eq!(task_contract_timeout_seconds(&contract, 99), 7 * 60);
+        assert_eq!(task_contract_timeout_seconds(&contract, 3), 3 * 60);
+        let mut invalid = contract;
+        invalid.budget = json!({"max_minutes":0});
+        assert_eq!(task_contract_timeout_seconds(&invalid, 13), 13 * 60);
+        invalid.budget = json!({"max_minutes":1441});
+        assert_eq!(task_contract_timeout_seconds(&invalid, 2_000), 1_440 * 60);
+    }
+
+    #[test]
+    fn retries_cannot_reset_the_task_time_budget() {
+        let started = Utc::now();
+        let attempt = |id: &str, milliseconds: i64| research_domain::TaskAttempt {
+            attempt_id: id.into(),
+            project_id: "p".into(),
+            task_id: "t".into(),
+            worker_instance_id: None,
+            attempt_no: 1,
+            status: "failed".into(),
+            lease_epoch: 0,
+            plan_revision_id: None,
+            route_cancellation_epoch: 0,
+            context_packet_id: None,
+            failure_signature: None,
+            failure_reason: None,
+            started_at: Some(started),
+            completed_at: Some(started + chrono::Duration::milliseconds(milliseconds)),
+            created_at: started,
+        };
+        let attempts = vec![
+            attempt("old-1", 30_100),
+            attempt("old-2", 29_100),
+            attempt("current", 15_000),
+        ];
+        assert_eq!(
+            remaining_retry_budget_seconds(120, &attempts, "current"),
+            60
+        );
+        assert_eq!(remaining_retry_budget_seconds(30, &attempts, "current"), 0);
+        assert_eq!(remaining_retry_budget_seconds(120, &[], "current"), 120);
+    }
+
+    #[test]
     fn mathematical_reviewers_use_distinct_cognitive_contracts() {
         let forward = reviewer_role_contract("math_review_1");
         let falsification = reviewer_role_contract("math_review_2");
@@ -6791,7 +9200,25 @@ mod strategy_audit_tests {
     }
 
     #[test]
-    fn byte_equivalent_math_reviews_do_not_count_as_independent() {
+    fn independence_check_is_only_created_for_multiple_mathematical_reviewers() {
+        let report = duplicated_report();
+        let single = reviewer_independence_check_draft(&[
+            ("math_review_1".into(), report.clone()),
+            ("adversarial_review".into(), report.clone()),
+        ])
+        .expect("single-reviewer audit should be infallible");
+        assert!(single.is_none());
+
+        let multiple = reviewer_independence_check_draft(&[
+            ("math_review_1".into(), report.clone()),
+            ("math_review_2".into(), report),
+        ])
+        .expect("multi-reviewer audit should be infallible");
+        assert!(multiple.is_some());
+    }
+
+    #[test]
+    fn byte_equivalent_math_reviews_block_promotion() {
         let report = VerificationReport {
             verdict: VerificationVerdict::Accepted,
             summary: "The stated proof is valid.".into(),
@@ -6815,6 +9242,38 @@ mod strategy_audit_tests {
                 String::from("math_review_2"),
             ]]
         );
+        assert!(duplicated.output_similarity_warning);
+        assert_eq!(duplicated.bounded_rereview_max_attempts, 1);
+
+        let check = reviewer_independence_check_draft(&[
+            ("math_review_1".into(), report.clone()),
+            ("math_review_2".into(), report.clone()),
+        ])
+        .expect("similarity audit should be serializable")
+        .expect("two mathematical reviewers require an independence check");
+        assert_eq!(check.status, CheckStatus::Unknown);
+        assert!(check.mandatory);
+        assert_eq!(check.details["output_similarity_warning"], true);
+        assert_eq!(check.details["bounded_rereview_max_attempts"], 1);
+
+        let submission = CandidateSubmission {
+            task_id: "task-duplicate-review".into(),
+            route_id: "route-duplicate-review".into(),
+            target_goal_ids: vec!["goal-main".into()],
+            statement: "P".into(),
+            assumptions: vec![],
+            proof_markdown: "Proof of P.".into(),
+            dependency_fact_ids: vec![],
+            definitions_introduced: std::collections::BTreeMap::new(),
+            external_source_ids: vec![],
+            candidate_type: CandidateType::Theorem,
+            task_revision: 1,
+            route_cancellation_epoch: 0,
+        };
+        let accepted = adjudicate_reviews(&submission, &[report.clone(), report.clone()]);
+        let adjudicated = reviewer_independence_unknown_report(&submission, accepted);
+        assert_eq!(adjudicated.verdict, VerificationVerdict::Unknown);
+        assert_eq!(adjudicated.evidence_level, "unknown");
 
         let mut distinct_report = report;
         distinct_report.summary = "No counterexample survives the boundary audit.".into();
@@ -6844,6 +9303,14 @@ mod strategy_audit_tests {
         let route = RouteProposal {
             title: "central bridge".into(),
             method_summary: "prove the exact missing bridge".into(),
+            approach_kind: String::new(),
+            route_role: String::new(),
+            user_title: String::new(),
+            plain_language_summary: String::new(),
+            why_this_route: String::new(),
+            expected_output: String::new(),
+            relation_to_goal: String::new(),
+            steps: vec![],
             target_goal_ids: vec!["goal-main".into()],
             required_fact_ids: vec![],
             expected_subgoals: vec!["bridge".into()],
@@ -6883,6 +9350,82 @@ mod strategy_audit_tests {
             ..plan
         };
         assert!(!primary_plan_is_executable(&empty));
+    }
+
+    fn precheck_fixture(proof_markdown: &str) -> (Task, CandidateSubmission) {
+        let task = Task {
+            task_id: "task-precheck".into(),
+            project_id: "project-precheck".into(),
+            route_id: "route-precheck".into(),
+            worker_id: None,
+            worker_role: "prover".into(),
+            goal_ids: vec![],
+            objective: "prove a lemma".into(),
+            completion_contract: "submit a checked lemma".into(),
+            status: TaskStatus::Completed,
+            priority: 1.0,
+            revision: 1,
+            route_cancellation_epoch: 0,
+            round: 1,
+            result_summary: None,
+            plan_revision_id: None,
+            task_signature: None,
+            context_packet_id: None,
+        };
+        let submission = CandidateSubmission {
+            task_id: task.task_id.clone(),
+            route_id: task.route_id.clone(),
+            target_goal_ids: vec![],
+            statement: "A checked intermediate lemma".into(),
+            assumptions: vec![],
+            proof_markdown: proof_markdown.into(),
+            dependency_fact_ids: vec![],
+            definitions_introduced: std::collections::BTreeMap::new(),
+            external_source_ids: vec![],
+            candidate_type: CandidateType::Lemma,
+            task_revision: task.revision,
+            route_cancellation_epoch: task.route_cancellation_epoch,
+        };
+        (task, submission)
+    }
+
+    #[test]
+    fn real_proof_placeholders_and_empty_fields_remain_hard_precheck_errors() {
+        for placeholder in ["TODO", "TBD", "待证明", "此处略", "proof omitted"] {
+            let (task, submission) =
+                precheck_fixture(&format!("First step is established; {placeholder}."));
+            let report = deterministic_precheck(&submission, &task, &[], &[], &[])
+                .expect("a real proof placeholder must fail deterministically");
+            assert!(
+                report.critical_errors.contains(&"proof_placeholder".into()),
+                "placeholder was not rejected: {placeholder}"
+            );
+        }
+
+        let (task, mut submission) = precheck_fixture(" ");
+        submission.statement.clear();
+        let report = deterministic_precheck(&submission, &task, &[], &[], &[])
+            .expect("empty required fields must fail deterministically");
+        assert!(
+            report
+                .critical_errors
+                .contains(&"empty_required_field".into())
+        );
+    }
+
+    #[test]
+    fn rhetorical_shortcuts_are_left_for_independent_review() {
+        for proof in [
+            "交换两个指标后，同理可得其余情形。",
+            "由上一式，显然可得所需界。",
+            "对边界项作相同估计，类似可得结论。",
+        ] {
+            let (task, submission) = precheck_fixture(proof);
+            assert!(
+                deterministic_precheck(&submission, &task, &[], &[], &[]).is_none(),
+                "rhetorical shorthand alone must not be a deterministic rejection: {proof}"
+            );
+        }
     }
 
     #[test]
@@ -6989,12 +9532,24 @@ mod strategy_audit_tests {
             retrieved_at: Utc::now(),
         };
 
-        let report = deterministic_precheck(&submission, &task, &[], &[source], &[])
-            .expect("citation without archived content must fail deterministically");
+        let report =
+            deterministic_precheck(&submission, &task, &[], std::slice::from_ref(&source), &[])
+                .expect("citation without archived content must fail deterministically");
         assert!(
             report
                 .critical_errors
                 .contains(&"source_fulltext_artifact_missing".to_owned())
+        );
+
+        let mut lead = source;
+        lead.status = "lead_unverified".into();
+        lead.fulltext_artifact_id = Some("artifact-present-but-not-evidence-standing".into());
+        let report = deterministic_precheck(&submission, &task, &[], &[lead], &[])
+            .expect("search lead must never be usable as candidate evidence");
+        assert!(
+            report
+                .critical_errors
+                .contains(&"source_not_eligible_as_evidence".to_owned())
         );
     }
 
@@ -7071,6 +9626,751 @@ mod strategy_audit_tests {
         let by_time =
             strategy_audit_decision(Some(&old_macro), std::slice::from_ref(&old_macro), &empty);
         assert_eq!(by_time.kind, "macro");
+    }
+}
+
+#[cfg(test)]
+mod route_score_persistence_tests {
+    use research_domain::{
+        AssignmentDraft, Budget, CommandMode, PlannerOutput, ProblemContract, RankingWeights,
+        ReflectionOutput, RouteProposal, RouteReflection,
+    };
+    use research_storage::{CommandDraft, SqliteStore};
+    use serde_json::json;
+
+    use super::rank_routes;
+
+    fn route(title: &str, method_summary: &str, novelty: f64) -> RouteProposal {
+        RouteProposal {
+            title: title.into(),
+            method_summary: method_summary.into(),
+            approach_kind: String::new(),
+            route_role: String::new(),
+            user_title: String::new(),
+            plain_language_summary: String::new(),
+            why_this_route: String::new(),
+            expected_output: String::new(),
+            relation_to_goal: String::new(),
+            steps: vec![],
+            target_goal_ids: vec![],
+            required_fact_ids: vec![],
+            expected_subgoals: vec![],
+            expected_goal_progress: 0.5,
+            uncertainty_reduction: 0.5,
+            human_suggestion_alignment: 0.5,
+            evidence_support: 0.5,
+            route_diversity: 0.5,
+            verifiability: 0.5,
+            novelty,
+            failure_similarity_penalty: 0.0,
+            cost_penalty: 0.0,
+            risks: vec![],
+        }
+    }
+
+    fn review(route_index: usize) -> RouteReflection {
+        RouteReflection {
+            route_index,
+            changes_problem: false,
+            uses_unverified_claims: false,
+            conflicts_with_facts: false,
+            repeats_failure_pattern: false,
+            has_verifiable_milestone: true,
+            risk_score: 0.0,
+            goal_closure_leverage: 0.0,
+            generality_gain: 0.0,
+            assumption_debt: 0.0,
+            bridge_centrality: 0.0,
+            architecture_fit: 0.0,
+            unjustified_narrowing: false,
+            remaining_goal_gaps_if_successful: vec![],
+            blockers: vec![],
+            suggestions: vec![],
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn custom_v2_ranking_scores_are_the_persisted_route_priorities() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::connect("sqlite::memory:", temp.path().join("artifacts"))
+            .await
+            .expect("store");
+        let (project, _) = store
+            .create_project(
+                "custom ranking persistence".into(),
+                ProblemContract {
+                    original_problem: "Prove the target".into(),
+                    target_statement: "target".into(),
+                    assumptions: vec![],
+                    success_criteria: "accepted".into(),
+                    version: 1,
+                },
+                Budget::default(),
+            )
+            .await
+            .expect("project");
+        let (command, _) = store
+            .enqueue_command(
+                &project.project_id,
+                CommandDraft {
+                    command_type: "start_project".into(),
+                    target_kind: "project".into(),
+                    target_id: project.project_id.clone(),
+                    mode: CommandMode::Immediate,
+                    payload: json!({}),
+                    expected_project_revision: project.revision,
+                    idempotency_key: "custom-ranking-start".into(),
+                    reason: "test".into(),
+                    requested_by: "test".into(),
+                },
+            )
+            .await
+            .expect("enqueue start");
+        store
+            .apply_command(&project.project_id, &command.command_id)
+            .await
+            .expect("start project");
+        let (round, _) = store.begin_round(&project.project_id).await.expect("round");
+        let delta = store
+            .collect_research_delta(&project.project_id)
+            .await
+            .expect("delta");
+        let plan = PlannerOutput {
+            rationale_summary: "custom novelty-only ranking".into(),
+            routes: vec![
+                route("low novelty", "direct exact derivation", 0.2),
+                route("high novelty", "independent boundary construction", 0.8),
+            ],
+            assignments: vec![AssignmentDraft {
+                route_index: 0,
+                worker_role: "prover".into(),
+                strategic_role: "central_bridge".into(),
+                addresses_interface_debt: true,
+                goal_ids: vec![],
+                objective: "prove the exact target".into(),
+                completion_contract: "candidate or exact blocker".into(),
+                priority: 1.0,
+            }],
+            targeted_uncertainty_ids: vec![],
+            suggestion_decisions: vec![],
+        };
+        let weights = RankingWeights {
+            expected_goal_progress: 0.0,
+            uncertainty_reduction: 0.0,
+            human_suggestion_alignment: 0.0,
+            evidence_support: 0.0,
+            route_diversity: 0.0,
+            verifiability: 0.0,
+            novelty: 1.0,
+            goal_closure_leverage: 0.0,
+            generality_gain: 0.0,
+            bridge_centrality: 0.0,
+            architecture_fit: 0.0,
+            assumption_debt_penalty: 0.0,
+            unjustified_narrowing_penalty: 0.0,
+        };
+        let ranking = rank_routes(
+            &plan.routes,
+            &ReflectionOutput {
+                summary: "no additional penalties".into(),
+                reviews: vec![review(0), review(1)],
+            },
+            weights,
+        );
+        assert_eq!(ranking.route_scores.len(), 2);
+        assert!((ranking.route_scores[0] - 0.2).abs() < f64::EPSILON);
+        assert!((ranking.route_scores[1] - 0.8).abs() < f64::EPSILON);
+        for ranked_route in ranking.output["ranked_routes"]
+            .as_array()
+            .expect("ranked routes")
+        {
+            let route_index = ranked_route["route_index"]
+                .as_u64()
+                .and_then(|index| usize::try_from(index).ok())
+                .expect("route index");
+            assert!(
+                (ranked_route["score"].as_f64().expect("ranked score")
+                    - ranking.route_scores[route_index])
+                    .abs()
+                    < f64::EPSILON
+            );
+        }
+
+        let saved = store
+            .save_plan_v2(
+                &project.project_id,
+                &round,
+                &plan,
+                &ranking.route_scores,
+                &delta,
+                "primary",
+                None,
+            )
+            .await
+            .expect("save ranked plan");
+
+        for route in saved.routes {
+            let route_index = plan
+                .routes
+                .iter()
+                .position(|proposal| proposal.title == route.title)
+                .expect("persisted proposal");
+            assert!((route.priority - ranking.route_scores[route_index]).abs() < f64::EPSILON);
+            assert!((route.score - ranking.route_scores[route_index]).abs() < f64::EPSILON);
+        }
+    }
+}
+
+#[cfg(test)]
+mod session_resume_tests {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::{Duration, Instant},
+    };
+
+    use async_trait::async_trait;
+    use research_domain::{
+        AssignmentDraft, Budget, CommandMode, PlannerOutput, ProblemContract, RouteProposal,
+    };
+    use research_storage::{CommandDraft, ModelCallPurpose, SqliteStore};
+    use research_worker_runtime::{
+        AgentBackend, AgentError, AgentHandle, AgentRunResult, AgentSpec, AgentTask, AgentTaskKind,
+        BackendCapabilities,
+    };
+    use serde_json::json;
+    use tokio::sync::{Mutex, Notify};
+    use tokio_util::sync::CancellationToken;
+
+    use super::{CountedAgentRun, ResearchConfig, ResearchService, remaining_task_seconds};
+
+    #[derive(Debug, Clone, Default)]
+    pub(super) struct RecordingBackend {
+        invocations: Arc<Mutex<Vec<(&'static str, String)>>>,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct LateSteerBackend {
+        invocations: Arc<Mutex<Vec<(&'static str, String)>>>,
+        run_count: Arc<AtomicUsize>,
+        first_started: Arc<Notify>,
+        release_first: Arc<Notify>,
+    }
+
+    async fn start_project(store: &SqliteStore, project_id: &str, revision: i64, key: &str) {
+        let (start, _) = store
+            .enqueue_command(
+                project_id,
+                CommandDraft {
+                    command_type: "start_project".into(),
+                    target_kind: "project".into(),
+                    target_id: project_id.into(),
+                    mode: CommandMode::Immediate,
+                    payload: json!({}),
+                    expected_project_revision: revision,
+                    idempotency_key: key.into(),
+                    reason: "test".into(),
+                    requested_by: "test".into(),
+                },
+            )
+            .await
+            .expect("enqueue start");
+        store
+            .apply_command(project_id, &start.command_id)
+            .await
+            .expect("start");
+    }
+
+    impl RecordingBackend {
+        fn result(handle: &AgentHandle, task: &AgentTask) -> AgentRunResult {
+            let now = chrono::Utc::now();
+            AgentRunResult {
+                structured_output: json!({"prompt": task.prompt}),
+                session_id: Some(
+                    handle
+                        .session_id
+                        .clone()
+                        .unwrap_or_else(|| "codex-session-1".into()),
+                ),
+                raw_events: vec![],
+                input_tokens: 3,
+                output_tokens: 2,
+                stderr: String::new(),
+                started_at: now,
+                completed_at: now,
+            }
+        }
+    }
+
+    impl LateSteerBackend {
+        fn worker_result(session_id: &str, summary: &str) -> AgentRunResult {
+            let now = chrono::Utc::now();
+            AgentRunResult {
+                structured_output: json!({
+                    "summary":summary,
+                    "discoveries":[],
+                    "candidates":[],
+                    "failures":[],
+                    "uncertainties":[],
+                    "sources":[],
+                    "experiments":[],
+                }),
+                session_id: Some(session_id.into()),
+                raw_events: vec![],
+                input_tokens: 5,
+                output_tokens: 3,
+                stderr: String::new(),
+                started_at: now,
+                completed_at: now,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AgentBackend for RecordingBackend {
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                resumable_session: true,
+                safe_point_steering: false,
+                non_waking_injection: false,
+                graceful_cancel: true,
+                event_stream: false,
+                structured_output: true,
+                tool_permissions: false,
+            }
+        }
+
+        async fn create(&self, spec: AgentSpec) -> Result<AgentHandle, AgentError> {
+            Ok(AgentHandle {
+                handle_id: "recording-handle".into(),
+                project_id: spec.project_id,
+                role: spec.role,
+                model: spec.model,
+                working_directory: spec.working_directory,
+                session_id: None,
+            })
+        }
+
+        async fn run(
+            &self,
+            handle: &AgentHandle,
+            task: AgentTask,
+            _cancellation: CancellationToken,
+        ) -> Result<AgentRunResult, AgentError> {
+            self.invocations
+                .lock()
+                .await
+                .push(("run", task.prompt.clone()));
+            Ok(Self::result(handle, &task))
+        }
+
+        async fn resume(
+            &self,
+            handle: &AgentHandle,
+            task: AgentTask,
+            _cancellation: CancellationToken,
+        ) -> Result<AgentRunResult, AgentError> {
+            if handle.session_id.as_deref() != Some("codex-session-1") {
+                return Err(AgentError::Process("missing resumed session id".into()));
+            }
+            self.invocations
+                .lock()
+                .await
+                .push(("resume", task.prompt.clone()));
+            Ok(Self::result(handle, &task))
+        }
+    }
+
+    #[async_trait]
+    impl AgentBackend for LateSteerBackend {
+        fn name(&self) -> &'static str {
+            "late_steer_recording"
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                resumable_session: true,
+                safe_point_steering: false,
+                non_waking_injection: false,
+                graceful_cancel: true,
+                event_stream: false,
+                structured_output: true,
+                tool_permissions: false,
+            }
+        }
+
+        async fn create(&self, spec: AgentSpec) -> Result<AgentHandle, AgentError> {
+            Ok(AgentHandle {
+                handle_id: "late-steer-handle".into(),
+                project_id: spec.project_id,
+                role: spec.role,
+                model: spec.model,
+                working_directory: spec.working_directory,
+                session_id: None,
+            })
+        }
+
+        async fn run(
+            &self,
+            _handle: &AgentHandle,
+            task: AgentTask,
+            cancellation: CancellationToken,
+        ) -> Result<AgentRunResult, AgentError> {
+            self.invocations
+                .lock()
+                .await
+                .push(("run", task.prompt.clone()));
+            let run_index = self.run_count.fetch_add(1, Ordering::SeqCst);
+            if run_index == 0 {
+                self.first_started.notify_one();
+                tokio::select! {
+                    () = self.release_first.notified() => {}
+                    () = cancellation.cancelled() => return Err(AgentError::Cancelled),
+                }
+                return Ok(Self::worker_result("stale-session", "superseded output"));
+            }
+            Ok(Self::worker_result("fresh-session", "final output"))
+        }
+
+        async fn resume(
+            &self,
+            _handle: &AgentHandle,
+            task: AgentTask,
+            _cancellation: CancellationToken,
+        ) -> Result<AgentRunResult, AgentError> {
+            self.invocations.lock().await.push(("resume", task.prompt));
+            Err(AgentError::SessionUnavailable(
+                "Codex session not found".into(),
+            ))
+        }
+    }
+
+    fn plan() -> PlannerOutput {
+        PlannerOutput {
+            rationale_summary: "one executable route plus a pressure route".into(),
+            routes: vec![
+                route("primary", "derive the obstruction"),
+                route("pressure", "seek a counterexample"),
+            ],
+            assignments: vec![AssignmentDraft {
+                route_index: 0,
+                worker_role: "prover".into(),
+                strategic_role: "central_bridge".into(),
+                addresses_interface_debt: true,
+                goal_ids: vec![],
+                objective: "derive the obstruction".into(),
+                completion_contract: "return a precise result".into(),
+                priority: 1.0,
+            }],
+            targeted_uncertainty_ids: vec![],
+            suggestion_decisions: vec![],
+        }
+    }
+
+    fn route(title: &str, method_summary: &str) -> RouteProposal {
+        RouteProposal {
+            title: title.into(),
+            method_summary: method_summary.into(),
+            approach_kind: "direct_proof".into(),
+            route_role: "primary".into(),
+            user_title: title.into(),
+            plain_language_summary: method_summary.into(),
+            why_this_route: "test the central implication".into(),
+            expected_output: "a checkable lemma".into(),
+            relation_to_goal: "advances the main goal".into(),
+            steps: vec!["state the invariant".into(), "derive the result".into()],
+            target_goal_ids: vec![],
+            required_fact_ids: vec![],
+            expected_subgoals: vec![],
+            expected_goal_progress: 0.5,
+            uncertainty_reduction: 0.5,
+            human_suggestion_alignment: 0.0,
+            evidence_support: 0.5,
+            route_diversity: 0.5,
+            verifiability: 1.0,
+            novelty: 0.2,
+            failure_similarity_penalty: 0.0,
+            cost_penalty: 0.1,
+            risks: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn counted_follow_up_resumes_the_recorded_session() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::connect("sqlite::memory:", temp.path().join("artifacts"))
+            .await
+            .expect("store");
+        let backend = Arc::new(RecordingBackend::default());
+        let service = ResearchService::new(
+            store,
+            backend.clone(),
+            ResearchConfig {
+                runtime_root: temp.path().join("runtime"),
+                output_root: temp.path().join("output"),
+                ..ResearchConfig::default()
+            },
+        );
+        let project = service
+            .create_project(
+                "session resume".into(),
+                ProblemContract {
+                    original_problem: "Prove A".into(),
+                    target_statement: "A".into(),
+                    assumptions: vec![],
+                    success_criteria: "accepted".into(),
+                    version: 1,
+                },
+                Budget::default(),
+            )
+            .await
+            .expect("project");
+        start_project(
+            &service.store,
+            &project.project_id,
+            project.revision,
+            "session-resume-start",
+        )
+        .await;
+        let handle = service
+            .backend
+            .create(AgentSpec {
+                project_id: project.project_id.clone(),
+                role: "prover".into(),
+                model: None,
+                working_directory: temp.path().join("worker"),
+            })
+            .await
+            .expect("handle");
+        let task = |prompt: &str| AgentTask {
+            kind: AgentTaskKind::Worker,
+            prompt: prompt.into(),
+            output_schema: json!({"type":"object"}),
+            timeout_seconds: 60,
+        };
+
+        let first = service
+            .run_agent_counted(CountedAgentRun {
+                handle: &handle,
+                task: task("full immutable worker packet"),
+                resume_session_id: None,
+                project: &project,
+                round: project.current_round,
+                worker_id: None,
+                task_id: None,
+                purpose: ModelCallPurpose::Research,
+                cancellation: CancellationToken::new(),
+            })
+            .await
+            .expect("first run");
+        service
+            .run_agent_counted(CountedAgentRun {
+                handle: &handle,
+                task: task("late steering only"),
+                resume_session_id: first.session_id.as_deref(),
+                project: &project,
+                round: project.current_round,
+                worker_id: None,
+                task_id: None,
+                purpose: ModelCallPurpose::Research,
+                cancellation: CancellationToken::new(),
+            })
+            .await
+            .expect("resumed run");
+
+        assert_eq!(
+            *backend.invocations.lock().await,
+            vec![
+                ("run", "full immutable worker packet".into()),
+                ("resume", "late steering only".into())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn late_steer_is_acknowledged_only_with_the_final_envelope_and_stale_session_falls_back()
+    {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::connect("sqlite::memory:", temp.path().join("artifacts"))
+            .await
+            .expect("store");
+        let backend = Arc::new(LateSteerBackend::default());
+        let service = ResearchService::new(
+            store.clone(),
+            backend.clone(),
+            ResearchConfig {
+                runtime_root: temp.path().join("runtime"),
+                output_root: temp.path().join("output"),
+                ..ResearchConfig::default()
+            },
+        );
+        let project = service
+            .create_project(
+                "late steer".into(),
+                ProblemContract {
+                    original_problem: "Prove A".into(),
+                    target_statement: "A".into(),
+                    assumptions: vec![],
+                    success_criteria: "accepted".into(),
+                    version: 1,
+                },
+                Budget::default(),
+            )
+            .await
+            .expect("project");
+        start_project(
+            &store,
+            &project.project_id,
+            project.revision,
+            "late-steer-start",
+        )
+        .await;
+        let (round, _) = store.begin_round(&project.project_id).await.expect("round");
+        let delta = store
+            .collect_research_delta(&project.project_id)
+            .await
+            .expect("delta");
+        let saved = store
+            .save_plan_v2(
+                &project.project_id,
+                &round,
+                &plan(),
+                &[0.8, 0.4],
+                &delta,
+                "test",
+                None,
+            )
+            .await
+            .expect("plan");
+        let task = saved.tasks[0].clone();
+        let task_id = task.task_id.clone();
+        let run_service = service.clone();
+        let execution = tokio::spawn(async move { run_service.execute_task(task).await });
+        tokio::time::timeout(Duration::from_secs(5), backend.first_started.notified())
+            .await
+            .expect("worker started");
+        let running = store
+            .get_task(&project.project_id, &task_id)
+            .await
+            .expect("running task");
+        let project_revision = store
+            .get_project(&project.project_id)
+            .await
+            .expect("project")
+            .revision;
+        let (steer, _) = store
+            .enqueue_command(
+                &project.project_id,
+                CommandDraft {
+                    command_type: "steer_task".into(),
+                    target_kind: "task".into(),
+                    target_id: task_id.clone(),
+                    mode: CommandMode::SafePoint,
+                    payload: json!({
+                        "content":"use the invariant supplied by the researcher",
+                        "expected_task_revision":running.revision,
+                        "expected_route_epoch":running.route_cancellation_epoch,
+                    }),
+                    expected_project_revision: project_revision,
+                    idempotency_key: "late-steer-command".into(),
+                    reason: "test late arrival".into(),
+                    requested_by: "researcher".into(),
+                },
+            )
+            .await
+            .expect("enqueue steer");
+        store
+            .apply_command(&project.project_id, &steer.command_id)
+            .await
+            .expect("queue steer");
+        let steer_id = store
+            .list_task_steers(&task_id)
+            .await
+            .expect("task steers")
+            .into_iter()
+            .find(|queued| queued.command_id == steer.command_id)
+            .expect("queued steer")
+            .steer_id;
+        backend.release_first.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), execution)
+            .await
+            .expect("task timeout")
+            .expect("task join")
+            .expect("task execution");
+
+        assert_eq!(
+            store
+                .get_command(&project.project_id, &steer.command_id)
+                .await
+                .expect("steer command")
+                .status,
+            research_domain::CommandStatus::Applied
+        );
+        assert_eq!(
+            store
+                .get_task(&project.project_id, &task_id)
+                .await
+                .expect("completed task")
+                .status,
+            research_domain::TaskStatus::Completed
+        );
+        let invocations = backend.invocations.lock().await.clone();
+        assert_eq!(
+            invocations.iter().map(|item| item.0).collect::<Vec<_>>(),
+            vec!["run", "resume", "run"]
+        );
+        assert!(!invocations[0].1.contains("use the invariant supplied"));
+        assert!(invocations[1].1.contains("use the invariant supplied"));
+        assert!(invocations[2].1.contains("use the invariant supplied"));
+        assert!(invocations[2].1.contains("Task Contract"));
+        assert_eq!(
+            store
+                .usage_summary(&project.project_id)
+                .await
+                .expect("usage")
+                .model_calls,
+            3
+        );
+        let superseded = store
+            .list_artifacts(&project.project_id)
+            .await
+            .expect("artifacts")
+            .into_iter()
+            .find(|artifact| artifact.kind == "superseded_worker_output")
+            .expect("superseded output");
+        let archived: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(&superseded.storage_path)
+                .await
+                .expect("read superseded output"),
+        )
+        .expect("archived JSON");
+        assert_eq!(archived["session_id"], "stale-session");
+        assert_eq!(archived["new_pending_steer_ids"][0], steer_id);
+        assert!(
+            !archived["task_contract_hash"]
+                .as_str()
+                .unwrap_or_default()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn worker_follow_ups_share_one_wall_clock_budget() {
+        let started = Instant::now()
+            .checked_sub(Duration::from_secs(30))
+            .expect("past instant");
+        let remaining =
+            remaining_task_seconds(started, 60, "task-budget").expect("remaining task budget");
+        assert!((29..=30).contains(&remaining));
+        assert!(remaining_task_seconds(Instant::now(), 0, "task-budget").is_err());
     }
 }
 
@@ -7325,5 +10625,33 @@ mod fulltext_tests {
                 .summary
                 .contains("reported_literature_source_missing_fulltext_and_url")
         }));
+
+        let mut lead = source("unused.txt", None);
+        lead.status = "lead_unverified".into();
+        lead.fulltext_path = None;
+        lead.url = None;
+        let mut not_applicable = lead.clone();
+        not_applicable.status = "not_applicable".into();
+        not_applicable.applicability = "inspected and irrelevant".into();
+        let mut non_evidence = WorkerOutput {
+            summary: "retain source bookkeeping without invented full text".into(),
+            discoveries: vec![],
+            candidates: vec![],
+            failures: vec![],
+            uncertainties: vec![],
+            sources: vec![lead, not_applicable],
+            experiments: vec![],
+        };
+        service
+            .archive_source_fulltexts(&handle, &task, &mut non_evidence)
+            .await
+            .expect("lead and not-applicable records do not require archival");
+        assert!(non_evidence.failures.is_empty());
+        assert!(
+            non_evidence
+                .sources
+                .iter()
+                .all(|source| source.fulltext_artifact_id.is_none())
+        );
     }
 }

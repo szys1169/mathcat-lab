@@ -1,0 +1,49 @@
+{
+  "id": "math-paper-writing",
+  "name": "Math Paper Writing",
+  "version": "0.4.0",
+  "contract_version": "1.0",
+  "entrypoints": {
+    "cli": "python -m math_paper_writing.cli",
+    "codex": "SKILL.md",
+    "deepseek_harness": "python adapters/deepseek_harness/adapter.py",
+    "deepseek_harness_manifest": "adapters/deepseek_harness/adapter.json",
+    "deepseek_harness_skill": "SKILL.md",
+    "mathcat_lab": "adapters/mathcat_lab/adapter.py",
+    "mathforge": "adapters/mathforge/adapter.py",
+    "mathcat_lab_node": "../../../math-lab-platfrom/src/paper-writer.mjs"
+  },
+  "contracts": {
+    "input": "contracts/input.schema.json",
+    "result": "contracts/result.schema.json",
+    "artifacts": "contracts/artifacts.schema.json",
+    "source_packet": "contracts/source-packet.schema.json"
+  },
+  "required_artifacts": [
+    "article_tex",
+    "article_pdf",
+    "article_plan",
+    "claim_evidence_ledger",
+    "revision_notes",
+    "writing_report",
+    "input_manifest",
+    "compile_report",
+    "render_report"
+  ],
+  "optional_dependencies": [
+    "latexmk",
+    "xelatex",
+    "pdflatex",
+    "bibtex",
+    "pdftoppm",
+    "pypdf",
+    "Pillow"
+  ],
+  "workflow_source": "workflow-source.json",
+  "workflow_modes": [
+    "draft",
+    "revision",
+    "bilingual-sync",
+    "submission-audit"
+  ]
+}

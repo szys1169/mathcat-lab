@@ -8,29 +8,26 @@ rust-version.workspace = true
 [dependencies]
 async-stream.workspace = true
 axum.workspace = true
-bytes.workspace = true
 chrono.workspace = true
 futures.workspace = true
-http.workspace = true
-mime_guess.workspace = true
 research-core = { path = "../research-core" }
 research-domain = { path = "../domain" }
 research-storage = { path = "../storage" }
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tower-http.workspace = true
-tracing.workspace = true
 ulid.workspace = true
-utoipa.workspace = true
 
 [lints]
 workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 research-worker-runtime = { path = "../worker-runtime" }
 tempfile = "3"
+tokio-util.workspace = true
 tokio-tungstenite = "0.29"
 tower.workspace = true

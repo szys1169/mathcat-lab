@@ -3,7 +3,7 @@ import path from "node:path";
 import { writeJsonAtomic } from "./fs-utils.mjs";
 
 const DEFINITIONS = {
-  mathcat: { id: "mathcat", name: "MathCat", description: "人机协作的智能体", env: "MATHCAT_ROOT", repo: null },
+  mathcat: { id: "mathcat", name: "MathCat 2.4.3", description: "持续研究 · 项目白板 · 按需伙伴与审查", env: "MATHCAT_ROOT", repo: null },
   rethlas: { id: "rethlas", name: "Rethlas", description: "生成—验证闭环数学研究智能体", env: "RETHLAS_ROOT", repo: "https://github.com/frenzymath/Rethlas" },
   danus: { id: "danus", name: "Danus", description: "带事实图与角色门控的研究智能体", env: "DANUS_ROOT", repo: "https://github.com/frenzymath/Danus" }
 };
@@ -18,8 +18,8 @@ export class ResearchAgents {
     const definition = DEFINITIONS[id];
     const values = [process.env[definition.env], this.saved[id]?.path];
     if (id === "mathcat") values.push(path.join(root, "math-research-mvp"));
-    if (id === "rethlas") values.push(path.join(root, "agents", "Rethlas"));
-    if (id === "danus") values.push(path.join(root, "agents", "Danus"));
+    if (id === "rethlas") values.push(path.join(root, "agents", "Rethlas"), "F:\\Rethlas-deepseek", "F:\\Rethlas");
+    if (id === "danus") values.push(path.join(root, "agents", "Danus"), "F:\\Danus");
     return [...new Set(values.filter(Boolean).map((value) => path.resolve(value)))];
   }
   async discover(id) { for (const candidate of this.candidates(id)) if (await isDirectory(candidate)) return candidate; return null; }

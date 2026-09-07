@@ -1,4 +1,0 @@
-interface:
-  display_name: "数学论文写作"
-  short_description: "把已完成结果整理为完整数学论文（来源包→骨架→台账→草稿→修订→编译检查），不做形式化验证"
-  default_prompt: "Use $math-paper-writing to turn this source packet into a complete math paper draft."

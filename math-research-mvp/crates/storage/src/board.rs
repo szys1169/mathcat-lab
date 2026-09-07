@@ -1,13 +1,32 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use research_domain::{
-    BoardCapabilities, BoardClaim, BoardRoute, BoardSummary, DomainEvent, GraphEdge, GraphNode,
-    GraphProjection, ResearchBoardView,
+    BoardCapabilities, BoardClaim, BoardPlanningSuggestion, BoardResearchSettings, BoardRoute,
+    BoardSummary, DomainEvent, GraphEdge, GraphNode, GraphProjection, ResearchBoardView,
 };
 use serde_json::{Value, json};
 use sqlx::Row;
 
 use crate::{SqliteStore, StorageError, StorageResult, event_from_row, rows};
+
+fn attribute_text(attributes: &research_domain::Attributes, key: &str) -> String {
+    attributes
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn attribute_strings(attributes: &research_domain::Attributes, key: &str) -> Vec<String> {
+    attributes
+        .get(key)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect()
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 #[allow(clippy::struct_excessive_bools)]
@@ -152,6 +171,14 @@ impl SqliteStore {
                 route_id: route.route_id.clone(),
                 title: route.title.clone(),
                 method_summary: route.method_summary.clone(),
+                approach_kind: attribute_text(&route.attributes, "approach_kind"),
+                route_role: attribute_text(&route.attributes, "route_role"),
+                user_title: attribute_text(&route.attributes, "user_title"),
+                plain_language_summary: attribute_text(&route.attributes, "plain_language_summary"),
+                why_this_route: attribute_text(&route.attributes, "why_this_route"),
+                expected_output: attribute_text(&route.attributes, "expected_output"),
+                relation_to_goal: attribute_text(&route.attributes, "relation_to_goal"),
+                steps: attribute_strings(&route.attributes, "steps"),
                 status: route.status.to_string(),
                 human_review: row.try_get("human_review")?,
                 progress: progress.clamp(0.0, 1.0),
@@ -240,6 +267,31 @@ impl SqliteStore {
         let human_questions = question_rows
             .iter()
             .map(question_value)
+            .collect::<StorageResult<Vec<_>>>()?;
+        let planning_suggestion_rows = sqlx::query(
+            "SELECT suggestion_id,content,target_route_id,status,decision,created_in_round,effective_round \
+             FROM suggestions WHERE project_id=? ORDER BY created_in_round,suggestion_id",
+        )
+        .bind(project_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let planning_suggestions = planning_suggestion_rows
+            .iter()
+            .map(|row| {
+                let decision = row
+                    .try_get::<Option<String>, _>("decision")?
+                    .map(|raw| serde_json::from_str::<Value>(&raw))
+                    .transpose()?;
+                Ok(BoardPlanningSuggestion {
+                    suggestion_id: row.try_get("suggestion_id")?,
+                    content: row.try_get("content")?,
+                    target_route_id: row.try_get("target_route_id")?,
+                    status: row.try_get("status")?,
+                    decision,
+                    created_in_round: row.try_get("created_in_round")?,
+                    effective_round: row.try_get("effective_round")?,
+                })
+            })
             .collect::<StorageResult<Vec<_>>>()?;
         let timeline_rows =
             sqlx::query("SELECT * FROM events WHERE project_id=? ORDER BY cursor DESC LIMIT ?")
@@ -333,6 +385,14 @@ impl SqliteStore {
             revision,
             event_cursor,
             problem: project.contract,
+            settings: BoardResearchSettings {
+                budget: project.budget,
+                review_mode: project.review_mode,
+                human_route_approval: project.human_route_approval,
+                running_task_policy:
+                    "settings apply to future task admission and newly created immutable task contracts; running attempts continue"
+                        .into(),
+            },
             summary,
             routes: board_routes
                 .into_iter()
@@ -343,6 +403,7 @@ impl SqliteStore {
             goals,
             claims,
             failed_routes,
+            planning_suggestions,
             human_questions,
             uncertainties,
             tasks: if include.tasks { all_tasks } else { vec![] },
@@ -402,7 +463,7 @@ async fn board_graph(
     revision: i64,
 ) -> StorageResult<GraphProjection> {
     let mut nodes = Vec::new();
-    for row in sqlx::query("SELECT goal_id,statement,status FROM goals WHERE project_id=?")
+    for row in sqlx::query("SELECT goal_id,statement,status FROM goals WHERE project_id=? ORDER BY created_in_round,goal_id")
         .bind(project_id)
         .fetch_all(&mut **tx)
         .await?
@@ -415,12 +476,41 @@ async fn board_graph(
             attributes: Default::default(),
         });
     }
+    for row in sqlx::query(
+        "SELECT route_id,title,method_summary,status,human_review,attributes_json FROM routes WHERE project_id=? AND status NOT IN ('merged','pruned','failed','human_stopped') ORDER BY priority DESC,route_id",
+    )
+    .bind(project_id)
+    .fetch_all(&mut **tx)
+    .await?
+    {
+        let mut attributes: research_domain::Attributes =
+            serde_json::from_str(row.try_get("attributes_json")?)?;
+        let title: String = row.try_get("title")?;
+        let method_summary: String = row.try_get("method_summary")?;
+        let label = attribute_text(&attributes, "user_title");
+        attributes.insert("technical_title".into(), json!(title.clone()));
+        attributes.insert("technical_summary".into(), json!(method_summary));
+        nodes.push(GraphNode {
+            id: row.try_get("route_id")?,
+            kind: "route".into(),
+            label: if label.is_empty() { title } else { label },
+            status: if row.try_get::<String, _>("human_review")? == "pending" {
+                "pending".into()
+            } else {
+                row.try_get("status")?
+            },
+            attributes,
+        });
+    }
     for row in
         sqlx::query("SELECT hypothesis_id,kind,statement,status FROM hypotheses WHERE project_id=?")
             .bind(project_id)
             .fetch_all(&mut **tx)
             .await?
     {
+        if row.try_get::<String, _>("kind")? == "route" {
+            continue;
+        }
         nodes.push(GraphNode {
             id: row.try_get("hypothesis_id")?,
             kind: row.try_get("kind")?,
@@ -459,6 +549,13 @@ async fn board_graph(
             });
         }
     }
+    let node_ids = nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<HashSet<_>>();
+    edges.retain(|edge| {
+        node_ids.contains(edge.source.as_str()) && node_ids.contains(edge.target.as_str())
+    });
     Ok(GraphProjection {
         graph_type: "combined".into(),
         revision,

@@ -1,0 +1,61 @@
+# Beamer 排版约定、模板用法与编译审计
+
+## 默认通用模板
+
+公开源码包使用 `assets/generic-template/slides.tex`。将其复制到本次输出目录，不依赖机构主题或校徽。用户明确提供了有权使用的模板时，可以保留其样式；私有学堂班模板不随本仓库提供。
+
+```latex
+\documentclass[aspectratio=169]{beamer}   % 现代投影默认 16:9;旧设备可去掉
+\usepackage{ctex}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{tikz-cd}
+\usepackage{booktabs,graphicx,multicol}
+\usetheme{Madrid}
+
+\author{作者}
+\title{标题}
+\institute{单位/书院}
+\date{\today}
+```
+
+通用模板的内容组织约定:
+
+- 标题页使用 `\titlepage`，不自行添加机构标志。
+- 使用清晰的章节结构和页码，不依赖外部主题文件。
+- 数学内容用命名 block:`\begin{block}{Definition 1.1.} ... \end{block}`、`Theorem`、`Proposition`、`Lemma`、`Corollary`、`Example`、`Construction`。
+- 校徽等品牌图片只在本地使用,不随输出公开传播。
+
+默认关闭 `smoothbars` 的微型圆点导航或其他需要小字号才能容纳的导航条；使用 section 标题、简洁进度条和页码即可。顶部导航不得与标题争夺视觉注意力。
+
+## 颜色与空间
+
+- 使用统一主题色表示结构、标题和中性重点；红色只表示矛盾、风险、反例或必须警示之处，不用红色装饰普通结论。
+- 蓝/绿色可用于正向结论或已完成步骤，但同一语义全稿保持一致。
+- 参考文献页正文不小于 `\footnotesize`，优先减少条目或拆页，不用不可读的小字。
+- TikZ 节点文字和连线必须留出间距；标签不得压在线条、箭头、节点边框或其他标签上。
+
+## 公式纪律
+
+- 行内公式 `$...$`;独立公式用 `equation`/`align`/`align*`;推导用 `split`、`multline`;分段函数用 `cases`;不用裸 `$$...$$`。
+- 长公式:先 `\small` 或拆行,再考虑拆页;保证公式字号不小于正文的约 85%。
+- 符号先定义后使用;同一符号在全文保持同一含义;量词、假设、边界条件一个都不能丢。
+- 交换图用 `tikz-cd`;结构图用 `tikz`/`pgfplots`;图片统一放 `pic/`,用相对路径引用。
+
+## 中文与字体
+
+- 引擎固定 xelatex(ctex 需要);不要用 pdflatex 编译中文 deck。
+- 中文标点、公式与中文之间的间距由 ctex 自动处理;`\kaishu`/`\songti` 按需切换字体。
+- 若目标机器缺中文字体,先 `check_environment.py` 定位问题,不擅自改字体配置。
+
+## 编译与审计
+
+编译统一走 `scripts/build_slides.py`(封装 `latexmk -xelatex -interaction=nonstopmode -halt-on-error`)。MiKTeX 首次编译可能自动安装宏包,耗时较长,属正常现象。
+
+审计清单(每项都要过):
+
+- 编译零错误;`!` 开头的错误行全部消除。
+- Overfull/Underfull 数量:Overfull 必须处理(拆行、缩字号、拆页);Underfull 可容忍但需知道原因。
+- PDF 页数与大纲一致;目录、导航、页脚不重叠。
+- 渲染检查:公式不乱码、图片不糊、无元素越界;用 `scripts/render_check.py --strict-layout` 生成报告并逐页看 PNG。机器检查只能筛查明显文本越界/重叠，不能替代人工逐页查看。
+- 引用与交叉引用可解析;`ref.bib` 条目真实存在。

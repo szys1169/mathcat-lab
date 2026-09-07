@@ -1,0 +1,36 @@
+{
+  "source": "https://github.com/frenzymath/Rethlas",
+  "source_snapshot": "local checkout pinned by file SHA256; not asserted equal to current main",
+  "captured_at": "2026-09-06T09:02:16.353Z",
+  "files": [
+    {
+      "path": "LICENSE",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    {
+      "path": "agents/verification/AGENTS.md",
+      "sha256": "29a43aac1035fa4a0d9c002f7e6f2732604740a0e5661540df72cab9f64ee63c"
+    },
+    {
+      "path": "agents/verification/mcp/server.py",
+      "sha256": "7980105cd8f0bb86c8054ba5d6ee9d67cb357c563496cef3ee2519889f1d0108"
+    },
+    {
+      "path": "agents/verification/schemas/verification_output.schema.json",
+      "sha256": "a8d6f8904bec58cba44c43f6fc305461f21733699117d2be703d9408c50b1356"
+    },
+    {
+      "path": "agents/verification/.agents/skills/verify-sequential-statements/SKILL.md",
+      "sha256": "aa134aedc8d91f4af246520982327eec5b83c69e1a65940ccbc16033df470d1d"
+    },
+    {
+      "path": "agents/verification/.agents/skills/check-referenced-statements/SKILL.md",
+      "sha256": "2ff55a3db595fd8a88ce0526f7375b8ea6775a0847aacbd34329194dc1b0d97e"
+    },
+    {
+      "path": "agents/verification/.agents/skills/synthesize-verification-report/SKILL.md",
+      "sha256": "db04ac457b53426f5544a3b6fb3343320008463b7cb45a25573bc319c4512ec0"
+    }
+  ],
+  "modifications": "Adapted three methods and consistency rules; native managed runtime, local file tools instead of upstream launchers/MCP, explicit inconclusive, dependency closure and repair coverage, no computation tool."
+}

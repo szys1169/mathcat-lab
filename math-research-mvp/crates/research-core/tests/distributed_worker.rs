@@ -1,11 +1,11 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use research_core::{ResearchConfig, ResearchService};
 use research_domain::{
-    AssignmentDraft, Budget, CandidateDraft, CandidateType, CommandMode, PlannerOutput,
+    AssignmentDraft, Budget, CandidateSubmission, CandidateType, CommandMode, PlannerOutput,
     ProblemContract, RouteProposal, WorkerOutput,
 };
-use research_storage::{CommandDraft, SqliteStore};
+use research_storage::{CommandDraft, SqliteStore, TaskLeaseCompletionRequest};
 use research_worker_runtime::MockBackend;
 use serde_json::json;
 
@@ -13,6 +13,14 @@ fn route(title: &str, diversity: f64) -> RouteProposal {
     RouteProposal {
         title: title.into(),
         method_summary: format!("auditable {title} route"),
+        approach_kind: String::new(),
+        route_role: String::new(),
+        user_title: String::new(),
+        plain_language_summary: String::new(),
+        why_this_route: String::new(),
+        expected_output: String::new(),
+        relation_to_goal: String::new(),
+        steps: vec![],
         target_goal_ids: vec![],
         required_fact_ids: vec![],
         expected_subgoals: vec![],
@@ -107,34 +115,71 @@ async fn remote_candidates_pass_through_the_same_fact_gate() {
         .await
         .expect("start project");
     let (round, _) = store.begin_round(&project.project_id).await.expect("round");
-    store
-        .save_plan(
+    let delta = store
+        .collect_research_delta(&project.project_id)
+        .await
+        .expect("collect V2 planning delta");
+    let plan = PlannerOutput {
+        rationale_summary: "two independent routes".into(),
+        routes: vec![route("direct", 0.3), route("adversarial", 1.0)],
+        assignments: vec![
+            AssignmentDraft {
+                route_index: 0,
+                worker_role: "prover".into(),
+                strategic_role: "local_milestone".into(),
+                addresses_interface_debt: false,
+                goal_ids: vec![],
+                objective: "produce an intermediate lemma".into(),
+                completion_contract: "candidate or explicit gap".into(),
+                priority: 1.0,
+            },
+            AssignmentDraft {
+                route_index: 1,
+                worker_role: "counterexample_hunter".into(),
+                strategic_role: "adversarial".into(),
+                addresses_interface_debt: false,
+                goal_ids: vec![],
+                objective: "independently pressure-test the lemma".into(),
+                completion_contract: "counterexample or exclusion report".into(),
+                priority: 0.5,
+            },
+        ],
+        targeted_uncertainty_ids: vec![],
+        suggestion_decisions: vec![],
+    };
+    let route_scores = plan
+        .routes
+        .iter()
+        .map(RouteProposal::score)
+        .collect::<Vec<_>>();
+    let saved = store
+        .save_plan_v2(
             &project.project_id,
             &round,
-            &PlannerOutput {
-                rationale_summary: "two independent routes".into(),
-                routes: vec![route("direct", 0.3), route("adversarial", 1.0)],
-                assignments: vec![AssignmentDraft {
-                    route_index: 0,
-                    worker_role: "prover".into(),
-                    strategic_role: "local_milestone".into(),
-                    addresses_interface_debt: false,
-                    goal_ids: vec![],
-                    objective: "produce an intermediate lemma".into(),
-                    completion_contract: "candidate or explicit gap".into(),
-                    priority: 1.0,
-                }],
-                targeted_uncertainty_ids: vec![],
-                suggestion_decisions: vec![],
-            },
+            &plan,
+            &route_scores,
+            &delta,
+            "distributed worker regression",
+            None,
         )
         .await
-        .expect("save plan");
+        .expect("save V2 plan");
+    assert_eq!(
+        saved.tasks.len(),
+        2,
+        "both routes should materialize tasks; routes={:?}",
+        saved
+            .routes
+            .iter()
+            .map(|route| (&route.title, &route.status, &route.family_id))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(saved.tasks[0].status.to_string(), "queued");
     let node = store
         .register_worker_node(
             "remote-node",
             "Remote test node",
-            json!({"roles":["prover"]}),
+            json!({"roles":["prover","counterexample_hunter"]}),
             "remote-worker-token-123456",
         )
         .await
@@ -150,45 +195,147 @@ async fn remote_candidates_pass_through_the_same_fact_gate() {
         .await
         .expect("lease")
         .expect("leased task");
-    service
-        .complete_distributed_task(
-            &lease.lease_id,
+    let (sibling_lease, _sibling_task) = service
+        .lease_next_distributed_task(
+            &project.project_id,
             &node.node_id,
             "remote-worker-token-123456",
             node.node_epoch,
-            lease.lease_epoch,
-            &WorkerOutput {
-                summary: "remote lemma completed".into(),
-                discoveries: vec![],
-                candidates: vec![CandidateDraft {
-                    statement: "Every even natural number is divisible by two.".into(),
-                    assumptions: vec![],
-                    proof_markdown: "By definition, an even natural number n has n = 2k for some natural number k, so 2 divides n.".into(),
-                    dependency_fact_ids: vec![],
-                    definitions_introduced: std::collections::BTreeMap::default(),
-                    external_source_ids: vec![],
-                    candidate_type: CandidateType::Lemma,
-                    target_goal_ids: task.goal_ids.clone(),
-                }],
-                failures: vec![],
-                uncertainties: vec![],
-                sources: vec![],
-                experiments: vec![],
-            },
+            60,
         )
         .await
+        .expect("sibling lease")
+        .expect("leased sibling task");
+    let attempt_status: String = sqlx::query_scalar(
+        "SELECT a.status FROM task_attempts a JOIN task_leases l ON l.attempt_id=a.attempt_id WHERE l.lease_id=?",
+    )
+    .bind(&lease.lease_id)
+    .fetch_one(store.pool())
+    .await
+    .expect("V2 attempt state");
+    assert_eq!(attempt_status, "running");
+    let output = WorkerOutput {
+        summary: "remote lemma completed".into(),
+        discoveries: vec![],
+        candidates: vec![],
+        failures: vec![],
+        uncertainties: vec![],
+        sources: vec![],
+        experiments: vec![],
+    };
+    service
+        .complete_distributed_task(TaskLeaseCompletionRequest {
+            lease_id: &lease.lease_id,
+            node_id: &node.node_id,
+            token: "remote-worker-token-123456",
+            node_epoch: node.node_epoch,
+            lease_epoch: lease.lease_epoch,
+            output: &output,
+            incorporated_steer_ids: &[],
+        })
+        .await
         .expect("complete remote task");
+    service
+        .complete_distributed_task(TaskLeaseCompletionRequest {
+            lease_id: &lease.lease_id,
+            node_id: &node.node_id,
+            token: "remote-worker-token-123456",
+            node_epoch: node.node_epoch,
+            lease_epoch: lease.lease_epoch,
+            output: &output,
+            incorporated_steer_ids: &[],
+        })
+        .await
+        .expect("idempotent remote completion replay");
 
-    let snapshot = store.snapshot(&project.project_id).await.expect("snapshot");
+    let completed_task = store
+        .get_task(&project.project_id, &task.task_id)
+        .await
+        .expect("completed producer task");
+    let receipt = service
+        .submit_candidate(
+            &project.project_id,
+            CandidateSubmission {
+                task_id: completed_task.task_id.clone(),
+                route_id: completed_task.route_id.clone(),
+                target_goal_ids: completed_task.goal_ids.clone(),
+                statement: "Every even natural number is divisible by two.".into(),
+                assumptions: vec![],
+                proof_markdown: "By definition, an even natural number n has n = 2k for some natural number k, so 2 divides n.".into(),
+                dependency_fact_ids: vec![],
+                definitions_introduced: std::collections::BTreeMap::default(),
+                external_source_ids: vec![],
+                candidate_type: CandidateType::Lemma,
+                task_revision: completed_task.revision,
+                route_cancellation_epoch: completed_task.route_cancellation_epoch,
+            },
+            "external-candidate-before-round-safe-point",
+        )
+        .await
+        .expect("submit external candidate");
+
+    let pending = store
+        .list_verifications(&project.project_id)
+        .await
+        .expect("pending verifications");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0].verification_id,
+        receipt.verification.verification_id
+    );
+    assert_eq!(pending[0].status.to_string(), "submitted");
+    assert!(
+        store
+            .snapshot(&project.project_id)
+            .await
+            .expect("snapshot before sibling completion")
+            .facts
+            .is_empty(),
+        "the first remote completion must not win verification admission"
+    );
+
+    let sibling_output = WorkerOutput {
+        summary: "remote pressure test completed without a candidate".into(),
+        discoveries: vec![],
+        candidates: vec![],
+        failures: vec![],
+        uncertainties: vec![],
+        sources: vec![],
+        experiments: vec![],
+    };
+    service
+        .complete_distributed_task(TaskLeaseCompletionRequest {
+            lease_id: &sibling_lease.lease_id,
+            node_id: &node.node_id,
+            token: "remote-worker-token-123456",
+            node_epoch: node.node_epoch,
+            lease_epoch: sibling_lease.lease_epoch,
+            output: &sibling_output,
+            incorporated_steer_ids: &[],
+        })
+        .await
+        .expect("complete sibling remote task");
+
+    let snapshot = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshot = store.snapshot(&project.project_id).await.expect("snapshot");
+            if !snapshot.facts.is_empty() {
+                break snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("verification drain timeout");
     assert_eq!(snapshot.facts.len(), 1);
     assert_eq!(snapshot.facts[0].evidence_level, "reviewed");
     assert_eq!(snapshot.facts[0].created_by, task.task_id);
-    let verification = store
+    let mut verifications = store
         .list_verifications(&project.project_id)
         .await
-        .expect("verifications")
-        .pop()
-        .expect("verification");
+        .expect("verifications");
+    assert_eq!(verifications.len(), 1);
+    let verification = verifications.pop().expect("verification");
     assert_eq!(
         verification.report.expect("report").evidence_level,
         "reviewed"

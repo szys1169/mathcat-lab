@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "math-paper-writing/result.schema.json",
+  "title": "Math paper writing result",
+  "type": "object",
+  "required": ["schema_version", "task_id", "executor", "status", "termination_reason", "version", "compile_status", "artifacts", "warnings", "errors"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "task_id": {"type": "string"},
+    "executor": {"enum": ["codex", "deepseek_harness"]},
+    "status": {"enum": ["completed", "partial", "failed", "stopped"]},
+    "termination_reason": {"enum": ["completed", "missing_input", "executor_failed", "compile_failed", "delivery_gate_failed", "user_stopped", "time_limit"]},
+    "version": {"type": "string"},
+    "compile_status": {"enum": ["passed", "failed", "not_run"]},
+    "render_status": {"enum": ["passed", "failed", "not_run"]},
+    "verification_level": {"const": "writing_audit"},
+    "artifacts": {"type": "array", "items": {"$ref": "artifacts.schema.json#/$defs/artifact"}},
+    "warnings": {"type": "array", "items": {"type": "string"}},
+    "errors": {"type": "array", "items": {"type": "string"}}
+  }
+}

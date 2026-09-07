@@ -5,12 +5,12 @@ use std::{
 
 use chrono::Utc;
 use research_domain::{
-    AcceptanceClass, AlignmentRelation, AlignmentReview, BackendRun, CheckStatus, DomainEvent,
-    FactAssurance, Formalization, FormalizerOutput, ProofEdge, ProofHint, ProofNode,
-    ProofNodeStatus, ProofSearch, ProofSearchBudget, SemanticContract, SemanticContractDraft,
-    VerificationAttempt, VerificationCase, VerificationCheck, VerificationEvidence,
-    VerificationFinding, VerificationPackage, VerificationPolicy, VerificationProfile,
-    VerificationReplay, VerificationSnapshot, VerificationStage,
+    AcceptanceClass, AlignmentRelation, AlignmentReview, BackendRun,
+    CanonicalVerificationRequirements, CheckStatus, DomainEvent, Formalization, FormalizerOutput,
+    ProofEdge, ProofHint, ProofNode, ProofNodeStatus, ProofSearch, ProofSearchBudget,
+    SemanticContract, SemanticContractDraft, VerificationCase, VerificationCheck,
+    VerificationEvidence, VerificationFinding, VerificationPackage, VerificationPolicy,
+    VerificationProfile, VerificationReplay, VerificationSnapshot, VerificationStage,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -37,6 +37,36 @@ pub struct VerificationCaseDraft {
     pub max_attempts: u32,
     pub risk_score: f64,
     pub risk_reasons: Vec<String>,
+}
+
+fn validate_verification_case_draft(draft: &VerificationCaseDraft) -> StorageResult<()> {
+    let requirements =
+        CanonicalVerificationRequirements::from_required_checks(&draft.required_checks)
+            .map_err(StorageError::InvalidTransition)?;
+    let projected_required_checks = [
+        draft.require_citation_review.then_some("citation_review"),
+        draft
+            .require_adversarial_review
+            .then_some("adversarial_review"),
+        draft.require_alignment_review.then_some("alignment_review"),
+        draft.require_fresh_replay.then_some("fresh_replay"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    requirements
+        .validate_projection(draft.independent_reviewer_count, &projected_required_checks)
+        .map_err(StorageError::InvalidTransition)?;
+    if matches!(
+        draft.required_acceptance,
+        AcceptanceClass::FormallyVerified | AcceptanceClass::FullyCertified
+    ) && !requirements.requires_formal_pipeline()
+    {
+        return Err(StorageError::InvalidTransition(
+            "formal acceptance requires the complete formal verification check bundle".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -137,8 +167,12 @@ impl SqliteStore {
             tx.rollback().await?;
             return Ok((case, None));
         }
+        validate_verification_case_draft(&draft)?;
         let verification = sqlx::query(
-            "SELECT project_id,candidate_id FROM verifications WHERE verification_id=?",
+            "SELECT v.project_id,v.candidate_id,v.status AS verification_status,\
+                    p.status AS project_status \
+             FROM verifications v JOIN projects p ON p.project_id=v.project_id \
+             WHERE v.verification_id=?",
         )
         .bind(verification_id)
         .fetch_optional(&mut *tx)
@@ -149,6 +183,15 @@ impl SqliteStore {
         })?;
         let project_id: String = verification.try_get("project_id")?;
         let candidate_id: String = verification.try_get("candidate_id")?;
+        let verification_status: String = verification.try_get("verification_status")?;
+        let project_status: String = verification.try_get("project_status")?;
+        let route_released =
+            crate::verification_execution_is_released(&mut tx, verification_id).await?;
+        if !route_released || verification_status != "verifying" {
+            return Err(StorageError::LateSubmission(format!(
+                "verification {verification_id} cannot create a case while verification is {verification_status} and project is {project_status}"
+            )));
+        }
         let policy_id = new_id("vpolicy");
         let case_id = new_id("vcase");
         let now = Utc::now();
@@ -216,6 +259,8 @@ impl SqliteStore {
         let row = sqlx::query("SELECT vc.*,c.submission_json,p.problem_contract_json,p.revision FROM verification_cases vc JOIN candidates c ON c.candidate_id=vc.candidate_id JOIN projects p ON p.project_id=vc.project_id WHERE vc.case_id=?")
             .bind(case_id).fetch_optional(&mut *tx).await?
             .ok_or_else(|| StorageError::NotFound { kind: "verification_case", id: case_id.into() })?;
+        let case = case_from_row(&row)?;
+        ensure_case_progression_allowed(&mut tx, &case).await?;
         let stage: String = row.try_get("stage")?;
         if stage != "intake" && stage != "snapshotting" {
             return Err(StorageError::InvalidTransition(format!(
@@ -300,6 +345,12 @@ impl SqliteStore {
                         id: source_id.clone(),
                     })?;
             let source = rows::source(&source_row)?;
+            if !crate::source_ingestion::status_can_support_candidate(&source.status) {
+                return Err(StorageError::InvalidDependency(format!(
+                    "source {source_id} has non-evidence status {}",
+                    source.status
+                )));
+            }
             let hash = sha256(&serde_json::to_vec(&source)?);
             source_hashes.insert(source_id.clone(), hash);
             sources.push(source);
@@ -375,7 +426,7 @@ impl SqliteStore {
             .await?;
         let mut tx = self.pool().begin().await?;
         let case = case_in_tx(&mut tx, case_id).await?;
-        ensure_case_mutable(&case)?;
+        ensure_case_progression_allowed(&mut tx, &case).await?;
         let check_id = new_id("vcheck");
         let now = Utc::now();
         let completed_at = if matches!(draft.status, CheckStatus::Queued | CheckStatus::Running) {
@@ -420,7 +471,7 @@ impl SqliteStore {
             .await?;
         let mut tx = self.pool().begin().await?;
         let case = case_in_tx(&mut tx, case_id).await?;
-        ensure_case_mutable(&case)?;
+        ensure_case_progression_allowed(&mut tx, &case).await?;
         let finding_id = new_id("vfinding");
         let now = Utc::now();
         sqlx::query("INSERT INTO verification_findings(finding_id,case_id,check_id,reviewer_kind,severity,category,location,claim,rationale,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)")
@@ -461,7 +512,7 @@ impl SqliteStore {
             .await?;
         let mut tx = self.pool().begin().await?;
         let case = case_in_tx(&mut tx, case_id).await?;
-        ensure_case_mutable(&case)?;
+        ensure_case_progression_allowed(&mut tx, &case).await?;
         let evidence_id = new_id("vevidence");
         let now = Utc::now();
         let sha256 = sha256(&serde_json::to_vec(&draft.payload)?);
@@ -503,6 +554,7 @@ impl SqliteStore {
             .await?;
         let mut tx = self.pool().begin().await?;
         let case = case_in_tx(&mut tx, case_id).await?;
+        ensure_case_progression_allowed(&mut tx, &case).await?;
         if case.cancellation_epoch != expected_epoch {
             return Err(StorageError::LateSubmission(format!(
                 "verification case {case_id} epoch expected {expected_epoch}, actual {}",
@@ -658,7 +710,7 @@ impl SqliteStore {
             .await?;
         let mut tx = self.pool().begin().await?;
         let case = case_in_tx(&mut tx, case_id).await?;
-        ensure_case_mutable(&case)?;
+        ensure_case_progression_allowed(&mut tx, &case).await?;
         let version: i64 = sqlx::query_scalar(
             "SELECT COALESCE(MAX(version),0)+1 FROM semantic_contracts WHERE case_id=?",
         )
@@ -724,7 +776,7 @@ impl SqliteStore {
             .await?;
         let mut tx = self.pool().begin().await?;
         let case = case_in_tx(&mut tx, case_id).await?;
-        ensure_case_mutable(&case)?;
+        ensure_case_progression_allowed(&mut tx, &case).await?;
         let owns_contract: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM semantic_contracts WHERE case_id=? AND contract_id=?",
         )
@@ -779,7 +831,7 @@ impl SqliteStore {
             .await?;
         let mut tx = self.pool().begin().await?;
         let case = case_in_tx(&mut tx, case_id).await?;
-        ensure_case_mutable(&case)?;
+        ensure_case_progression_allowed(&mut tx, &case).await?;
         let alignment_id = new_id("alignment");
         let now = Utc::now();
         sqlx::query("INSERT INTO alignment_reviews(alignment_id,case_id,formalization_id,relation,reviewer_kind,rationale,missing_assumptions_json,extra_assumptions_json,confidence,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)")
@@ -819,7 +871,7 @@ impl SqliteStore {
             .await?;
         let mut tx = self.pool().begin().await?;
         let case = case_in_tx(&mut tx, case_id).await?;
-        ensure_case_mutable(&case)?;
+        ensure_case_progression_allowed(&mut tx, &case).await?;
         let backend_run_id = new_id("backendrun");
         let now = Utc::now();
         sqlx::query("INSERT INTO backend_runs(backend_run_id,case_id,attempt_id,backend,backend_version,status,command_json,working_directory,exit_code,stdout,stderr,diagnostics_json,axioms_json,elapsed_ms,input_hash,output_hash,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
@@ -868,7 +920,7 @@ impl SqliteStore {
             .await?;
         let mut tx = self.pool().begin().await?;
         let case = case_in_tx(&mut tx, case_id).await?;
-        ensure_case_mutable(&case)?;
+        ensure_case_progression_allowed(&mut tx, &case).await?;
         let manifest_hash = sha256(&serde_json::to_vec(&manifest)?);
         let package_id = format!("vpackage_{}", &manifest_hash[..24]);
         let now = Utc::now();
@@ -918,7 +970,7 @@ impl SqliteStore {
             .await?;
         let mut tx = self.pool().begin().await?;
         let case = case_in_tx(&mut tx, case_id).await?;
-        ensure_case_mutable(&case)?;
+        ensure_case_progression_allowed(&mut tx, &case).await?;
         let replay_id = new_id("vreplay");
         let now = Utc::now();
         sqlx::query("INSERT INTO verification_replays(replay_id,case_id,package_id,status,fresh_process,manifest_hash,observed_hash,backend_run_id,summary,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)")
@@ -1053,7 +1105,7 @@ impl SqliteStore {
             .await?;
         let mut tx = self.pool().begin().await?;
         let case = case_in_tx(&mut tx, case_id).await?;
-        ensure_case_mutable(&case)?;
+        ensure_case_progression_allowed(&mut tx, &case).await?;
         let owns_formalization: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM formalizations WHERE case_id=? AND formalization_id=?",
         )
@@ -1717,7 +1769,7 @@ impl SqliteStore {
             .await?;
         let mut tx = self.pool().begin().await?;
         let case = case_in_tx(&mut tx, case_id).await?;
-        ensure_case_mutable(&case)?;
+        ensure_case_progression_allowed(&mut tx, &case).await?;
         let base_row =
             sqlx::query("SELECT * FROM formalizations WHERE case_id=? AND formalization_id=?")
                 .bind(case_id)
@@ -1952,10 +2004,10 @@ async fn ensure_gate_checks(
     Ok(())
 }
 
-pub(crate) async fn validate_fact_gate(
+pub(crate) async fn validate_verification_snapshot_fence(
     tx: &mut Transaction<'_, Sqlite>,
     verification_id: &str,
-) -> StorageResult<FactGateContext> {
+) -> StorageResult<(VerificationCase, VerificationSnapshot)> {
     let case_row = sqlx::query("SELECT * FROM verification_cases WHERE verification_id=?")
         .bind(verification_id)
         .fetch_optional(&mut **tx)
@@ -1966,26 +2018,16 @@ pub(crate) async fn validate_fact_gate(
             ))
         })?;
     let case = case_from_row(&case_row)?;
-    if case.stage != VerificationStage::CommitReady {
-        return Err(StorageError::InvalidTransition(format!(
-            "verification case {} is {}, not commit_ready",
-            case.case_id, case.stage
-        )));
-    }
-    ensure_gate_checks(tx, &case).await?;
-    let acceptance = case.achieved_acceptance.ok_or_else(|| {
-        StorageError::InvalidTransition("verification case has no achieved acceptance".into())
-    })?;
-    if acceptance_rank(acceptance) < acceptance_rank(case.required_acceptance) {
-        return Err(StorageError::InvalidTransition(format!(
-            "achieved {acceptance} is below required {}",
-            case.required_acceptance
-        )));
-    }
     let snapshot_row = sqlx::query("SELECT * FROM verification_snapshots WHERE case_id=?")
         .bind(&case.case_id)
-        .fetch_one(&mut **tx)
-        .await?;
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| {
+            StorageError::InvalidTransition(format!(
+                "verification case {} has no immutable snapshot",
+                case.case_id
+            ))
+        })?;
     let snapshot = snapshot_from_row(&snapshot_row)?;
     let candidate_json: String =
         sqlx::query_scalar("SELECT submission_json FROM candidates WHERE candidate_id=?")
@@ -2007,6 +2049,30 @@ pub(crate) async fn validate_fact_gate(
         return Err(StorageError::LateSubmission(
             "problem contract changed after verification snapshot".into(),
         ));
+    }
+    Ok((case, snapshot))
+}
+
+pub(crate) async fn validate_fact_gate(
+    tx: &mut Transaction<'_, Sqlite>,
+    verification_id: &str,
+) -> StorageResult<FactGateContext> {
+    let (case, snapshot) = validate_verification_snapshot_fence(tx, verification_id).await?;
+    if case.stage != VerificationStage::CommitReady {
+        return Err(StorageError::InvalidTransition(format!(
+            "verification case {} is {}, not commit_ready",
+            case.case_id, case.stage
+        )));
+    }
+    ensure_gate_checks(tx, &case).await?;
+    let acceptance = case.achieved_acceptance.ok_or_else(|| {
+        StorageError::InvalidTransition("verification case has no achieved acceptance".into())
+    })?;
+    if acceptance_rank(acceptance) < acceptance_rank(case.required_acceptance) {
+        return Err(StorageError::InvalidTransition(format!(
+            "achieved {acceptance} is below required {}",
+            case.required_acceptance
+        )));
     }
     let mut pending_dependencies = snapshot
         .dependency_hashes
@@ -2058,6 +2124,12 @@ pub(crate) async fn validate_fact_gate(
                 id: source_id.clone(),
             })?;
         let source = rows::source(&row)?;
+        if !crate::source_ingestion::status_can_support_candidate(&source.status) {
+            return Err(StorageError::InvalidDependency(format!(
+                "source {source_id} has non-evidence status {}",
+                source.status
+            )));
+        }
         if sha256(&serde_json::to_vec(&source)?) != *expected_hash {
             return Err(StorageError::LateSubmission(format!(
                 "source {source_id} changed after verification snapshot"
@@ -2089,6 +2161,39 @@ fn ensure_case_mutable(case: &VerificationCase) -> StorageResult<()> {
         return Err(StorageError::InvalidTransition(format!(
             "verification case {} is terminal ({})",
             case.case_id, case.stage
+        )));
+    }
+    Ok(())
+}
+
+async fn ensure_case_progression_allowed(
+    tx: &mut Transaction<'_, Sqlite>,
+    case: &VerificationCase,
+) -> StorageResult<()> {
+    ensure_case_mutable(case)?;
+    let lifecycle = sqlx::query(
+        "SELECT v.status AS verification_status,p.status AS project_status \
+         FROM verifications v JOIN projects p ON p.project_id=v.project_id \
+         WHERE v.verification_id=? AND v.project_id=?",
+    )
+    .bind(&case.verification_id)
+    .bind(&case.project_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| {
+        StorageError::CorruptData(format!(
+            "verification case {} lost its owning verification or project",
+            case.case_id
+        ))
+    })?;
+    let verification_status: String = lifecycle.try_get("verification_status")?;
+    let project_status: String = lifecycle.try_get("project_status")?;
+    let route_released =
+        crate::verification_execution_is_released(tx, &case.verification_id).await?;
+    if verification_status != "verifying" || !route_released {
+        return Err(StorageError::LateSubmission(format!(
+            "verification case {} cannot advance while verification is {verification_status} and project is {project_status}",
+            case.case_id
         )));
     }
     Ok(())
@@ -2182,7 +2287,7 @@ fn case_from_row(row: &SqliteRow) -> StorageResult<VerificationCase> {
 }
 
 fn policy_from_row(row: &SqliteRow) -> StorageResult<VerificationPolicy> {
-    Ok(VerificationPolicy {
+    let policy = VerificationPolicy {
         policy_id: row.try_get("policy_id")?,
         project_id: row.try_get("project_id")?,
         name: row.try_get("name")?,
@@ -2202,7 +2307,11 @@ fn policy_from_row(row: &SqliteRow) -> StorageResult<VerificationPolicy> {
         max_attempts: u32::try_from(row.try_get::<i64, _>("max_attempts")?)
             .map_err(|error| StorageError::CorruptData(error.to_string()))?,
         created_at: rows::timestamp(row.try_get("created_at")?)?,
-    })
+    };
+    policy
+        .canonical_requirements()
+        .map_err(StorageError::CorruptData)?;
+    Ok(policy)
 }
 
 fn snapshot_from_row(row: &SqliteRow) -> StorageResult<VerificationSnapshot> {
@@ -2425,22 +2534,4 @@ fn hint_from_row(row: &SqliteRow) -> StorageResult<ProofHint> {
         consumed_at: rows::optional_timestamp(row.try_get("consumed_at")?)?,
         created_at: rows::timestamp(row.try_get("created_at")?)?,
     })
-}
-
-// Keep all V2/V3 persisted types in this module's public API even before their orchestration
-// methods are called; this makes transport and replay code share one canonical model.
-#[allow(dead_code)]
-fn _persistence_model_anchor(
-    _: (
-        AlignmentRelation,
-        AlignmentReview,
-        BackendRun,
-        FactAssurance,
-        Formalization,
-        SemanticContract,
-        VerificationAttempt,
-        VerificationPackage,
-        VerificationReplay,
-    ),
-) {
 }

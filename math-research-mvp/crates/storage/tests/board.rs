@@ -110,7 +110,10 @@ async fn problem_revision_atomically_invalidates_stale_tasks_and_preserves_origi
             BoardCapabilities {
                 can_edit_problem: true,
                 can_propose_route: true,
+                can_create_route: true,
                 can_approve_route: true,
+                can_force_goal_review: true,
+                can_manage_settings: true,
                 can_control_project: true,
                 can_control_tasks: true,
                 can_govern_facts: true,

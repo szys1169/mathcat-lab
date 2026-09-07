@@ -1,0 +1,6 @@
+interface:
+  display_name: "数学相关工作"
+  short_description: "复用核验文献，比较已有工作与本文并生成可合并的综述章节"
+  default_prompt: "Use $math-related-work to position these mathematical results against verified literature and draft a cited related-work section."
+policy:
+  allow_implicit_invocation: true

@@ -1,6 +1,0 @@
-.*
-!.gitignore
-!.pre-commit-config.yaml
-
-*.[io]lean
-/result

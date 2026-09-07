@@ -69,7 +69,7 @@ impl SqliteStore {
             .await?;
         let mut tx = self.pool().begin().await?;
         let case = sqlx::query(
-            "SELECT project_id,stage,cancellation_epoch FROM verification_cases WHERE case_id=?",
+            "SELECT vc.project_id,vc.stage,vc.cancellation_epoch,vc.snapshot_id,vs.content_hash AS snapshot_hash,vp.max_attempts,p.status AS project_status FROM verification_cases vc JOIN verification_policies vp ON vp.policy_id=vc.policy_id JOIN projects p ON p.project_id=vc.project_id LEFT JOIN verification_snapshots vs ON vs.snapshot_id=vc.snapshot_id AND vs.case_id=vc.case_id WHERE vc.case_id=?",
         )
         .bind(case_id)
         .fetch_optional(&mut *tx)
@@ -81,20 +81,48 @@ impl SqliteStore {
         let project_id: String = case.try_get("project_id")?;
         let stage: String = case.try_get("stage")?;
         let cancellation_epoch: i64 = case.try_get("cancellation_epoch")?;
-        if matches!(
-            stage.as_str(),
-            "committed" | "rejected" | "unknown" | "cancelled"
-        ) {
+        let snapshot_id: Option<String> = case.try_get("snapshot_id")?;
+        let snapshot_hash: Option<String> = case.try_get("snapshot_hash")?;
+        let max_attempts: i64 = case.try_get("max_attempts")?;
+        let project_status: String = case.try_get("project_status")?;
+        if !crate::verification_case_execution_is_released(&mut tx, case_id).await? {
+            return Err(StorageError::InvalidTransition(format!(
+                "verification workers cannot be offered while project is {project_status}"
+            )));
+        }
+        if max_attempts < 1 {
+            return Err(StorageError::CorruptData(format!(
+                "verification case {case_id} has invalid max_attempts {max_attempts}"
+            )));
+        }
+        if verification_stage_is_terminal(&stage) {
             return Err(StorageError::InvalidTransition(format!(
                 "verification case is {stage}"
             )));
         }
+        let (snapshot_id, snapshot_hash) = snapshot_id.zip(snapshot_hash).ok_or_else(|| {
+            StorageError::InvalidTransition(format!(
+                "verification case {case_id} has no immutable snapshot"
+            ))
+        })?;
         let sequence: i64 = sqlx::query_scalar(
             "SELECT COALESCE(MAX(sequence),0)+1 FROM verification_attempts WHERE case_id=?",
         )
         .bind(case_id)
         .fetch_one(&mut *tx)
         .await?;
+        let attempts_for_kind: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM verification_attempts WHERE case_id=? AND kind=?",
+        )
+        .bind(case_id)
+        .bind(kind)
+        .fetch_one(&mut *tx)
+        .await?;
+        if attempts_for_kind >= max_attempts {
+            return Err(StorageError::BudgetExhausted(format!(
+                "verification case {case_id} exhausted {max_attempts} attempt(s) for {kind}"
+            )));
+        }
         let lease_epoch: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(lease_epoch),0)+1 FROM verification_attempts WHERE case_id=? AND kind=?")
             .bind(case_id).bind(kind).fetch_one(&mut *tx).await?;
         let revision = current_revision(&mut tx, &project_id).await?;
@@ -121,8 +149,10 @@ impl SqliteStore {
             "allowed_tools":["read_verification_snapshot","submit_verification_result"],
             "forbidden_actions":["write_fact_graph","read_other_reviewer_results","claim_acceptance_without_adjudicator"],
             "completion_contract":completion_contract,
-            "retry_policy":{"max_attempts":3,"same_failure_signature_retries":1},
+            "retry_policy":{"max_attempts":max_attempts,"same_failure_signature_retries":1},
             "cancellation_epoch":cancellation_epoch,
+            "snapshot_id":snapshot_id,
+            "snapshot_hash":snapshot_hash,
         });
         let contract_hash = hash_json(&contract)?;
         let input_hash =
@@ -181,15 +211,25 @@ impl SqliteStore {
             );
         let verification_lease_id = new_id("verlease");
         let mut tx = self.pool().begin().await?;
-        let current_epoch: i64 =
-            sqlx::query_scalar("SELECT cancellation_epoch FROM verification_cases WHERE case_id=?")
-                .bind(&offer.case_id)
-                .fetch_one(&mut *tx)
-                .await?;
+        let current = sqlx::query("SELECT vc.cancellation_epoch,vc.stage,p.status AS project_status FROM verification_cases vc JOIN projects p ON p.project_id=vc.project_id WHERE vc.case_id=? AND vc.project_id=?")
+            .bind(&offer.case_id)
+            .bind(&offer.project_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let current_epoch: i64 = current.try_get("cancellation_epoch")?;
+        let stage: String = current.try_get("stage")?;
+        let project_status: String = current.try_get("project_status")?;
         if current_epoch != offer.cancellation_epoch {
             return Err(StorageError::LateSubmission(
                 "verification case epoch changed before handshake".into(),
             ));
+        }
+        if !crate::verification_case_execution_is_released(&mut tx, &offer.case_id).await?
+            || verification_stage_is_terminal(&stage)
+        {
+            return Err(StorageError::LateSubmission(format!(
+                "verification handshake crossed a lifecycle boundary: project={project_status}, case={stage}"
+            )));
         }
         let changed=sqlx::query("UPDATE verification_attempts SET status='running',started_at=? WHERE attempt_id=? AND status='offered'")
             .bind(now.to_rfc3339()).bind(&offer.attempt_id).execute(&mut *tx).await?;
@@ -311,9 +351,17 @@ impl SqliteStore {
             kind: "verification_result_envelope",
             id: envelope_id.into(),
         })?;
-        let payload: Value = serde_json::from_str(row.try_get("envelope_json")?)?;
         let status: String = row.try_get("status")?;
+        let envelope_json: String = row.try_get("envelope_json")?;
+        let payload = serde_json::from_str::<Value>(&envelope_json);
         if status == "ingested" {
+            let payload = payload?;
+            let expected_content_hash: String = row.try_get("content_hash")?;
+            if hash_json(&payload)? != expected_content_hash {
+                return Err(StorageError::CorruptData(format!(
+                    "ingested verification result {envelope_id} failed its content hash"
+                )));
+            }
             tx.rollback().await?;
             return Ok((payload, Vec::new()));
         }
@@ -328,16 +376,64 @@ impl SqliteStore {
         let lease_id: String = row.try_get("verification_lease_id")?;
         let lease_epoch: i64 = row.try_get("lease_epoch")?;
         let cancellation_epoch: i64 = row.try_get("cancellation_epoch")?;
-        let valid:i64=sqlx::query_scalar("SELECT COUNT(*) FROM verification_task_leases l JOIN verification_attempts a ON a.attempt_id=l.attempt_id JOIN verification_cases c ON c.case_id=l.case_id WHERE l.verification_lease_id=? AND l.status IN ('active','expired') AND l.lease_epoch=? AND l.cancellation_epoch=? AND a.status='result_submitted' AND c.cancellation_epoch=?")
-            .bind(&lease_id).bind(lease_epoch).bind(cancellation_epoch).bind(cancellation_epoch).fetch_one(&mut *tx).await?;
-        if valid != 1 {
-            sqlx::query("UPDATE verification_result_envelopes SET status='stale',rejection_reason='lease or cancellation epoch changed' WHERE verification_result_envelope_id=?")
-                .bind(envelope_id).execute(&mut *tx).await?;
-            tx.commit().await?;
-            return Err(StorageError::LateSubmission(
-                "verification result became stale".into(),
-            ));
+        let expected_content_hash: String = row.try_get("content_hash")?;
+        let mut rejection_reason = match &payload {
+            Ok(payload) if hash_json(payload)? == expected_content_hash => None,
+            Ok(_) => Some("verification result content hash mismatch".to_owned()),
+            Err(error) => Some(format!(
+                "verification result payload is invalid JSON: {error}"
+            )),
+        };
+        let chain = sqlx::query(
+            "SELECT a.case_id AS attempt_case_id,a.kind AS attempt_kind,a.status AS attempt_status,a.cancellation_epoch AS attempt_cancellation_epoch,a.lease_epoch AS attempt_lease_epoch,a.input_hash,a.output_hash,a.context_packet_id,l.project_id AS lease_project_id,l.case_id AS lease_case_id,l.attempt_id AS lease_attempt_id,l.lease_epoch AS stored_lease_epoch,l.cancellation_epoch AS lease_cancellation_epoch,l.status AS lease_status,c.project_id AS case_project_id,c.snapshot_id,c.cancellation_epoch AS case_cancellation_epoch,c.stage AS case_stage,s.content_hash AS snapshot_hash,cp.project_id AS context_project_id,cp.content_json AS context_json,cp.content_hash AS context_hash,cp.status AS context_status,tc.project_id AS contract_project_id,tc.case_id AS contract_case_id,tc.contract_json,tc.content_hash AS contract_hash FROM verification_attempts a JOIN verification_task_leases l ON l.verification_lease_id=? JOIN verification_cases c ON c.case_id=? LEFT JOIN verification_snapshots s ON s.snapshot_id=c.snapshot_id AND s.case_id=c.case_id LEFT JOIN context_packets cp ON cp.context_packet_id=a.context_packet_id LEFT JOIN verification_task_contracts tc ON tc.attempt_id=a.attempt_id WHERE a.attempt_id=?",
+        )
+        .bind(&lease_id)
+        .bind(&case_id)
+        .bind(&attempt_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if rejection_reason.is_none() {
+            rejection_reason = match chain.as_ref() {
+                None => Some("verification result ownership chain is missing".to_owned()),
+                Some(chain) => validate_result_ownership(
+                    chain,
+                    &project_id,
+                    &case_id,
+                    &attempt_id,
+                    lease_epoch,
+                    cancellation_epoch,
+                    &expected_content_hash,
+                )?,
+            };
         }
+        if let Some(reason) = rejection_reason {
+            sqlx::query("UPDATE verification_result_envelopes SET status='stale',rejection_reason=? WHERE verification_result_envelope_id=? AND status='submitted'")
+                .bind(&reason).bind(envelope_id).execute(&mut *tx).await?;
+            let revision = bump_revision(&mut tx, &project_id).await?;
+            append_event(
+                &mut tx,
+                &project_id,
+                revision,
+                "verification.worker.result_rejected",
+                entity("verification_result_envelope", envelope_id),
+                json!({
+                    "case_id":case_id,
+                    "attempt_id":attempt_id,
+                    "lease_epoch":lease_epoch,
+                    "cancellation_epoch":cancellation_epoch,
+                    "reason":reason,
+                }),
+                Some(entity("verification_task_lease", &lease_id)),
+            )
+            .await?;
+            tx.commit().await?;
+            return Err(StorageError::LateSubmission(reason));
+        }
+        let payload = payload.map_err(|error| {
+            StorageError::CorruptData(format!(
+                "validated verification result payload could not be decoded: {error}"
+            ))
+        })?;
         let now = Utc::now();
         sqlx::query(
             "UPDATE verification_attempts SET status='completed',completed_at=? WHERE attempt_id=?",
@@ -367,6 +463,35 @@ impl SqliteStore {
         Ok((payload, vec![event]))
     }
 
+    pub async fn replay_ingested_verification_result(
+        &self,
+        case_id: &str,
+        kind: &str,
+        context: &Value,
+    ) -> StorageResult<Option<(String, Value)>> {
+        let expected_context_hash = hash_json(context)?;
+        let row = sqlx::query(
+            "SELECT e.attempt_id,e.envelope_json,e.content_hash FROM verification_result_envelopes e JOIN verification_attempts a ON a.attempt_id=e.attempt_id JOIN verification_cases c ON c.case_id=e.case_id JOIN verification_task_leases l ON l.verification_lease_id=e.verification_lease_id JOIN verification_task_contracts tc ON tc.attempt_id=a.attempt_id JOIN verification_snapshots s ON s.snapshot_id=c.snapshot_id AND s.case_id=c.case_id JOIN context_packets cp ON cp.context_packet_id=a.context_packet_id WHERE e.case_id=? AND a.kind=? AND cp.content_hash=? AND e.status='ingested' AND a.status='completed' AND l.status='completed' AND e.project_id=c.project_id AND e.cancellation_epoch=c.cancellation_epoch AND e.cancellation_epoch=a.cancellation_epoch AND e.cancellation_epoch=l.cancellation_epoch AND e.lease_epoch=a.lease_epoch AND e.lease_epoch=l.lease_epoch AND json_extract(tc.contract_json,'$.snapshot_id')=c.snapshot_id AND json_extract(tc.contract_json,'$.snapshot_hash')=s.content_hash ORDER BY e.ingested_at DESC,e.verification_result_envelope_id DESC LIMIT 1",
+        )
+        .bind(case_id)
+        .bind(kind)
+        .bind(expected_context_hash)
+        .fetch_optional(self.pool())
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let attempt_id: String = row.try_get("attempt_id")?;
+        let payload: Value = serde_json::from_str(row.try_get("envelope_json")?)?;
+        let expected_hash: String = row.try_get("content_hash")?;
+        if hash_json(&payload)? != expected_hash {
+            return Err(StorageError::CorruptData(format!(
+                "ingested verification result for attempt {attempt_id} failed its content hash"
+            )));
+        }
+        Ok(Some((attempt_id, payload)))
+    }
+
     pub async fn fail_verification_worker(
         &self,
         offer: &VerificationWorkerOffer,
@@ -389,14 +514,189 @@ impl SqliteStore {
         ));
         let now = Utc::now();
         let mut tx = self.pool().begin().await?;
-        sqlx::query("UPDATE verification_attempts SET status='failed',failure_signature=?,error_kind='runtime_unavailable',error_message=?,completed_at=? WHERE attempt_id=? AND status NOT IN ('completed','failed')")
-            .bind(&signature).bind(reason).bind(now.to_rfc3339()).bind(&offer.attempt_id).execute(&mut *tx).await?;
-        if let Some(lease) = lease {
-            sqlx::query("UPDATE verification_task_leases SET status='failed',completed_at=? WHERE verification_lease_id=? AND status='active'")
-                .bind(now.to_rfc3339()).bind(&lease.verification_lease_id).execute(&mut *tx).await?;
+        let row = sqlx::query(
+            "SELECT a.status AS attempt_status,a.failure_signature,a.sequence,a.kind,\
+                    a.cancellation_epoch AS attempt_cancellation_epoch,a.lease_epoch AS attempt_lease_epoch,\
+                    a.worker_instance_id,c.project_id,c.stage AS case_stage,\
+                    c.cancellation_epoch AS case_cancellation_epoch,p.status AS project_status,\
+                    wi.status AS worker_instance_status \
+             FROM verification_attempts a \
+             JOIN verification_cases c ON c.case_id=a.case_id \
+             JOIN projects p ON p.project_id=c.project_id \
+             JOIN worker_instances wi ON wi.worker_instance_id=a.worker_instance_id \
+             WHERE a.attempt_id=? AND a.case_id=?",
+        )
+        .bind(&offer.attempt_id)
+        .bind(&offer.case_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            StorageError::LateSubmission(
+                "verification attempt no longer exists in this case scope".into(),
+            )
+        })?;
+        let attempt_status: String = row.try_get("attempt_status")?;
+        let recorded_signature: Option<String> = row.try_get("failure_signature")?;
+        if attempt_status == "failed" {
+            tx.rollback().await?;
+            if recorded_signature.as_deref() == Some(signature.as_str()) {
+                return Ok(Vec::new());
+            }
+            return Err(StorageError::LateSubmission(
+                "verification attempt already failed with a different reason".into(),
+            ));
         }
-        sqlx::query("UPDATE worker_instances SET status='exited',quarantine_reason=?,exited_at=? WHERE worker_instance_id=?")
-            .bind(reason).bind(now.to_rfc3339()).bind(&offer.worker_instance_id).execute(&mut *tx).await?;
+
+        let sequence: i64 = row.try_get("sequence")?;
+        let kind: String = row.try_get("kind")?;
+        let attempt_cancellation_epoch: i64 = row.try_get("attempt_cancellation_epoch")?;
+        let attempt_lease_epoch: i64 = row.try_get("attempt_lease_epoch")?;
+        let worker_instance_id: String = row.try_get("worker_instance_id")?;
+        let project_id: String = row.try_get("project_id")?;
+        let case_stage: String = row.try_get("case_stage")?;
+        let case_cancellation_epoch: i64 = row.try_get("case_cancellation_epoch")?;
+        let project_status: String = row.try_get("project_status")?;
+        let worker_instance_status: String = row.try_get("worker_instance_status")?;
+        let route_released =
+            crate::verification_case_execution_is_released(&mut tx, &offer.case_id).await?;
+        let latest_sequence: i64 = sqlx::query_scalar(
+            "SELECT MAX(sequence) FROM verification_attempts WHERE case_id=? AND kind=?",
+        )
+        .bind(&offer.case_id)
+        .bind(&kind)
+        .fetch_one(&mut *tx)
+        .await?;
+        let expected_attempt_status = if lease.is_some() {
+            "running"
+        } else {
+            "offered"
+        };
+        let expected_worker_status = if lease.is_some() {
+            "running"
+        } else {
+            "handshaking"
+        };
+        let identity_matches = project_id == offer.project_id
+            && kind == offer.kind
+            && sequence == offer.sequence
+            && attempt_cancellation_epoch == offer.cancellation_epoch
+            && attempt_lease_epoch == offer.lease_epoch
+            && worker_instance_id == offer.worker_instance_id;
+        if !route_released
+            || verification_stage_is_terminal(&case_stage)
+            || case_cancellation_epoch != offer.cancellation_epoch
+            || latest_sequence != offer.sequence
+            || attempt_status != expected_attempt_status
+            || worker_instance_status != expected_worker_status
+            || !identity_matches
+        {
+            return Err(StorageError::LateSubmission(format!(
+                "verification failure is stale: project={project_status}, case={case_stage}/{case_cancellation_epoch}, attempt={attempt_status}/{sequence}, latest={latest_sequence}, worker={worker_instance_status}"
+            )));
+        }
+
+        if let Some(lease) = lease {
+            if lease.project_id != offer.project_id
+                || lease.case_id != offer.case_id
+                || lease.attempt_id != offer.attempt_id
+                || lease.worker_instance_id != offer.worker_instance_id
+                || lease.lease_epoch != offer.lease_epoch
+                || lease.cancellation_epoch != offer.cancellation_epoch
+            {
+                return Err(StorageError::LateSubmission(
+                    "verification failure lease does not match its offer".into(),
+                ));
+            }
+            let lease_row = sqlx::query(
+                "SELECT project_id,case_id,attempt_id,worker_instance_id,lease_epoch,\
+                        cancellation_epoch,lease_token_hash,status \
+                 FROM verification_task_leases WHERE verification_lease_id=?",
+            )
+            .bind(&lease.verification_lease_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| {
+                StorageError::LateSubmission("verification failure lease no longer exists".into())
+            })?;
+            let lease_matches = lease_row.try_get::<String, _>("project_id")? == offer.project_id
+                && lease_row.try_get::<String, _>("case_id")? == offer.case_id
+                && lease_row.try_get::<String, _>("attempt_id")? == offer.attempt_id
+                && lease_row.try_get::<String, _>("worker_instance_id")?
+                    == offer.worker_instance_id
+                && lease_row.try_get::<i64, _>("lease_epoch")? == offer.lease_epoch
+                && lease_row.try_get::<i64, _>("cancellation_epoch")? == offer.cancellation_epoch
+                && lease_row.try_get::<String, _>("lease_token_hash")?
+                    == hash_secret(&lease.lease_token)
+                && lease_row.try_get::<String, _>("status")? == "active";
+            if !lease_matches {
+                return Err(StorageError::LateSubmission(
+                    "verification failure lease token, epoch, ownership, or lifecycle is stale"
+                        .into(),
+                ));
+            }
+        } else {
+            let lease_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM verification_task_leases WHERE attempt_id=?",
+            )
+            .bind(&offer.attempt_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if lease_count != 0 {
+                return Err(StorageError::LateSubmission(
+                    "unleased verification failure cannot replace an existing lease".into(),
+                ));
+            }
+        }
+
+        let attempt_update = sqlx::query("UPDATE verification_attempts SET status='failed',failure_signature=?,error_kind='runtime_unavailable',error_message=?,completed_at=? WHERE attempt_id=? AND case_id=? AND status=? AND sequence=? AND cancellation_epoch=? AND lease_epoch=?")
+            .bind(&signature)
+            .bind(reason)
+            .bind(now.to_rfc3339())
+            .bind(&offer.attempt_id)
+            .bind(&offer.case_id)
+            .bind(expected_attempt_status)
+            .bind(offer.sequence)
+            .bind(offer.cancellation_epoch)
+            .bind(offer.lease_epoch)
+            .execute(&mut *tx)
+            .await?;
+        if attempt_update.rows_affected() != 1 {
+            return Err(StorageError::LateSubmission(
+                "verification attempt changed while its failure was being recorded".into(),
+            ));
+        }
+        if let Some(lease) = lease {
+            let lease_update = sqlx::query("UPDATE verification_task_leases SET status='failed',completed_at=? WHERE verification_lease_id=? AND project_id=? AND case_id=? AND attempt_id=? AND worker_instance_id=? AND lease_epoch=? AND cancellation_epoch=? AND lease_token_hash=? AND status='active'")
+                .bind(now.to_rfc3339())
+                .bind(&lease.verification_lease_id)
+                .bind(&offer.project_id)
+                .bind(&offer.case_id)
+                .bind(&offer.attempt_id)
+                .bind(&offer.worker_instance_id)
+                .bind(offer.lease_epoch)
+                .bind(offer.cancellation_epoch)
+                .bind(hash_secret(&lease.lease_token))
+                .execute(&mut *tx)
+                .await?;
+            if lease_update.rows_affected() != 1 {
+                return Err(StorageError::LateSubmission(
+                    "verification lease changed while its failure was being recorded".into(),
+                ));
+            }
+        }
+        let worker_update = sqlx::query("UPDATE worker_instances SET status='exited',quarantine_reason=?,exited_at=? WHERE worker_instance_id=? AND project_id=? AND status=?")
+            .bind(reason)
+            .bind(now.to_rfc3339())
+            .bind(&offer.worker_instance_id)
+            .bind(&offer.project_id)
+            .bind(expected_worker_status)
+            .execute(&mut *tx)
+            .await?;
+        if worker_update.rows_affected() != 1 {
+            return Err(StorageError::LateSubmission(
+                "verification worker changed while its failure was being recorded".into(),
+            ));
+        }
         let revision = bump_revision(&mut tx, &offer.project_id).await?;
         let event = append_event(
             &mut tx,
@@ -413,11 +713,161 @@ impl SqliteStore {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_result_ownership(
+    row: &sqlx::sqlite::SqliteRow,
+    project_id: &str,
+    case_id: &str,
+    attempt_id: &str,
+    lease_epoch: i64,
+    cancellation_epoch: i64,
+    result_content_hash: &str,
+) -> StorageResult<Option<String>> {
+    let attempt_case_id: String = row.try_get("attempt_case_id")?;
+    let attempt_kind: String = row.try_get("attempt_kind")?;
+    let attempt_status: String = row.try_get("attempt_status")?;
+    let attempt_cancellation_epoch: i64 = row.try_get("attempt_cancellation_epoch")?;
+    let attempt_lease_epoch: i64 = row.try_get("attempt_lease_epoch")?;
+    let input_hash: String = row.try_get("input_hash")?;
+    let output_hash: Option<String> = row.try_get("output_hash")?;
+    let context_packet_id: Option<String> = row.try_get("context_packet_id")?;
+    let lease_project_id: String = row.try_get("lease_project_id")?;
+    let lease_case_id: String = row.try_get("lease_case_id")?;
+    let lease_attempt_id: String = row.try_get("lease_attempt_id")?;
+    let stored_lease_epoch: i64 = row.try_get("stored_lease_epoch")?;
+    let lease_cancellation_epoch: i64 = row.try_get("lease_cancellation_epoch")?;
+    let lease_status: String = row.try_get("lease_status")?;
+    let case_project_id: String = row.try_get("case_project_id")?;
+    let snapshot_id: Option<String> = row.try_get("snapshot_id")?;
+    let case_cancellation_epoch: i64 = row.try_get("case_cancellation_epoch")?;
+    let case_stage: String = row.try_get("case_stage")?;
+    let snapshot_hash: Option<String> = row.try_get("snapshot_hash")?;
+    let context_project_id: Option<String> = row.try_get("context_project_id")?;
+    let context_json: Option<String> = row.try_get("context_json")?;
+    let context_hash: Option<String> = row.try_get("context_hash")?;
+    let context_status: Option<String> = row.try_get("context_status")?;
+    let contract_project_id: Option<String> = row.try_get("contract_project_id")?;
+    let contract_case_id: Option<String> = row.try_get("contract_case_id")?;
+    let contract_json: Option<String> = row.try_get("contract_json")?;
+    let contract_hash: Option<String> = row.try_get("contract_hash")?;
+
+    if attempt_case_id != case_id
+        || lease_project_id != project_id
+        || lease_case_id != case_id
+        || lease_attempt_id != attempt_id
+        || case_project_id != project_id
+        || context_project_id.as_deref() != Some(project_id)
+        || contract_project_id.as_deref() != Some(project_id)
+        || contract_case_id.as_deref() != Some(case_id)
+    {
+        return Ok(Some(
+            "verification result case or project ownership changed".into(),
+        ));
+    }
+    if attempt_status != "result_submitted"
+        || !matches!(lease_status.as_str(), "active" | "expired")
+    {
+        return Ok(Some(
+            "verification attempt or lease is not awaiting ingestion".into(),
+        ));
+    }
+    if attempt_lease_epoch != lease_epoch
+        || stored_lease_epoch != lease_epoch
+        || attempt_cancellation_epoch != cancellation_epoch
+        || lease_cancellation_epoch != cancellation_epoch
+        || case_cancellation_epoch != cancellation_epoch
+    {
+        return Ok(Some(
+            "verification lease or cancellation epoch changed".into(),
+        ));
+    }
+    if output_hash.as_deref() != Some(result_content_hash) {
+        return Ok(Some(
+            "verification attempt output hash does not match its result envelope".into(),
+        ));
+    }
+    if verification_stage_is_terminal(&case_stage) {
+        return Ok(Some(format!(
+            "verification case is already terminal ({case_stage})"
+        )));
+    }
+    let (Some(snapshot_id), Some(snapshot_hash)) = (snapshot_id, snapshot_hash) else {
+        return Ok(Some(
+            "verification result is not bound to an immutable snapshot".into(),
+        ));
+    };
+    let (Some(context_packet_id), Some(context_json), Some(context_hash)) =
+        (context_packet_id, context_json, context_hash)
+    else {
+        return Ok(Some("verification result context packet is missing".into()));
+    };
+    if context_status.as_deref() != Some("active") {
+        return Ok(Some(
+            "verification result context packet is no longer active".into(),
+        ));
+    }
+    let context: Value = match serde_json::from_str(&context_json) {
+        Ok(context) => context,
+        Err(error) => {
+            return Ok(Some(format!(
+                "verification context packet is invalid JSON: {error}"
+            )));
+        }
+    };
+    if hash_json(&context)? != context_hash {
+        return Ok(Some(
+            "verification context packet content hash mismatch".into(),
+        ));
+    }
+    let (Some(contract_json), Some(contract_hash)) = (contract_json, contract_hash) else {
+        return Ok(Some("verification task contract is missing".into()));
+    };
+    let contract: Value = match serde_json::from_str(&contract_json) {
+        Ok(contract) => contract,
+        Err(error) => {
+            return Ok(Some(format!(
+                "verification task contract is invalid JSON: {error}"
+            )));
+        }
+    };
+    if hash_json(&contract)? != contract_hash {
+        return Ok(Some(
+            "verification task contract content hash mismatch".into(),
+        ));
+    }
+    let contract_matches = contract.get("case_id").and_then(Value::as_str) == Some(case_id)
+        && contract.get("attempt_id").and_then(Value::as_str) == Some(attempt_id)
+        && contract.get("task_kind").and_then(Value::as_str) == Some(attempt_kind.as_str())
+        && contract.get("context_packet_id").and_then(Value::as_str)
+            == Some(context_packet_id.as_str())
+        && contract.get("cancellation_epoch").and_then(Value::as_i64) == Some(cancellation_epoch)
+        && contract.get("snapshot_id").and_then(Value::as_str) == Some(snapshot_id.as_str())
+        && contract.get("snapshot_hash").and_then(Value::as_str) == Some(snapshot_hash.as_str());
+    if !contract_matches {
+        return Ok(Some(
+            "verification task contract no longer matches its case, snapshot, or attempt".into(),
+        ));
+    }
+    let expected_input_hash = hash_json(&json!({
+        "context_hash": context_hash,
+        "contract_hash": contract_hash,
+    }))?;
+    if input_hash != expected_input_hash {
+        return Ok(Some("verification attempt input hash mismatch".into()));
+    }
+    Ok(None)
+}
+
 async fn validate_lease(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     lease: &VerificationWorkerLease,
 ) -> StorageResult<()> {
-    let valid:i64=sqlx::query_scalar("SELECT COUNT(*) FROM verification_task_leases l JOIN verification_attempts a ON a.attempt_id=l.attempt_id JOIN verification_cases c ON c.case_id=l.case_id WHERE l.verification_lease_id=? AND l.attempt_id=? AND l.worker_instance_id=? AND l.lease_epoch=? AND l.lease_token_hash=? AND l.status='active' AND l.expires_at>=? AND a.status='running' AND c.cancellation_epoch=?")
+    if !crate::verification_case_execution_is_released(tx, &lease.case_id).await? {
+        return Err(StorageError::LateSubmission(
+            "verification route is no longer released".into(),
+        ));
+    }
+    let valid:i64=sqlx::query_scalar("SELECT COUNT(*) FROM verification_task_leases l JOIN verification_attempts a ON a.attempt_id=l.attempt_id JOIN verification_cases c ON c.case_id=l.case_id WHERE l.verification_lease_id=? AND l.attempt_id=? AND l.worker_instance_id=? AND l.lease_epoch=? AND l.lease_token_hash=? AND l.status='active' AND l.expires_at>=? AND a.status='running' AND c.cancellation_epoch=? AND c.stage NOT IN ('committed','rejected','unknown','failed','cancelled')")
         .bind(&lease.verification_lease_id).bind(&lease.attempt_id).bind(&lease.worker_instance_id).bind(lease.lease_epoch)
         .bind(hash_secret(&lease.lease_token)).bind(Utc::now().to_rfc3339()).bind(lease.cancellation_epoch)
         .fetch_one(&mut **tx).await?;
@@ -434,4 +884,11 @@ fn hash_json(value: &Value) -> StorageResult<String> {
 }
 fn hash_secret(secret: &str) -> String {
     hex::encode(Sha256::digest(secret.as_bytes()))
+}
+
+fn verification_stage_is_terminal(stage: &str) -> bool {
+    matches!(
+        stage,
+        "committed" | "rejected" | "unknown" | "failed" | "cancelled"
+    )
 }

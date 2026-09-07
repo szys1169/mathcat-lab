@@ -1,0 +1,6 @@
+* text=auto
+# Hash-pinned upstream/writing sources and parser fixtures must retain exact bytes.
+capabilities/mathcat-proof-verification/upstream/** -text
+mathcat-lab/capabilities/math-paper-writing/prompts/** -text
+**/test/fixtures/** -text
+**/tests/fixtures/** -text

@@ -7,23 +7,34 @@
     clippy::too_many_lines
 )]
 
+pub mod research_v2;
+
 mod board;
 mod board_commands;
+mod candidate_ingestion;
 mod control_plane;
 mod distribution;
 mod fact_catalog;
 mod fact_governance;
+#[cfg(feature = "postgres")]
 mod postgres_committer;
+mod problem_intake;
+mod proof_obligations;
 mod publication;
 mod reliability_v2;
+mod route_mutations;
 mod rows;
 mod security;
+mod source_ingestion;
 mod state_writer;
 mod strategy;
+mod suggestions;
+mod task_materialization;
 #[cfg(test)]
 mod tests;
 mod verification;
 mod verification_runtime;
+mod worker_output_ingestion;
 mod write;
 
 use std::{
@@ -37,7 +48,8 @@ use chrono::Utc;
 use research_domain::{
     Artifact, Budget, Candidate, DomainEvent, EntityRef, ExperimentCapsule, Fact, Goal, GraphEdge,
     GraphNode, GraphProjection, HumanCommand, Hypothesis, ProblemContract, Project,
-    ProjectSnapshot, ResearchRound, Route, SourceRecord, Task, Uncertainty, Verification, Worker,
+    ProjectSnapshot, ResearchRound, Route, RouteProposal, SourceRecord, Task, Uncertainty,
+    Verification, Worker,
 };
 use serde_json::{Value, json};
 use sqlx::{
@@ -51,10 +63,19 @@ use ulid::Ulid;
 
 pub use board::BoardInclude;
 pub use board_commands::BoardMutation;
+pub use distribution::{TaskLeaseCompletion, TaskLeaseCompletionRequest};
+#[cfg(feature = "postgres")]
 pub use postgres_committer::{
     PostgresLease, PostgresPlanCommit, PostgresPlanTask, PostgresStateCommitter,
 };
-pub use reliability_v2::{LocalTaskLease, LocalTaskOffer};
+pub use problem_intake::{
+    ProblemDraftBeginRequest, ProblemDraftCompletionRequest, ProblemDraftConfirmationRequest,
+    ProblemDraftControlRequest, ProblemDraftFailureRequest, problem_document_hash,
+    problem_material_manifest_hash,
+};
+pub use reliability_v2::{
+    LocalResultIngestion, LocalResultSubmission, LocalTaskLease, LocalTaskOffer,
+};
 pub use state_writer::StateWriterSnapshot;
 pub use verification::{
     BackendRunDraft, CheckDraft, EvidenceDraft, FindingDraft, ProofNodeDraft,
@@ -62,8 +83,8 @@ pub use verification::{
 };
 pub use verification_runtime::{VerificationWorkerLease, VerificationWorkerOffer};
 pub use write::{
-    CommandDraft, ModelCallRequest, PlanSaveResult, SubmissionReceipt, UsageReservation,
-    VerificationCommit,
+    CommandDraft, ModelCallPurpose, ModelCallRequest, PlanSaveResult, SubmissionReceipt,
+    UsageReservation, VerificationCommit,
 };
 
 #[derive(Debug, Error)]
@@ -102,8 +123,97 @@ pub enum StorageError {
 
 pub type StorageResult<T> = Result<T, StorageError>;
 
+pub(crate) fn route_execution_is_released(project_status: &str, human_review: &str) -> bool {
+    matches!(project_status, "running" | "needs_human_review")
+        && matches!(human_review, "approved" | "not_required")
+}
+
+pub(crate) async fn verification_execution_is_released(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    verification_id: &str,
+) -> StorageResult<bool> {
+    let released: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM verifications v \
+         JOIN candidates c ON c.candidate_id=v.candidate_id AND c.project_id=v.project_id \
+         JOIN projects p ON p.project_id=v.project_id \
+         LEFT JOIN routes r ON r.project_id=v.project_id AND r.route_id=json_extract(c.submission_json,'$.route_id') \
+         WHERE v.verification_id=? AND ( \
+           (p.status='running' AND json_extract(c.submission_json,'$.route_id') IS NULL) OR ( \
+             p.status IN ('running','needs_human_review') \
+             AND r.human_review IN ('approved','not_required') \
+             AND r.status IN ('incubating','active','probation','revived') \
+           ) OR ( \
+             p.status='needs_human_review' \
+             AND EXISTS ( \
+               SELECT 1 FROM fact_challenges fc \
+               WHERE fc.project_id=v.project_id \
+                 AND fc.verification_id=v.verification_id \
+                 AND fc.status='open' \
+             ) \
+           ) \
+         )",
+    )
+    .bind(verification_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(released == 1)
+}
+
+pub(crate) async fn verification_case_execution_is_released(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    case_id: &str,
+) -> StorageResult<bool> {
+    let verification_id: String =
+        sqlx::query_scalar("SELECT verification_id FROM verification_cases WHERE case_id=?")
+            .bind(case_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or_else(|| StorageError::NotFound {
+                kind: "verification_case",
+                id: case_id.into(),
+            })?;
+    verification_execution_is_released(tx, &verification_id).await
+}
+
+pub(crate) fn route_attributes(proposal: &RouteProposal) -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        ("risks".into(), json!(proposal.risks)),
+        ("approach_kind".into(), json!(proposal.approach_kind)),
+        ("route_role".into(), json!(proposal.route_role)),
+        ("user_title".into(), json!(proposal.user_title)),
+        (
+            "plain_language_summary".into(),
+            json!(proposal.plain_language_summary),
+        ),
+        ("why_this_route".into(), json!(proposal.why_this_route)),
+        ("expected_output".into(), json!(proposal.expected_output)),
+        ("relation_to_goal".into(), json!(proposal.relation_to_goal)),
+        ("steps".into(), json!(proposal.steps)),
+        (
+            "expected_subgoals".into(),
+            json!(proposal.expected_subgoals),
+        ),
+    ])
+}
+
+pub(crate) fn merged_route_attributes(
+    existing_json: &str,
+    proposal: &RouteProposal,
+) -> StorageResult<String> {
+    let mut attributes = serde_json::from_str::<BTreeMap<String, Value>>(existing_json)?;
+    for (key, value) in route_attributes(proposal) {
+        let empty = value.as_str().is_some_and(str::is_empty)
+            || value.as_array().is_some_and(Vec::is_empty);
+        if !empty {
+            attributes.insert(key, value);
+        }
+    }
+    json_text(&attributes)
+}
+
 pub(crate) fn normalized_source_identity(
     url: Option<&str>,
+    citation_key: Option<&str>,
 ) -> (Option<String>, Option<String>, Option<String>) {
     let normalized_url = url.and_then(|raw| {
         let without_fragment = raw.trim().split('#').next().unwrap_or_default().trim();
@@ -111,7 +221,17 @@ pub(crate) fn normalized_source_identity(
         (!normalized.is_empty()).then(|| normalized.to_owned())
     });
     let Some(normalized) = normalized_url.as_deref() else {
-        return (None, None, None);
+        let citation_key = citation_key
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        return match citation_key {
+            Some(value) => (
+                None,
+                Some("citation_key".into()),
+                Some(value.to_ascii_lowercase()),
+            ),
+            None => (None, None, None),
+        };
     };
     let lower = normalized.to_ascii_lowercase();
     if let Some(index) = lower.find("doi.org/") {
@@ -265,6 +385,85 @@ impl SqliteStore {
             rows::task,
         )
         .await
+    }
+
+    /// Returns queued work whose own route has cleared its approval gate.
+    ///
+    /// A project may remain in `needs_human_review` while sibling routes are
+    /// pending. In that state only tasks on explicitly approved routes are
+    /// runnable. The same route-local check also prevents a pruned or rejected
+    /// route from borrowing the enclosing project's runnable state.
+    pub async fn list_released_queued_tasks(
+        &self,
+        project_id: &str,
+        round: i64,
+    ) -> StorageResult<Vec<Task>> {
+        let rows = sqlx::query(
+            "SELECT t.* FROM tasks t \
+             JOIN routes r ON r.project_id=t.project_id AND r.route_id=t.route_id \
+             JOIN projects p ON p.project_id=t.project_id \
+             WHERE t.project_id=? AND t.round=? AND t.status='queued' \
+               AND r.status IN ('incubating','active','probation','revived') \
+               AND p.status IN ('running','needs_human_review') \
+               AND r.human_review IN ('approved','not_required') \
+             ORDER BY t.priority DESC,t.task_id",
+        )
+        .bind(project_id)
+        .bind(round)
+        .fetch_all(&self.read_pool)
+        .await?;
+        rows.iter().map(rows::task).collect()
+    }
+
+    pub async fn has_pending_route_reviews(&self, project_id: &str) -> StorageResult<bool> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM routes WHERE project_id=? AND human_review='pending' \
+             AND status NOT IN ('merged','pruned','failed','human_stopped')",
+        )
+        .bind(project_id)
+        .fetch_one(&self.read_pool)
+        .await?;
+        Ok(count > 0)
+    }
+
+    pub async fn round_has_unfinished_tasks(
+        &self,
+        project_id: &str,
+        round: i64,
+    ) -> StorageResult<bool> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tasks WHERE project_id=? AND round=? \
+             AND status IN ('open','queued','assigned','offered','leased','running','checkpointed','result_submitted','ingesting','paused','blocked')",
+        )
+        .bind(project_id)
+        .bind(round)
+        .fetch_one(&self.read_pool)
+        .await?;
+        Ok(count > 0)
+    }
+
+    /// Returns whether the round's currently released execution batch still has
+    /// unfinished work. Tasks behind a pending human route review are not part of
+    /// that batch and must not indefinitely block verification of an approved
+    /// sibling route.
+    pub async fn round_has_unfinished_released_tasks(
+        &self,
+        project_id: &str,
+        round: i64,
+    ) -> StorageResult<bool> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tasks t \
+             JOIN routes r ON r.project_id=t.project_id AND r.route_id=t.route_id \
+             WHERE t.project_id=? AND t.round=? \
+               AND t.status IN ('open','queued','assigned','offered','leased','running','checkpointed','result_submitted','ingesting','paused','blocked') \
+               AND r.status IN ('incubating','active','probation','revived') \
+               AND r.human_review IN ('approved','not_required')",
+        )
+        .bind(project_id)
+        .bind(round)
+        .fetch_one(&self.read_pool)
+        .await?;
+        Ok(count > 0)
     }
 
     pub async fn get_task(&self, project_id: &str, task_id: &str) -> StorageResult<Task> {
@@ -526,9 +725,13 @@ impl SqliteStore {
             .collect()
     }
 
-    pub async fn pending_suggestions(&self, project_id: &str) -> StorageResult<Vec<Value>> {
-        let rows = sqlx::query("SELECT suggestion_id, content, target_route_id, effective_round FROM suggestions WHERE project_id = ? AND status = 'pending' ORDER BY effective_round, suggestion_id")
-            .bind(project_id).fetch_all(&self.read_pool).await?;
+    pub async fn pending_suggestions(
+        &self,
+        project_id: &str,
+        planning_round: i64,
+    ) -> StorageResult<Vec<Value>> {
+        let rows = sqlx::query("SELECT suggestion_id, content, target_route_id, effective_round FROM suggestions WHERE project_id = ? AND status = 'pending' AND effective_round <= ? ORDER BY effective_round, suggestion_id")
+            .bind(project_id).bind(planning_round).fetch_all(&self.read_pool).await?;
         rows.into_iter()
             .map(|row| {
                 Ok(serde_json::json!({
@@ -868,12 +1071,18 @@ pub(crate) async fn append_event(
         "caused_by": caused_by,
         "occurred_at": occurred_at,
     });
-    sqlx::query("INSERT INTO event_outbox(outbox_id,event_id,project_id,event_type,payload_json,status,available_at) VALUES(?,?,?,?,?,'pending',?)")
+    // SQLite's durable `events` table is the local delivery sink. Live SSE/WS
+    // clients replay from it by cursor, so leaving a second undrained pending
+    // queue would report false storage degradation and grow without bound.
+    // The experimental PostgreSQL committer keeps a real pending outbox for an
+    // external dispatcher.
+    sqlx::query("INSERT INTO event_outbox(outbox_id,event_id,project_id,event_type,payload_json,status,available_at,delivered_at) VALUES(?,?,?,?,?,'delivered',?,?)")
         .bind(outbox_id)
         .bind(&event_id)
         .bind(project_id)
         .bind(event_type)
         .bind(serde_json::to_string(&payload)?)
+        .bind(occurred_at.to_rfc3339())
         .bind(occurred_at.to_rfc3339())
         .execute(&mut **tx)
         .await?;

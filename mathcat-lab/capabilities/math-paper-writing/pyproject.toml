@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mathforge-math-paper-writing"
+version = "0.4.0"
+description = "Executor-neutral, versioned mathematics paper writing capability"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+math-paper-writing = "math_paper_writing.cli:main"
+math-paper-writing-harness = "math_paper_writing.harness_cli:main"
+
+[tool.setuptools]
+packages = ["math_paper_writing"]

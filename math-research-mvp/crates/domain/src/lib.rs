@@ -1,4 +1,6 @@
-use std::collections::BTreeMap;
+pub mod research_v2;
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -38,6 +40,7 @@ macro_rules! string_enum {
     (@snake Paused) => { "paused" };
     (@snake Success) => { "success" };
     (@snake PartialSuccess) => { "partial_success" };
+    (@snake EnvironmentFailed) => { "environment_failed" };
     (@snake Refuted) => { "refuted" };
     (@snake NeedsHumanReview) => { "needs_human_review" };
     (@snake StoppedByHuman) => { "stopped_by_human" };
@@ -67,6 +70,7 @@ macro_rules! string_enum {
     (@snake Validated) => { "validated" };
     (@snake WaitingSafePoint) => { "waiting_safe_point" };
     (@snake Applied) => { "applied" };
+    (@snake Deferred) => { "deferred" };
     (@snake Investigating) => { "investigating" };
     (@snake Resolved) => { "resolved" };
     (@snake AcceptedRisk) => { "accepted_risk" };
@@ -77,6 +81,9 @@ macro_rules! string_enum {
     (@snake NextRound) => { "next_round" };
     (@snake SafePoint) => { "safe_point" };
     (@snake Immediate) => { "immediate" };
+    (@snake Automatic) => { "automatic" };
+    (@snake Balanced) => { "balanced" };
+    (@snake Strict) => { "strict" };
     (@snake Theorem) => { "theorem" };
     (@snake Lemma) => { "lemma" };
     (@snake Proposition) => { "proposition" };
@@ -141,6 +148,20 @@ macro_rules! string_enum {
     (@snake Backoff) => { "backoff" };
     (@snake Quarantined) => { "quarantined" };
     (@snake Exited) => { "exited" };
+    (@snake Generating) => { "generating" };
+    (@snake AwaitingConfirmation) => { "awaiting_confirmation" };
+    (@snake Confirmed) => { "confirmed" };
+    (@snake Prompt) => { "prompt" };
+    (@snake Material) => { "material" };
+    (@snake Inferred) => { "inferred" };
+    (@snake Required) => { "required" };
+    (@snake Advisory) => { "advisory" };
+    (@snake Satisfied) => { "satisfied" };
+    (@snake DependsOn) => { "depends_on" };
+    (@snake Refines) => { "refines" };
+    (@snake Supports) => { "supports" };
+    (@snake Satisfies) => { "satisfies" };
+    (@snake Insufficient) => { "insufficient" };
 }
 
 string_enum!(ProjectStatus {
@@ -149,10 +170,22 @@ string_enum!(ProjectStatus {
     Paused,
     Success,
     PartialSuccess,
+    EnvironmentFailed,
     Refuted,
     NeedsHumanReview,
     StoppedByHuman,
     Error,
+});
+string_enum!(ProblemDraftStatus {
+    Generating,
+    AwaitingConfirmation,
+    Confirmed,
+    Failed,
+});
+string_enum!(ProblemAssumptionProvenance {
+    Prompt,
+    Material,
+    Inferred,
 });
 string_enum!(RoundStatus {
     Created,
@@ -258,6 +291,16 @@ string_enum!(CommandMode {
     SafePoint,
     Immediate
 });
+string_enum!(ReviewMode {
+    Automatic,
+    Balanced,
+    Strict
+});
+string_enum!(SuggestionDisposition {
+    Applied,
+    Deferred,
+    Rejected
+});
 string_enum!(UncertaintyStatus {
     Open,
     Investigating,
@@ -336,6 +379,20 @@ string_enum!(ProofNodeStatus {
     Pruned,
     Cancelled,
 });
+string_enum!(ProofObligationStatus {
+    Open,
+    Satisfied,
+    Blocked,
+    Obsolete,
+});
+string_enum!(ProofObligationNecessity { Required, Advisory });
+string_enum!(ObligationEdgeKind { DependsOn, Refines });
+string_enum!(ObligationCoverageDisposition {
+    Supports,
+    Satisfies,
+    Insufficient,
+    Unknown,
+});
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Budget {
@@ -356,6 +413,85 @@ impl Default for Budget {
             max_total_model_calls: 120,
         }
     }
+}
+
+/// One proposed assumption together with the source class from which it was derived.
+///
+/// Generated and material-derived assumptions remain proposals until the user confirms the
+/// enclosing problem document.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProblemAssumption {
+    pub statement: String,
+    pub provenance: ProblemAssumptionProvenance,
+}
+
+/// A bounded material snapshot considered while expanding a vague problem prompt.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProblemMaterial {
+    pub relative_path: String,
+    pub media_type: String,
+    pub byte_size: u64,
+    pub included_bytes: u64,
+    pub sha256: String,
+    pub status: String,
+    pub warning: Option<String>,
+}
+
+/// The complete, user-reviewable problem definition produced by the intake generator.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProblemDocument {
+    pub name: String,
+    pub problem: String,
+    pub target_statement: String,
+    #[serde(default)]
+    pub assumptions: Vec<ProblemAssumption>,
+    pub success_criteria: String,
+    pub budget: Budget,
+    #[serde(default)]
+    pub human_route_approval: bool,
+    pub budget_rationale: String,
+    #[serde(default)]
+    pub generation_notes: Vec<String>,
+    #[serde(default)]
+    pub unresolved_questions: Vec<String>,
+    #[serde(default)]
+    pub material_references: Vec<String>,
+}
+
+/// Durable pre-project intake state. A draft cannot create research state until confirmation.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProblemDraft {
+    pub draft_id: String,
+    pub requested_by: String,
+    pub creation_idempotency_key: String,
+    pub creation_request_hash: String,
+    pub prompt: String,
+    pub material_directory: String,
+    #[serde(default)]
+    pub materials: Vec<ProblemMaterial>,
+    pub status: ProblemDraftStatus,
+    pub revision: i64,
+    pub document: Option<ProblemDocument>,
+    pub document_hash: Option<String>,
+    pub material_manifest_hash: String,
+    pub model: Option<String>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub elapsed_ms: i64,
+    pub error_kind: Option<String>,
+    pub error_message: Option<String>,
+    pub confirmation_idempotency_key: Option<String>,
+    pub confirmation_request_hash: Option<String>,
+    pub confirmed_project_id: Option<String>,
+    pub start_command_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub generation_completed_at: Option<DateTime<Utc>>,
+    pub confirmed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -387,8 +523,22 @@ pub struct Project {
     pub revision: i64,
     pub current_round: i64,
     pub budget: Budget,
+    /// Durable collaboration policy. `human_route_approval` is retained as a
+    /// compatibility projection for older clients.
+    pub review_mode: ReviewMode,
+    pub human_route_approval: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// The idempotent result of confirming a problem draft and optionally queuing project start.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProblemDraftConfirmation {
+    pub draft: ProblemDraft,
+    pub project: Project,
+    pub start_command: Option<HumanCommand>,
+    pub replayed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -476,6 +626,67 @@ pub struct Goal {
     pub created_in_round: i64,
 }
 
+/// A first-class statement whose proof coverage can be tracked independently of execution.
+///
+/// `Required` obligations participate in the fail-closed Goal gate. Verifier-generated repair
+/// suggestions are always `Advisory`: model output cannot silently become a logical premise.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ProofObligation {
+    pub obligation_id: String,
+    pub project_id: String,
+    pub goal_id: Option<String>,
+    pub parent_obligation_id: Option<String>,
+    pub source_kind: String,
+    pub statement: String,
+    pub completion_criteria: String,
+    pub necessity: ProofObligationNecessity,
+    pub status: ProofObligationStatus,
+    pub priority: f64,
+    pub source_verification_id: Option<String>,
+    pub source_bottleneck_id: Option<String>,
+    pub source_fingerprint: String,
+    #[schema(value_type = Object)]
+    pub provenance: Value,
+    pub satisfied_by_fact_id: Option<String>,
+    pub created_revision: i64,
+    pub updated_revision: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A typed structural relation in the obligation graph.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ObligationEdge {
+    pub edge_id: String,
+    pub project_id: String,
+    pub source_obligation_id: String,
+    pub target_obligation_id: String,
+    pub kind: ObligationEdgeKind,
+    pub created_at: DateTime<Utc>,
+}
+
+/// The auditable disposition of one candidate against one root obligation.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CandidateObligationCoverage {
+    pub coverage_id: String,
+    pub project_id: String,
+    pub candidate_id: String,
+    pub obligation_id: String,
+    pub verification_id: String,
+    pub disposition: ObligationCoverageDisposition,
+    pub fact_id: Option<String>,
+    pub rationale: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Read-only aggregate used by operators and the HTTP API.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ProofObligationGraph {
+    pub obligations: Vec<ProofObligation>,
+    pub edges: Vec<ObligationEdge>,
+    pub coverage: Vec<CandidateObligationCoverage>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Hypothesis {
     pub hypothesis_id: String,
@@ -510,6 +721,7 @@ pub struct Fact {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CandidateSubmission {
     pub task_id: String,
     pub route_id: String,
@@ -596,6 +808,198 @@ pub struct VerificationPolicy {
     pub require_fresh_replay: bool,
     pub max_attempts: u32,
     pub created_at: DateTime<Utc>,
+}
+
+/// Canonical execution requirements derived from `VerificationPolicy::required_checks`.
+///
+/// The scalar/boolean fields retained on `VerificationPolicy` are compatibility projections
+/// for persisted V2 rows. New code must derive execution behavior from this value and validate
+/// those projections rather than treating them as independent policy inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalVerificationRequirements {
+    required_checks: BTreeSet<String>,
+    reviewer_kinds: Vec<String>,
+    independent_reviewer_count: u32,
+}
+
+impl CanonicalVerificationRequirements {
+    const FORMAL_PIPELINE_CHECKS: [&'static str; 5] = [
+        "semantic_contract",
+        "alignment_review",
+        "lean_kernel",
+        "package_integrity",
+        "fresh_replay",
+    ];
+
+    /// Builds and validates the canonical policy representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for duplicate/blank checks, malformed reviewer sequences, a missing
+    /// deterministic precheck, or a partially specified formal-certification pipeline.
+    pub fn from_required_checks(required_checks: &[String]) -> Result<Self, String> {
+        let mut checks = BTreeSet::new();
+        for check in required_checks {
+            if check.is_empty() || check.trim() != check {
+                return Err(
+                    "verification required checks must be non-empty canonical names".into(),
+                );
+            }
+            if !checks.insert(check.clone()) {
+                return Err(format!("duplicate verification required check {check}"));
+            }
+        }
+        if !checks.contains("deterministic_precheck") {
+            return Err("verification policy must require deterministic_precheck".into());
+        }
+
+        let mut reviewer_indexes = Vec::new();
+        for check in &checks {
+            let Some(suffix) = check.strip_prefix("math_review_") else {
+                continue;
+            };
+            let index = suffix
+                .parse::<u32>()
+                .map_err(|_| format!("invalid mathematical reviewer check name {check}"))?;
+            if !(1..=3).contains(&index) {
+                return Err(format!(
+                    "mathematical reviewer check {check} is outside the supported range 1..=3"
+                ));
+            }
+            reviewer_indexes.push(index);
+        }
+        reviewer_indexes.sort_unstable();
+        let reviewer_count = u32::try_from(reviewer_indexes.len())
+            .map_err(|error| format!("mathematical reviewer count overflow: {error}"))?;
+        if reviewer_count == 0 {
+            return Err("verification policy must require at least math_review_1".into());
+        }
+        let expected_indexes = (1..=reviewer_count).collect::<Vec<_>>();
+        if reviewer_indexes != expected_indexes {
+            return Err(
+                "mathematical reviewer checks must be contiguous from math_review_1".into(),
+            );
+        }
+        if checks.contains("reviewer_independence") != (reviewer_count > 1) {
+            return Err(
+                "reviewer_independence must be required exactly when multiple mathematical reviewers are required"
+                    .into(),
+            );
+        }
+
+        let formal_check_count = Self::FORMAL_PIPELINE_CHECKS
+            .iter()
+            .filter(|check| checks.contains(**check))
+            .count();
+        if formal_check_count != 0 && formal_check_count != Self::FORMAL_PIPELINE_CHECKS.len() {
+            return Err(
+                "formal verification requires semantic_contract, alignment_review, lean_kernel, package_integrity, and fresh_replay as one complete bundle"
+                    .into(),
+            );
+        }
+
+        let mut reviewer_kinds = expected_indexes
+            .into_iter()
+            .map(|index| format!("math_review_{index}"))
+            .collect::<Vec<_>>();
+        for kind in ["citation_review", "adversarial_review"] {
+            if checks.contains(kind) {
+                reviewer_kinds.push(kind.into());
+            }
+        }
+        Ok(Self {
+            required_checks: checks,
+            reviewer_kinds,
+            independent_reviewer_count: reviewer_count,
+        })
+    }
+
+    #[must_use]
+    pub fn reviewer_kinds(&self) -> &[String] {
+        &self.reviewer_kinds
+    }
+
+    #[must_use]
+    pub fn independent_reviewer_count(&self) -> u32 {
+        self.independent_reviewer_count
+    }
+
+    #[must_use]
+    pub fn requires_check(&self, check: &str) -> bool {
+        self.required_checks.contains(check)
+    }
+
+    #[must_use]
+    pub fn requires_formal_pipeline(&self) -> bool {
+        Self::FORMAL_PIPELINE_CHECKS
+            .iter()
+            .all(|check| self.required_checks.contains(*check))
+    }
+
+    /// Validates the compatibility projection stored in legacy V2 columns.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a projected count or flag disagrees with `required_checks`.
+    pub fn validate_projection(
+        &self,
+        independent_reviewer_count: u32,
+        projected_required_checks: &[&str],
+    ) -> Result<(), String> {
+        const PROJECTED_CHECKS: [&str; 4] = [
+            "citation_review",
+            "adversarial_review",
+            "alignment_review",
+            "fresh_replay",
+        ];
+
+        if independent_reviewer_count != self.independent_reviewer_count {
+            return Err(format!(
+                "independent_reviewer_count {independent_reviewer_count} disagrees with required_checks ({})",
+                self.independent_reviewer_count
+            ));
+        }
+        let expected = PROJECTED_CHECKS
+            .into_iter()
+            .filter(|check| self.requires_check(check))
+            .collect::<BTreeSet<_>>();
+        let actual = projected_required_checks
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if actual != expected {
+            return Err(format!(
+                "legacy verification requirement flags {actual:?} disagree with required_checks {expected:?}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl VerificationPolicy {
+    /// Returns the single canonical interpretation of this persisted policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the canonical checks are invalid or a compatibility projection
+    /// disagrees with them.
+    pub fn canonical_requirements(&self) -> Result<CanonicalVerificationRequirements, String> {
+        let requirements =
+            CanonicalVerificationRequirements::from_required_checks(&self.required_checks)?;
+        let projected_required_checks = [
+            self.require_citation_review.then_some("citation_review"),
+            self.require_adversarial_review
+                .then_some("adversarial_review"),
+            self.require_alignment_review.then_some("alignment_review"),
+            self.require_fresh_replay.then_some("fresh_replay"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        requirements
+            .validate_projection(self.independent_reviewer_count, &projected_required_checks)?;
+        Ok(requirements)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1158,10 +1562,22 @@ pub struct ProjectSnapshot {
 pub struct BoardCapabilities {
     pub can_edit_problem: bool,
     pub can_propose_route: bool,
+    pub can_create_route: bool,
     pub can_approve_route: bool,
+    pub can_force_goal_review: bool,
+    pub can_manage_settings: bool,
     pub can_control_project: bool,
     pub can_control_tasks: bool,
     pub can_govern_facts: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BoardResearchSettings {
+    pub budget: Budget,
+    pub review_mode: ReviewMode,
+    /// Compatibility projection consumed by older `MathCat Lab` clients.
+    pub human_route_approval: bool,
+    pub running_task_policy: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1181,6 +1597,22 @@ pub struct BoardRoute {
     pub route_id: String,
     pub title: String,
     pub method_summary: String,
+    #[serde(default)]
+    pub approach_kind: String,
+    #[serde(default)]
+    pub route_role: String,
+    #[serde(default)]
+    pub user_title: String,
+    #[serde(default)]
+    pub plain_language_summary: String,
+    #[serde(default)]
+    pub why_this_route: String,
+    #[serde(default)]
+    pub expected_output: String,
+    #[serde(default)]
+    pub relation_to_goal: String,
+    #[serde(default)]
+    pub steps: Vec<String>,
     pub status: String,
     pub human_review: String,
     pub progress: f64,
@@ -1202,6 +1634,18 @@ pub struct BoardClaim {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BoardPlanningSuggestion {
+    pub suggestion_id: String,
+    pub content: String,
+    pub target_route_id: Option<String>,
+    pub status: String,
+    #[schema(value_type = Option<Object>)]
+    pub decision: Option<Value>,
+    pub created_in_round: i64,
+    pub effective_round: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResearchBoardView {
     pub schema_version: i64,
     pub project_id: String,
@@ -1211,11 +1655,13 @@ pub struct ResearchBoardView {
     pub revision: i64,
     pub event_cursor: i64,
     pub problem: ProblemContract,
+    pub settings: BoardResearchSettings,
     pub summary: BoardSummary,
     pub routes: Vec<BoardRoute>,
     pub goals: Vec<Goal>,
     pub claims: Vec<BoardClaim>,
     pub failed_routes: Vec<BoardRoute>,
+    pub planning_suggestions: Vec<BoardPlanningSuggestion>,
     pub human_questions: Vec<Value>,
     pub uncertainties: Vec<Uncertainty>,
     pub tasks: Vec<Task>,
@@ -1228,6 +1674,7 @@ pub struct ResearchBoardView {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ProblemRevisionRequest {
     pub expected_revision: i64,
     pub target_statement: String,
@@ -1248,6 +1695,7 @@ pub struct ProblemRevisionResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct HumanRouteProposalRequest {
     pub expected_revision: i64,
     pub title: String,
@@ -1289,10 +1737,75 @@ pub struct HumanRouteProposalResult {
     pub route_id: Option<String>,
 }
 
+/// A human-authored route that bypasses generative Planner selection while
+/// retaining every V2 execution and verification trust boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HumanRouteCreateRequest {
+    pub expected_revision: i64,
+    pub title: String,
+    pub method_summary: String,
+    #[serde(default)]
+    pub approach_kind: String,
+    #[serde(default)]
+    pub route_role: String,
+    #[serde(default)]
+    pub plain_language_summary: String,
+    #[serde(default)]
+    pub steps: Vec<String>,
+    #[serde(default)]
+    pub target_goal_ids: Vec<String>,
+    #[serde(default)]
+    pub required_fact_ids: Vec<String>,
+    #[serde(default)]
+    pub known_risks: Vec<String>,
+    #[serde(default = "default_human_route_worker_role")]
+    pub worker_role: String,
+    pub objective: String,
+    pub completion_contract: String,
+    #[serde(default = "default_human_route_priority")]
+    pub priority: f64,
+    pub reason: String,
+}
+
+fn default_human_route_worker_role() -> String {
+    "prover".into()
+}
+
+const fn default_human_route_priority() -> f64 {
+    0.9
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct HumanRouteCreateResult {
+    pub command_id: String,
+    pub route_id: String,
+    pub task_id: String,
+    pub plan_revision_id: String,
+    pub execution_started: bool,
+    pub status: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RouteProposal {
     pub title: String,
     pub method_summary: String,
+    #[serde(default)]
+    pub approach_kind: String,
+    #[serde(default)]
+    pub route_role: String,
+    #[serde(default)]
+    pub user_title: String,
+    #[serde(default)]
+    pub plain_language_summary: String,
+    #[serde(default)]
+    pub why_this_route: String,
+    #[serde(default)]
+    pub expected_output: String,
+    #[serde(default)]
+    pub relation_to_goal: String,
+    #[serde(default)]
+    pub steps: Vec<String>,
     #[serde(default)]
     pub target_goal_ids: Vec<String>,
     #[serde(default)]
@@ -1342,6 +1855,13 @@ pub struct AssignmentDraft {
     pub priority: f64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SuggestionDecision {
+    pub suggestion_id: String,
+    pub disposition: SuggestionDisposition,
+    pub rationale: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PlannerOutput {
     pub rationale_summary: String,
@@ -1349,8 +1869,10 @@ pub struct PlannerOutput {
     pub assignments: Vec<AssignmentDraft>,
     #[serde(default)]
     pub targeted_uncertainty_ids: Vec<String>,
+    /// Missing legacy fields remain safe (no suggestion is resolved); legacy free-form strings
+    /// intentionally fail closed because they cannot identify a suggestion unambiguously.
     #[serde(default)]
-    pub suggestion_decisions: Vec<String>,
+    pub suggestion_decisions: Vec<SuggestionDecision>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1364,9 +1886,13 @@ pub struct RouteGeneratorOutput {
 pub struct RouteReflection {
     pub route_index: usize,
     pub changes_problem: bool,
+    /// Uses a conclusion as established without permission from the Problem Contract or
+    /// certification by an active Fact. Planning to prove, refute, or test an unknown bridge
+    /// is not such use; `blockers` must identify the assumed conclusion and route location.
     pub uses_unverified_claims: bool,
     pub conflicts_with_facts: bool,
     pub repeats_failure_pattern: bool,
+    /// Promises a concrete future artifact and check criterion, not an already produced result.
     pub has_verifiable_milestone: bool,
     pub risk_score: f64,
     #[serde(default)]
@@ -1383,6 +1909,8 @@ pub struct RouteReflection {
     pub unjustified_narrowing: bool,
     #[serde(default)]
     pub remaining_goal_gaps_if_successful: Vec<String>,
+    /// Includes pending research obligations; when `uses_unverified_claims` is true, also
+    /// identifies the conclusion being assumed, its route location, and the misuse.
     pub blockers: Vec<String>,
     pub suggestions: Vec<String>,
 }
@@ -1445,7 +1973,8 @@ pub struct SupervisorOutput {
     pub rationale_summary: String,
     pub assignments: Vec<AssignmentDraft>,
     pub targeted_uncertainty_ids: Vec<String>,
-    pub suggestion_decisions: Vec<String>,
+    #[serde(default)]
+    pub suggestion_decisions: Vec<SuggestionDecision>,
     pub deferred_route_indices: Vec<usize>,
 }
 
@@ -1592,6 +2121,8 @@ pub struct FactImpact {
     pub fact_id: String,
     pub affected_fact_ids: Vec<String>,
     pub reopened_goal_ids: Vec<String>,
+    #[serde(default)]
+    pub reopened_obligation_ids: Vec<String>,
     pub paused_route_ids: Vec<String>,
 }
 
@@ -1724,6 +2255,10 @@ pub struct ResearchDelta {
     pub completed_task_attempt_ids: Vec<String>,
     pub failed_or_expired_attempt_ids: Vec<String>,
     pub human_command_ids: Vec<String>,
+    /// Auditable planning-relevant command payloads. These are directives, not
+    /// mathematical premises.
+    #[serde(default)]
+    pub human_commands: Vec<Value>,
     pub route_state_changes: Vec<Value>,
     pub status: String,
     pub consumed_by_plan_revision_id: Option<String>,
@@ -1928,13 +2463,14 @@ pub struct PlannerHealth {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct StorageHealth {
     pub mode: String,
+    pub state_writer_status: String,
+    pub state_writer_last_command_kind: Option<String>,
     pub state_writer_queue_depth: i64,
     pub state_writer_queue_capacity: i64,
     pub state_writer_admitted_total: i64,
     pub state_writer_completed_total: i64,
     pub state_writer_queue_wait_seconds: f64,
     pub state_writer_last_transaction_seconds: f64,
-    pub sqlite_busy_total: i64,
     pub outbox_pending: i64,
     pub outbox_oldest_age_seconds: Option<i64>,
     pub orphaned_task_attempts: i64,
@@ -1944,13 +2480,23 @@ pub struct StorageHealth {
 
 #[cfg(test)]
 mod tests {
-    use super::RouteProposal;
+    use serde_json::json;
+
+    use super::{CanonicalVerificationRequirements, RouteProposal, SupervisorOutput};
 
     #[test]
     fn route_score_uses_configured_architecture_weights() {
         let route = RouteProposal {
             title: "route".into(),
             method_summary: "method".into(),
+            approach_kind: String::new(),
+            route_role: String::new(),
+            user_title: String::new(),
+            plain_language_summary: String::new(),
+            why_this_route: String::new(),
+            expected_output: String::new(),
+            relation_to_goal: String::new(),
+            steps: vec![],
             target_goal_ids: vec![],
             required_fact_ids: vec![],
             expected_subgoals: vec![],
@@ -1966,5 +2512,101 @@ mod tests {
             risks: vec![],
         };
         assert!((route.score() - 0.7).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn suggestion_decision_serde_defaults_missing_legacy_field_but_rejects_ambiguous_strings() {
+        let missing = serde_json::from_value::<SupervisorOutput>(json!({
+            "rationale_summary":"legacy output without suggestion decisions",
+            "assignments":[],
+            "targeted_uncertainty_ids":[],
+            "deferred_route_indices":[]
+        }))
+        .expect("missing legacy field is a safe empty decision set");
+        assert!(missing.suggestion_decisions.is_empty());
+
+        assert!(
+            serde_json::from_value::<SupervisorOutput>(json!({
+                "rationale_summary":"ambiguous legacy decision",
+                "assignments":[],
+                "targeted_uncertainty_ids":[],
+                "suggestion_decisions":["apply the first suggestion"],
+                "deferred_route_indices":[]
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<SupervisorOutput>(json!({
+                "rationale_summary":"invalid typed decision",
+                "assignments":[],
+                "targeted_uncertainty_ids":[],
+                "suggestion_decisions":[{
+                    "suggestion_id":"suggestion-1",
+                    "disposition":"considered",
+                    "rationale":"not a legal disposition"
+                }],
+                "deferred_route_indices":[]
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn canonical_verification_requirements_drive_reviewers_and_formal_execution() {
+        let requirements = CanonicalVerificationRequirements::from_required_checks(&[
+            "deterministic_precheck".into(),
+            "math_review_1".into(),
+            "math_review_2".into(),
+            "reviewer_independence".into(),
+            "citation_review".into(),
+            "adversarial_review".into(),
+            "semantic_contract".into(),
+            "alignment_review".into(),
+            "lean_kernel".into(),
+            "package_integrity".into(),
+            "fresh_replay".into(),
+        ])
+        .expect("canonical requirements");
+        assert_eq!(
+            requirements.reviewer_kinds(),
+            [
+                "math_review_1",
+                "math_review_2",
+                "citation_review",
+                "adversarial_review"
+            ]
+        );
+        assert!(requirements.requires_formal_pipeline());
+        requirements
+            .validate_projection(
+                2,
+                &[
+                    "citation_review",
+                    "adversarial_review",
+                    "alignment_review",
+                    "fresh_replay",
+                ],
+            )
+            .expect("matching compatibility projection");
+    }
+
+    #[test]
+    fn canonical_verification_requirements_reject_partial_or_ambiguous_policies() {
+        let missing_independence = CanonicalVerificationRequirements::from_required_checks(&[
+            "deterministic_precheck".into(),
+            "math_review_1".into(),
+            "math_review_2".into(),
+        ])
+        .expect_err("two reviewers without independence gate must fail");
+        assert!(missing_independence.contains("reviewer_independence"));
+
+        let partial_formal = CanonicalVerificationRequirements::from_required_checks(&[
+            "deterministic_precheck".into(),
+            "math_review_1".into(),
+            "alignment_review".into(),
+            "fresh_replay".into(),
+        ])
+        .expect_err("partial formal bundle must fail");
+        assert!(partial_formal.contains("formal verification requires"));
     }
 }

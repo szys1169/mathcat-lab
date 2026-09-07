@@ -1,14 +1,22 @@
 use std::{
     net::SocketAddr,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::Arc,
 };
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use research_core::{ResearchConfig, ResearchService};
-use research_domain::{Budget, ProblemContract, ProjectStatus, WorkerOutput};
-use research_storage::{CommandDraft, PostgresStateCommitter, SqliteStore};
+use research_core::{
+    HARD_MAX_VERIFICATION_CONCURRENCY, ResearchConfig, ResearchService,
+    render_problem_document_markdown,
+};
+use research_domain::{
+    Budget, ProblemContract, ProblemDocument, ProblemDraft, ProblemDraftStatus, ProjectStatus,
+    WorkerOutput,
+};
+#[cfg(feature = "postgres")]
+use research_storage::PostgresStateCommitter;
+use research_storage::{CommandDraft, ProblemDraftConfirmationRequest, SqliteStore};
 use research_worker_runtime::{
     AgentBackend, AgentSpec, AgentTask, AgentTaskKind, CodexCliBackend, CodexCliConfig,
     InteractiveProofBackend, LeanKernelBackend, LeanKernelConfig, PantographBackend,
@@ -38,6 +46,9 @@ struct Cli {
     runtime_root: PathBuf,
     #[arg(long, env = "MRA_OUTPUT_ROOT", default_value = "output")]
     output_root: PathBuf,
+    /// 问题生成器允许读取的本地材料根目录。
+    #[arg(long, env = "MRA_PROBLEM_MATERIAL_ROOT", default_value = ".")]
+    material_root: PathBuf,
     #[arg(long, env = "MRA_CODEX_COMMAND", default_value = "codex.cmd")]
     codex_command: PathBuf,
     #[arg(long, env = "MRA_LAKE_COMMAND", default_value = "lake")]
@@ -59,8 +70,40 @@ struct Cli {
     model: Option<String>,
     #[arg(long, env = "MRA_PLANNER_TIMEOUT_SECONDS", default_value_t = 20 * 60)]
     planner_timeout_seconds: u64,
+    #[arg(long, env = "MRA_PLANNER_ROUND_TIMEOUT_SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
+    planner_round_timeout_seconds: Option<u64>,
+    #[arg(long, env = "MRA_WORKER_TIMEOUT_SECONDS", default_value_t = 45 * 60, value_parser = clap::value_parser!(u64).range(1..))]
+    worker_timeout_seconds: u64,
+    #[arg(long, env = "MRA_VERIFIER_TIMEOUT_SECONDS", default_value_t = 30 * 60, value_parser = clap::value_parser!(u64).range(1..))]
+    verifier_timeout_seconds: u64,
+    #[arg(
+        long,
+        env = "MRA_PROBLEM_GENERATOR_MAX_CONCURRENCY",
+        default_value_t = 2
+    )]
+    problem_generator_max_concurrency: usize,
+    /// 全服务同时运行的候选验证流水线数；每条流水线内部仍按持久化验证策略执行。
+    #[arg(
+        long,
+        env = "MRA_VERIFICATION_MAX_CONCURRENCY",
+        default_value_t = 2,
+        value_parser = parse_verification_concurrency
+    )]
+    verification_max_concurrency: usize,
     #[command(subcommand)]
     command: Commands,
+}
+
+fn parse_verification_concurrency(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|error| format!("invalid verification concurrency: {error}"))?;
+    if !(1..=HARD_MAX_VERIFICATION_CONCURRENCY).contains(&parsed) {
+        return Err(format!(
+            "verification concurrency must be between 1 and {HARD_MAX_VERIFICATION_CONCURRENCY}"
+        ));
+    }
+    Ok(parsed)
 }
 
 #[derive(Debug, Subcommand)]
@@ -72,7 +115,8 @@ enum Commands {
     },
     /// 检查数据库、目录和 Codex CLI。
     Doctor,
-    /// 连接 PostgreSQL、应用生产 State Committer 迁移并检查连接池。
+    /// 连接实验性 PostgreSQL State Committer（需启用 postgres feature）。
+    #[cfg(feature = "postgres")]
     PostgresDoctor {
         #[arg(long, env = "MRA_POSTGRES_URL")]
         postgres_url: String,
@@ -106,6 +150,46 @@ enum Commands {
         max_model_calls_per_task: u32,
         #[arg(long, default_value_t = 120)]
         max_total_model_calls: u32,
+    },
+    /// 从模糊提示词和根目录下的有界材料生成待人工确认的问题文档。
+    GenerateProblem {
+        #[arg(
+            long,
+            conflicts_with = "prompt_file",
+            required_unless_present = "prompt_file"
+        )]
+        prompt: Option<String>,
+        /// 从 UTF-8 文件读取提示词。
+        #[arg(long, conflicts_with = "prompt")]
+        prompt_file: Option<PathBuf>,
+        /// 相对 `--material-root` 的材料目录。
+        #[arg(long, default_value = ".")]
+        context_dir: PathBuf,
+        /// 可选的稳定幂等键，用于安全重放生成请求。
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    /// 查看已持久化的问题草稿。
+    ShowProblemDraft { draft_id: String },
+    /// 确认问题草稿；默认启动并持续执行研究。
+    ConfirmProblem {
+        draft_id: String,
+        #[arg(long)]
+        expected_revision: i64,
+        #[arg(long)]
+        expected_document_hash: String,
+        /// 可选的用户编辑后完整 `ProblemDocument` JSON。
+        #[arg(long)]
+        document_file: Option<PathBuf>,
+        /// 明确确认已阅读材料跳过、截断等警告。
+        #[arg(long)]
+        acknowledge_material_warnings: bool,
+        /// 仅创建项目，不启动研究。
+        #[arg(long)]
+        no_start: bool,
+        /// 可选的稳定幂等键，用于安全重放确认请求。
+        #[arg(long)]
+        idempotency_key: Option<String>,
     },
     /// 从持久状态持续运行项目直到终态。
     Run { project_id: String },
@@ -150,6 +234,7 @@ async fn main() -> Result<()> {
         )
         .init();
     let cli = Cli::parse();
+    #[cfg(feature = "postgres")]
     if let Commands::PostgresDoctor {
         postgres_url,
         max_connections,
@@ -213,9 +298,15 @@ async fn main() -> Result<()> {
         ResearchConfig {
             runtime_root: cli.runtime_root.clone(),
             output_root: cli.output_root.clone(),
+            material_root: cli.material_root.clone(),
             model: cli.model.clone(),
             lean_project_root: Some(cli.lean_project_root.clone()),
             planner_timeout_seconds: cli.planner_timeout_seconds,
+            planner_round_timeout_seconds: cli.planner_round_timeout_seconds,
+            worker_timeout_seconds: cli.worker_timeout_seconds,
+            verifier_timeout_seconds: cli.verifier_timeout_seconds,
+            problem_generator_max_concurrency: cli.problem_generator_max_concurrency,
+            verification_max_concurrency: cli.verification_max_concurrency,
             ..ResearchConfig::default()
         },
     );
@@ -223,6 +314,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Serve { bind } => serve(service, bind).await,
         Commands::Doctor => doctor(&cli, &service).await,
+        #[cfg(feature = "postgres")]
         Commands::PostgresDoctor { .. } => unreachable!("handled before SQLite initialization"),
         Commands::Create {
             name,
@@ -245,7 +337,7 @@ async fn main() -> Result<()> {
                         target_statement: target.unwrap_or(problem),
                         assumptions,
                         success_criteria:
-                            "目标陈述得到 accepted 裁决，依赖闭包均为 active，且无阻塞不确定性"
+                            "主目标由 FullyCertified 证据证明或否证；证明完成须全部主目标闭合、required 证明义务满足、依赖事实为 active，且无高危阻塞不确定性"
                                 .into(),
                         version: 1,
                     },
@@ -261,13 +353,107 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&project)?);
             Ok(())
         }
+        Commands::GenerateProblem {
+            prompt,
+            prompt_file,
+            context_dir,
+            idempotency_key,
+        } => {
+            let prompt = read_prompt(prompt, prompt_file.as_deref()).await?;
+            validate_relative_context_directory(&context_dir)?;
+            let idempotency_key = idempotency_key
+                .unwrap_or_else(|| format!("cli-generate-problem-{}", ulid::Ulid::new()));
+            let draft = service
+                .generate_problem_draft(
+                    "cli:researcher",
+                    &idempotency_key,
+                    prompt.trim(),
+                    &context_dir,
+                )
+                .await?;
+            print_problem_draft(&draft)?;
+            Ok(())
+        }
+        Commands::ShowProblemDraft { draft_id } => {
+            let draft = service.store().get_problem_draft(&draft_id).await?;
+            print_problem_draft(&draft)?;
+            Ok(())
+        }
+        Commands::ConfirmProblem {
+            draft_id,
+            expected_revision,
+            expected_document_hash,
+            document_file,
+            acknowledge_material_warnings,
+            no_start,
+            idempotency_key,
+        } => {
+            let edited_document = match document_file.as_deref() {
+                Some(path) => Some(read_problem_document(path).await?),
+                None => None,
+            };
+            let idempotency_key = idempotency_key
+                .unwrap_or_else(|| format!("cli-confirm-problem-{}", ulid::Ulid::new()));
+            let confirmation = service
+                .confirm_problem_draft(ProblemDraftConfirmationRequest {
+                    draft_id: &draft_id,
+                    expected_revision,
+                    expected_document_hash: &expected_document_hash,
+                    idempotency_key: &idempotency_key,
+                    requested_by: "cli:researcher",
+                    start: !no_start,
+                    edited_document: edited_document.as_ref(),
+                    acknowledge_material_warnings,
+                })
+                .await?;
+            let preview_markdown = confirmation
+                .draft
+                .document
+                .as_ref()
+                .map(render_problem_document_markdown);
+            let project_id = confirmation.project.project_id.clone();
+
+            if no_start {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "confirmation": confirmation,
+                        "preview_markdown": preview_markdown,
+                    }))?
+                );
+                return Ok(());
+            }
+
+            // Confirmation synchronously applies the durable start command. Waiting on the same
+            // project lock keeps this short-lived CLI process alive until the scheduled runner
+            // reaches a terminal state.
+            Box::pin(service.run_project_until_terminal(&project_id)).await?;
+            let final_project = service.store().get_project(&project_id).await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "confirmation": confirmation,
+                    "preview_markdown": preview_markdown,
+                    "final_project": final_project,
+                }))?
+            );
+            if final_project.status == ProjectStatus::EnvironmentFailed {
+                bail!(
+                    "research environment failed before producing any valid model output; inspect usage records and backend configuration"
+                );
+            }
+            Ok(())
+        }
         Commands::Run { project_id } => {
             ensure_running(&service, &project_id).await?;
             Box::pin(service.run_project_until_terminal(&project_id)).await?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&service.store().get_project(&project_id).await?)?
-            );
+            let project = service.store().get_project(&project_id).await?;
+            println!("{}", serde_json::to_string_pretty(&project)?);
+            if project.status == ProjectStatus::EnvironmentFailed {
+                bail!(
+                    "research environment failed before producing any valid model output; inspect usage records and backend configuration"
+                );
+            }
             Ok(())
         }
         Commands::RunOnce { project_id } => {
@@ -373,6 +559,27 @@ async fn serve(service: ResearchService, bind: SocketAddr) -> Result<()> {
         .run_reconciliation(None, "service_startup")
         .await
         .context("startup reconciliation failed")?;
+    let recovered_problem_drafts = service
+        .recover_interrupted_problem_drafts()
+        .await
+        .context("problem-draft recovery failed")?;
+    if recovered_problem_drafts > 0 {
+        info!(
+            recovered_problem_drafts,
+            "marked interrupted problem-generation attempts as failed"
+        );
+    }
+    service
+        .recover_pending_commands()
+        .await
+        .context("durable command recovery failed")?;
+    let recovered_projects = service
+        .recover_running_projects()
+        .await
+        .context("running-project recovery failed")?;
+    if recovered_projects > 0 {
+        info!(recovered_projects, "resumed durable running projects");
+    }
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind {bind}"))?;
@@ -389,6 +596,18 @@ async fn serve(service: ResearchService, bind: SocketAddr) -> Result<()> {
                 _ = interval.tick() => {
                     if let Err(error) = watchdog_service.store().run_reconciliation(None, "watchdog_tick").await {
                         warn!(%error, "storage watchdog reconciliation failed");
+                    }
+                    if let Err(error) = watchdog_service.recover_pending_commands().await {
+                        warn!(%error, "durable command recovery failed");
+                    }
+                    match watchdog_service.recover_running_projects().await {
+                        Ok(recovered_projects) if recovered_projects > 0 => {
+                            info!(recovered_projects, "watchdog resumed durable running projects");
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            warn!(%error, "running-project recovery failed");
+                        }
                     }
                 }
             }
@@ -432,6 +651,7 @@ async fn doctor(cli: &Cli, service: &ResearchService) -> Result<()> {
             "artifact_root":cli.artifact_root,
             "runtime_root":cli.runtime_root,
             "output_root":cli.output_root,
+            "problem_material_root":cli.material_root,
             "backend":capabilities,
             "codex_version":version,
             "verification_backend":service.verification_backend_name(),
@@ -586,6 +806,82 @@ async fn read_problem(problem: Option<String>, problem_file: Option<&Path>) -> R
     Ok(content)
 }
 
+async fn read_prompt(prompt: Option<String>, prompt_file: Option<&Path>) -> Result<String> {
+    let content = match (prompt, prompt_file) {
+        (Some(content), None) => content,
+        (None, Some(path)) => tokio::fs::read_to_string(path)
+            .await
+            .with_context(|| format!("read UTF-8 prompt file {}", path.display()))?,
+        _ => bail!("provide exactly one of --prompt or --prompt-file"),
+    };
+    if content.trim().is_empty() {
+        bail!("problem-generation prompt must not be empty");
+    }
+    Ok(content)
+}
+
+async fn read_problem_document(path: &Path) -> Result<ProblemDocument> {
+    let bytes = tokio::fs::read(path)
+        .await
+        .with_context(|| format!("read problem document {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse ProblemDocument JSON {}", path.display()))
+}
+
+fn validate_relative_context_directory(path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty() {
+        bail!("--context-dir must not be empty");
+    }
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        bail!("--context-dir must remain relative to --material-root");
+    }
+    Ok(())
+}
+
+fn print_problem_draft(draft: &ProblemDraft) -> Result<()> {
+    let preview_markdown = draft
+        .document
+        .as_ref()
+        .map(render_problem_document_markdown);
+    let confirm_command = problem_draft_confirm_command(draft);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "draft": draft,
+            "preview_markdown": preview_markdown,
+            "confirm_command": confirm_command,
+        }))?
+    );
+    Ok(())
+}
+
+fn problem_draft_confirm_command(draft: &ProblemDraft) -> Option<String> {
+    if draft.status != ProblemDraftStatus::AwaitingConfirmation {
+        return None;
+    }
+    let document_hash = draft.document_hash.as_deref()?;
+    let acknowledge = draft
+        .materials
+        .iter()
+        .any(|material| material.warning.is_some() || material.status == "warning");
+    let warning_flag = if acknowledge {
+        " --acknowledge-material-warnings"
+    } else {
+        ""
+    };
+    Some(format!(
+        "math-research-agent confirm-problem {} --expected-revision {} --expected-document-hash {} --idempotency-key cli-confirm-problem-{}{}",
+        draft.draft_id, draft.revision, document_hash, draft.draft_id, warning_flag,
+    ))
+}
+
 async fn prepare_database_parent(database_url: &str) -> Result<()> {
     if let Some(path) = database_url.strip_prefix("sqlite://") {
         let path = Path::new(path);
@@ -602,6 +898,31 @@ mod tests {
 
     use super::{Cli, Commands};
     use clap::Parser;
+
+    #[test]
+    fn execution_timeouts_are_configurable_and_reject_zero() {
+        let cli = Cli::try_parse_from([
+            "math-research-agent",
+            "--worker-timeout-seconds",
+            "1200",
+            "--planner-round-timeout-seconds",
+            "600",
+            "--verifier-timeout-seconds",
+            "1200",
+            "doctor",
+        ])
+        .expect("bounded execution timeouts");
+        assert_eq!(cli.worker_timeout_seconds, 1200);
+        assert_eq!(cli.verifier_timeout_seconds, 1200);
+        assert_eq!(cli.planner_round_timeout_seconds, Some(600));
+        for option in [
+            "--worker-timeout-seconds",
+            "--verifier-timeout-seconds",
+            "--planner-round-timeout-seconds",
+        ] {
+            assert!(Cli::try_parse_from(["math-research-agent", option, "0", "doctor"]).is_err());
+        }
+    }
 
     #[test]
     fn create_accepts_problem_file_for_replayable_inputs() {
@@ -640,5 +961,60 @@ mod tests {
         ])
         .expect_err("inline and file inputs must conflict");
         assert!(error.to_string().contains("cannot be used with"));
+    }
+
+    #[test]
+    fn generate_problem_accepts_replayable_prompt_and_relative_context() {
+        let cli = Cli::try_parse_from([
+            "math-research-agent",
+            "generate-problem",
+            "--prompt-file",
+            "hint.md",
+            "--context-dir",
+            "notes",
+            "--idempotency-key",
+            "generate-1",
+        ])
+        .expect("problem generation arguments should parse");
+        let Commands::GenerateProblem {
+            prompt,
+            prompt_file,
+            context_dir,
+            idempotency_key,
+        } = cli.command
+        else {
+            panic!("expected generate-problem command");
+        };
+        assert!(prompt.is_none());
+        assert_eq!(prompt_file.as_deref(), Some(Path::new("hint.md")));
+        assert_eq!(context_dir, Path::new("notes"));
+        assert_eq!(idempotency_key.as_deref(), Some("generate-1"));
+    }
+
+    #[test]
+    fn confirm_problem_starts_by_default_and_supports_explicit_no_start() {
+        let cli = Cli::try_parse_from([
+            "math-research-agent",
+            "confirm-problem",
+            "draft-1",
+            "--expected-revision",
+            "2",
+            "--expected-document-hash",
+            "abc",
+            "--no-start",
+        ])
+        .expect("problem confirmation arguments should parse");
+        let Commands::ConfirmProblem {
+            expected_revision,
+            expected_document_hash,
+            no_start,
+            ..
+        } = cli.command
+        else {
+            panic!("expected confirm-problem command");
+        };
+        assert_eq!(expected_revision, 2);
+        assert_eq!(expected_document_hash, "abc");
+        assert!(no_start);
     }
 }

@@ -9,6 +9,8 @@ rust-version.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+ulid.workspace = true
 utoipa.workspace = true
+
 [lints]
 workspace = true

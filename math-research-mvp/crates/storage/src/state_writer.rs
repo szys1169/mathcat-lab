@@ -1,8 +1,8 @@
 use std::{
     collections::VecDeque,
     sync::{
-        Arc,
-        atomic::{AtomicI64, AtomicU64, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -32,27 +32,29 @@ impl WritePriority {
 #[derive(Debug, Clone, Serialize)]
 pub struct StateWriterSnapshot {
     pub status: &'static str,
+    pub last_command_kind: Option<String>,
     pub queue_depth: i64,
     pub queue_capacity: i64,
     pub admitted_total: u64,
     pub completed_total: u64,
     pub queue_wait_seconds: f64,
     pub last_transaction_seconds: f64,
-    pub sqlite_busy_total: u64,
 }
 
 #[derive(Debug, Default)]
 struct Metrics {
+    running: AtomicBool,
     queue_depth: AtomicI64,
     admitted_total: AtomicU64,
     completed_total: AtomicU64,
     queue_wait_micros: AtomicU64,
     last_transaction_micros: AtomicU64,
-    sqlite_busy_total: AtomicU64,
+    last_command_kind: Mutex<Option<&'static str>>,
 }
 
 struct AdmissionRequest {
     priority: WritePriority,
+    command_kind: &'static str,
     enqueued_at: Instant,
     admitted: oneshot::Sender<Instant>,
     completed: oneshot::Receiver<()>,
@@ -95,6 +97,7 @@ impl StateWriter {
     pub fn spawn() -> Self {
         let (sender, receiver) = mpsc::channel(QUEUE_CAPACITY);
         let metrics = Arc::new(Metrics::default());
+        metrics.running.store(true, Ordering::Release);
         tokio::spawn(run_state_writer(receiver, metrics.clone()));
         Self { sender, metrics }
     }
@@ -102,7 +105,7 @@ impl StateWriter {
     pub async fn admit(
         &self,
         priority: WritePriority,
-        _command_kind: &'static str,
+        command_kind: &'static str,
     ) -> StorageResult<WriteAdmission> {
         let (admitted_tx, admitted_rx) = oneshot::channel();
         let (completed_tx, completed_rx) = oneshot::channel();
@@ -111,6 +114,7 @@ impl StateWriter {
             .sender
             .send(AdmissionRequest {
                 priority,
+                command_kind,
                 enqueued_at: Instant::now(),
                 admitted: admitted_tx,
                 completed: completed_rx,
@@ -135,7 +139,17 @@ impl StateWriter {
 
     pub fn snapshot(&self) -> StateWriterSnapshot {
         StateWriterSnapshot {
-            status: "running",
+            status: if self.metrics.running.load(Ordering::Acquire) {
+                "running"
+            } else {
+                "stopped"
+            },
+            last_command_kind: self
+                .metrics
+                .last_command_kind
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .map(str::to_owned),
             queue_depth: self.metrics.queue_depth.load(Ordering::Relaxed),
             queue_capacity: i64::try_from(QUEUE_CAPACITY).unwrap_or(i64::MAX),
             admitted_total: self.metrics.admitted_total.load(Ordering::Relaxed),
@@ -148,7 +162,6 @@ impl StateWriter {
                 self.metrics.last_transaction_micros.load(Ordering::Relaxed),
             )
             .as_secs_f64(),
-            sqlite_busy_total: self.metrics.sqlite_busy_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -176,6 +189,10 @@ async fn run_state_writer(mut receiver: mpsc::Receiver<AdmissionRequest>, metric
         };
         metrics.queue_depth.fetch_sub(1, Ordering::Relaxed);
         metrics.admitted_total.fetch_add(1, Ordering::Relaxed);
+        *metrics
+            .last_command_kind
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(request.command_kind);
         metrics
             .queue_wait_micros
             .fetch_add(micros(request.enqueued_at.elapsed()), Ordering::Relaxed);
@@ -185,6 +202,7 @@ async fn run_state_writer(mut receiver: mpsc::Receiver<AdmissionRequest>, metric
         }
         let _ = request.completed.await;
     }
+    metrics.running.store(false, Ordering::Release);
 }
 
 fn micros(duration: std::time::Duration) -> u64 {

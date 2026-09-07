@@ -1,4 +1,0 @@
-interface:
-  display_name: "数学论文综述写作"
-  short_description: "撰写数学论文 Related Work/综述章节，按来源归因"
-  default_prompt: "Use $math-related-work to write the related-work section for this math paper from the findings and provenance ledger."

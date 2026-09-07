@@ -3,6 +3,22 @@ use serde_json::{Value, json};
 fn string_array() -> Value {
     json!({"type":"array","items":{"type":"string"}})
 }
+
+fn suggestion_decisions() -> Value {
+    json!({
+        "type":"array",
+        "items":{
+            "type":"object",
+            "additionalProperties":false,
+            "required":["suggestion_id","disposition","rationale"],
+            "properties":{
+                "suggestion_id":{"type":"string","minLength":1},
+                "disposition":{"type":"string","enum":["applied","deferred","rejected"]},
+                "rationale":{"type":"string","minLength":1}
+            }
+        }
+    })
+}
 fn attributes() -> Value {
     json!({
         "type":"object",
@@ -17,6 +33,63 @@ fn attributes() -> Value {
     })
 }
 
+/// Strict output contract for the pre-project problem-definition generator.
+///
+/// `material_paths` is projected into an enum so generated provenance cannot name files that were
+/// not part of the bounded material snapshot.
+#[must_use]
+pub fn problem_generator_schema(material_paths: &[String]) -> Value {
+    let material_references = if material_paths.is_empty() {
+        json!({"type":"array","maxItems":0,"items":{"type":"string"}})
+    } else {
+        json!({
+            "type":"array",
+            "items":{"type":"string","enum":material_paths}
+        })
+    };
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":[
+            "name","problem","target_statement","assumptions","success_criteria","budget",
+            "human_route_approval","budget_rationale","generation_notes",
+            "unresolved_questions","material_references"
+        ],
+        "properties":{
+            "name":{"type":"string","minLength":1,"maxLength":160},
+            "problem":{"type":"string","minLength":1},
+            "target_statement":{"type":"string","minLength":1},
+            "assumptions":{"type":"array","maxItems":64,"items":{
+                "type":"object","additionalProperties":false,
+                "required":["statement","provenance"],
+                "properties":{
+                    "statement":{"type":"string","minLength":1},
+                    "provenance":{"type":"string","enum":["prompt","material","inferred"]}
+                }
+            }},
+            "success_criteria":{"type":"string","minLength":1},
+            "budget":{"type":"object","additionalProperties":false,
+                "required":[
+                    "max_rounds","max_parallel_workers","max_minutes_per_task",
+                    "max_model_calls_per_task","max_total_model_calls"
+                ],
+                "properties":{
+                    "max_rounds":{"type":"integer","minimum":1,"maximum":64},
+                    "max_parallel_workers":{"type":"integer","minimum":1,"maximum":16},
+                    "max_minutes_per_task":{"type":"integer","minimum":1,"maximum":180},
+                    "max_model_calls_per_task":{"type":"integer","minimum":1,"maximum":16},
+                    "max_total_model_calls":{"type":"integer","minimum":1,"maximum":1000}
+                }
+            },
+            "human_route_approval":{"type":"boolean"},
+            "budget_rationale":{"type":"string","minLength":1},
+            "generation_notes":{"type":"array","maxItems":32,"items":{"type":"string","minLength":1}},
+            "unresolved_questions":{"type":"array","maxItems":32,"items":{"type":"string","minLength":1}},
+            "material_references":material_references
+        }
+    })
+}
+
 #[must_use]
 pub fn planner_schema() -> Value {
     json!({
@@ -25,9 +98,20 @@ pub fn planner_schema() -> Value {
         "properties":{
             "rationale_summary":{"type":"string"},
             "routes":{"type":"array","minItems":2,"items":{"type":"object","additionalProperties":false,
-                "required":["title","method_summary","target_goal_ids","required_fact_ids","expected_subgoals","expected_goal_progress","uncertainty_reduction","human_suggestion_alignment","evidence_support","route_diversity","verifiability","novelty","failure_similarity_penalty","cost_penalty","risks"],
+                "required":["title","method_summary","approach_kind","route_role","user_title","plain_language_summary","why_this_route","expected_output","relation_to_goal","steps","target_goal_ids","required_fact_ids","expected_subgoals","expected_goal_progress","uncertainty_reduction","human_suggestion_alignment","evidence_support","route_diversity","verifiability","novelty","failure_similarity_penalty","cost_penalty","risks"],
                 "properties":{
-                    "title":{"type":"string"},"method_summary":{"type":"string"},"target_goal_ids":string_array(),"required_fact_ids":string_array(),"expected_subgoals":string_array(),
+                    "title":{"type":"string"},"method_summary":{"type":"string"},
+                    "approach_kind":{"type":"string","enum":["direct_proof","counterexample","computation","reduction","literature","formalization","other"]},
+                    "route_role":{"type":"string","enum":["primary","adversarial","auxiliary","prerequisite"]},
+                    "user_title":{"type":"string","minLength":1,"maxLength":40},
+                    "plain_language_summary":{"type":"string","minLength":1},
+                    "why_this_route":{"type":"string","minLength":1},
+                    "expected_output":{"type":"string","minLength":1,"description":"完成时预期得到的可检查产物及检查标准；不宣称该产物已经存在或已获认证。"},
+                    "relation_to_goal":{"type":"string","minLength":1},
+                    "steps":{"type":"array","minItems":2,"maxItems":6,"items":{"type":"string","minLength":1}},
+                    "target_goal_ids":string_array(),
+                    "required_fact_ids":{"type":"array","items":{"type":"string"},"description":"仅列当前已有的 active Fact ID；没有此类输入时可为空，不得把待证明义务或未知引理编造成事实 ID。"},
+                    "expected_subgoals":{"type":"array","items":{"type":"string"},"description":"计划证明、证伪、核对或计算检查的研究义务；尚未完成的子目标不是已成立前提。"},
                     "expected_goal_progress":{"type":"number","minimum":0,"maximum":1},"uncertainty_reduction":{"type":"number","minimum":0,"maximum":1},
                     "human_suggestion_alignment":{"type":"number","minimum":0,"maximum":1},"evidence_support":{"type":"number","minimum":0,"maximum":1},
                     "route_diversity":{"type":"number","minimum":0,"maximum":1},"verifiability":{"type":"number","minimum":0,"maximum":1},"novelty":{"type":"number","minimum":0,"maximum":1},
@@ -36,7 +120,7 @@ pub fn planner_schema() -> Value {
             "assignments":{"type":"array","minItems":1,"items":{"type":"object","additionalProperties":false,
                 "required":["route_index","worker_role","strategic_role","addresses_interface_debt","goal_ids","objective","completion_contract","priority"],
                 "properties":{"route_index":{"type":"integer","minimum":0},"worker_role":{"type":"string","enum":["prover","explorer","counterexample_hunter","literature_researcher"]},"strategic_role":{"type":"string","enum":["whole_architecture","central_bridge","adversarial","literature","computation","local_milestone"]},"addresses_interface_debt":{"type":"boolean"},"goal_ids":string_array(),"objective":{"type":"string"},"completion_contract":{"type":"string"},"priority":{"type":"number","minimum":0,"maximum":1}}}},
-            "targeted_uncertainty_ids":string_array(),"suggestion_decisions":string_array()
+            "targeted_uncertainty_ids":string_array(),"suggestion_decisions":suggestion_decisions()
         }
     })
 }
@@ -58,7 +142,7 @@ pub fn worker_schema() -> Value {
                 "properties":{
                     "title":{"type":"string"},"authors":string_array(),"url":{"type":["string","null"]},"citation_key":{"type":["string","null"]},
                     "theorem_reference":{"type":["string","null"]},"statement_excerpt":{"type":["string","null"]},"assumptions":string_array(),
-                    "applicability":{"type":"string"},"status":{"type":"string","enum":["reported","possibly_applicable","not_applicable"]},
+                    "applicability":{"type":"string"},"status":{"type":"string","enum":["lead_unverified","reported","possibly_applicable","not_applicable"]},
                     "retrieval_query":{"type":["string","null"]},"document_version":{"type":["string","null"]},
                     "fulltext_path":{"type":["string","null"]},"fulltext_sha256":{"type":["string","null"]},
                     "fulltext_artifact_id":{"type":["string","null"]}
@@ -132,9 +216,10 @@ pub fn reflection_schema() -> Value {
                 "required":["route_index","changes_problem","uses_unverified_claims","conflicts_with_facts","repeats_failure_pattern","has_verifiable_milestone","risk_score","goal_closure_leverage","generality_gain","assumption_debt","bridge_centrality","architecture_fit","unjustified_narrowing","remaining_goal_gaps_if_successful","blockers","suggestions"],
                 "properties":{
                     "route_index":{"type":"integer","minimum":0},
-                    "changes_problem":{"type":"boolean"},"uses_unverified_claims":{"type":"boolean"},
+                    "changes_problem":{"type":"boolean"},
+                    "uses_unverified_claims":{"type":"boolean","description":"仅当路线把未经 Problem Contract 允许或 active Fact 认证的结论当作已成立前提时为 true。计划证明、证伪或计算检查未知桥梁本身应为 false；不能仅因引理尚未证明、算法尚未实现或没有已有事实而为 true。为 true 时 blockers 必须给出被当真结论及其路线字段或步骤位置。"},
                     "conflicts_with_facts":{"type":"boolean"},"repeats_failure_pattern":{"type":"boolean"},
-                    "has_verifiable_milestone":{"type":"boolean"},
+                    "has_verifiable_milestone":{"type":"boolean","description":"是否承诺将来可检查的具体产物及检查标准，而非该产物是否已经存在。"},
                     "risk_score":{"type":"number","minimum":0,"maximum":1},
                     "goal_closure_leverage":{"type":"number","minimum":0,"maximum":1},
                     "generality_gain":{"type":"number","minimum":0,"maximum":1},
@@ -143,7 +228,8 @@ pub fn reflection_schema() -> Value {
                     "architecture_fit":{"type":"number","minimum":0,"maximum":1},
                     "unjustified_narrowing":{"type":"boolean"},
                     "remaining_goal_gaps_if_successful":string_array(),
-                    "blockers":string_array(),"suggestions":string_array()
+                    "blockers":{"type":"array","items":{"type":"string"},"description":"具体障碍或待完成的研究义务。若 uses_unverified_claims=true，必须指明被当作已成立前提的结论、路线字段或步骤位置，以及为何是使用而非计划证明；仅说尚未证明或尚未实现不足以支持该标记。"},
+                    "suggestions":string_array()
                 }
             }}
         }
@@ -199,7 +285,7 @@ pub fn supervisor_schema() -> Value {
             "rationale_summary":{"type":"string"},
             "assignments":planner["properties"]["assignments"].clone(),
             "targeted_uncertainty_ids":string_array(),
-            "suggestion_decisions":string_array(),
+            "suggestion_decisions":suggestion_decisions(),
             "deferred_route_indices":{"type":"array","items":{"type":"integer","minimum":0}}
         }
     })
@@ -271,9 +357,64 @@ mod tests {
 
     use super::{
         alignment_schema, formalizer_schema, paper_writer_schema, planner_schema,
-        reflection_schema, route_generator_schema, strategy_director_schema, supervisor_schema,
-        tactic_proposal_schema, verifier_schema, worker_schema,
+        problem_generator_schema, reflection_schema, route_generator_schema,
+        strategy_director_schema, supervisor_schema, tactic_proposal_schema, verifier_schema,
+        worker_schema,
     };
+
+    fn assert_keyword_absent(value: &Value, keyword: &str) {
+        match value {
+            Value::Array(values) => {
+                for child in values {
+                    assert_keyword_absent(child, keyword);
+                }
+            }
+            Value::Object(values) => {
+                assert!(
+                    !values.contains_key(keyword),
+                    "structured-output schema contains unsupported keyword {keyword}: {value}"
+                );
+                for child in values.values() {
+                    assert_keyword_absent(child, keyword);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn assert_all_object_properties_required(value: &Value) {
+        if value.get("type").and_then(Value::as_str) == Some("object") {
+            let properties = value
+                .get("properties")
+                .and_then(Value::as_object)
+                .expect("object schema must define properties");
+            let required = value
+                .get("required")
+                .and_then(Value::as_array)
+                .expect("strict object schema must define required fields");
+            for property in properties.keys() {
+                assert!(
+                    required
+                        .iter()
+                        .any(|required| required.as_str() == Some(property)),
+                    "strict object property {property} is not required: {value}"
+                );
+            }
+        }
+        match value {
+            Value::Array(values) => {
+                for child in values {
+                    assert_all_object_properties_required(child);
+                }
+            }
+            Value::Object(values) => {
+                for child in values.values() {
+                    assert_all_object_properties_required(child);
+                }
+            }
+            _ => {}
+        }
+    }
 
     fn assert_strict_objects(value: &Value) {
         if value.get("type").and_then(Value::as_str) == Some("object") {
@@ -341,5 +482,160 @@ mod tests {
             assert_strict_objects(&schema);
             assert_array_items_are_typed(&schema);
         }
+    }
+
+    #[test]
+    fn problem_generator_schema_is_codex_compatible_and_strict() {
+        let schema = problem_generator_schema(&["notes/a.md".into()]);
+
+        assert_keyword_absent(&schema, "uniqueItems");
+        assert_strict_objects(&schema);
+        assert_all_object_properties_required(&schema);
+        assert_array_items_are_typed(&schema);
+        assert_eq!(
+            schema["properties"]["material_references"]["items"]["enum"],
+            serde_json::json!(["notes/a.md"])
+        );
+
+        let empty_material_schema = problem_generator_schema(&[]);
+        assert_keyword_absent(&empty_material_schema, "uniqueItems");
+        assert_eq!(
+            empty_material_schema["properties"]["material_references"]["maxItems"],
+            0
+        );
+    }
+
+    #[test]
+    fn suggestion_decisions_require_exact_ids_typed_dispositions_and_rationales() {
+        let schema = supervisor_schema();
+        let decisions = &schema["properties"]["suggestion_decisions"];
+        assert_eq!(
+            decisions["items"]["required"],
+            serde_json::json!(["suggestion_id", "disposition", "rationale"])
+        );
+        assert_eq!(decisions["items"]["additionalProperties"], false);
+        assert_eq!(
+            decisions["items"]["properties"]["disposition"]["enum"],
+            serde_json::json!(["applied", "deferred", "rejected"])
+        );
+        assert_eq!(
+            decisions["items"]["properties"]["suggestion_id"]["minLength"],
+            1
+        );
+        assert_eq!(
+            decisions["items"]["properties"]["rationale"]["minLength"],
+            1
+        );
+    }
+
+    #[test]
+    fn worker_source_schema_distinguishes_search_leads_from_evidence_candidates() {
+        assert_eq!(
+            worker_schema()["properties"]["sources"]["items"]["properties"]["status"]["enum"],
+            serde_json::json!([
+                "lead_unverified",
+                "reported",
+                "possibly_applicable",
+                "not_applicable"
+            ])
+        );
+    }
+
+    #[test]
+    fn route_schema_requires_complete_researcher_facing_presentation() {
+        let route = &route_generator_schema()["properties"]["routes"]["items"];
+        let required = route["required"].as_array().expect("required fields");
+        for field in [
+            "approach_kind",
+            "route_role",
+            "user_title",
+            "plain_language_summary",
+            "why_this_route",
+            "expected_output",
+            "relation_to_goal",
+            "steps",
+        ] {
+            assert!(required.iter().any(|item| item == field), "missing {field}");
+        }
+        assert_eq!(route["properties"]["steps"]["minItems"], 2);
+        assert_eq!(route["properties"]["steps"]["maxItems"], 6);
+    }
+
+    #[test]
+    fn route_schema_documents_dependencies_and_unfinished_obligations_separately() {
+        let schema = route_generator_schema();
+        let properties = &schema["properties"]["routes"]["items"]["properties"];
+        let dependencies = &properties["required_fact_ids"];
+        let obligations = &properties["expected_subgoals"];
+
+        assert_eq!(dependencies["type"], "array");
+        assert!(dependencies.get("minItems").is_none());
+        assert!(
+            dependencies["description"]
+                .as_str()
+                .expect("dependency semantics")
+                .contains("不得把待证明义务或未知引理编造成事实 ID")
+        );
+        assert!(
+            obligations["description"]
+                .as_str()
+                .expect("obligation semantics")
+                .contains("尚未完成的子目标不是已成立前提")
+        );
+        assert!(
+            properties["expected_output"]["description"]
+                .as_str()
+                .expect("future output semantics")
+                .contains("不宣称该产物已经存在或已获认证")
+        );
+    }
+
+    #[test]
+    fn reflection_schema_clarifies_semantics_without_changing_wire_fields() {
+        let schema = reflection_schema();
+        let review = &schema["properties"]["reviews"]["items"];
+        let properties = &review["properties"];
+
+        assert_eq!(
+            review["required"],
+            serde_json::json!([
+                "route_index",
+                "changes_problem",
+                "uses_unverified_claims",
+                "conflicts_with_facts",
+                "repeats_failure_pattern",
+                "has_verifiable_milestone",
+                "risk_score",
+                "goal_closure_leverage",
+                "generality_gain",
+                "assumption_debt",
+                "bridge_centrality",
+                "architecture_fit",
+                "unjustified_narrowing",
+                "remaining_goal_gaps_if_successful",
+                "blockers",
+                "suggestions"
+            ])
+        );
+        assert_eq!(properties.as_object().expect("properties").len(), 16);
+        assert_eq!(properties["uses_unverified_claims"]["type"], "boolean");
+        assert!(
+            properties["uses_unverified_claims"]["description"]
+                .as_str()
+                .expect("premise semantics")
+                .contains("计划证明、证伪或计算检查未知桥梁本身应为 false")
+        );
+        assert!(
+            properties["blockers"]["description"]
+                .as_str()
+                .expect("misuse evidence requirement")
+                .contains("结论、路线字段或步骤位置")
+        );
+        assert!(
+            properties["has_verifiable_milestone"]["description"]
+                .as_str()
+                .expect("milestone semantics")
+                .contains("而非该产物是否已经存在")
+        );
     }
 }

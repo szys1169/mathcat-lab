@@ -1,11 +1,12 @@
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::BTreeSet, path::Path, str::FromStr};
 
 use chrono::Utc;
 use research_domain::{
-    Artifact, Budget, Candidate, CandidateStatus, CandidateSubmission, CandidateType, CommandMode,
-    CommandStatus, DomainEvent, EntityRef, Fact, FactStatus, GoalStatus, HumanCommand,
-    PlannerOutput, ProblemContract, Project, ProjectStatus, ResearchRound, RoundStatus, Route,
-    RouteStatus, Task, TaskStatus, UncertaintyStatus, Verification, VerificationReport,
+    AcceptanceClass, Artifact, Budget, Candidate, CandidateStatus, CandidateSubmission,
+    CandidateType, CommandMode, CommandStatus, DomainEvent, EntityRef, Fact, FactStatus,
+    GoalStatus, HumanCommand, ObligationCoverageDisposition, PlannerOutput, ProblemContract,
+    Project, ProjectStatus, ResearchRound, ReviewMode, RoundStatus, Route, RouteStatus, Task,
+    TaskStatus, UncertaintyStatus, Verification, VerificationReport, VerificationStage,
     VerificationVerdict, Worker, WorkerOutput, WorkerStatus,
 };
 use serde_json::{Value, json};
@@ -14,7 +15,11 @@ use sqlx::Row;
 
 use crate::{
     SqliteStore, StorageError, StorageResult, append_event, bump_revision, current_revision,
-    entity, json_text, new_id, rows,
+    entity, json_text, new_id, route_attributes,
+    route_mutations::{
+        cancel_task_execution_tx, merge_routes_tx, prune_route_tx, revive_route_tx, stop_route_tx,
+    },
+    rows,
 };
 
 #[derive(Debug, Clone)]
@@ -45,12 +50,21 @@ pub struct UsageReservation {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub enum ModelCallPurpose<'a> {
+    Research,
+    RouteScopedResearch(&'a str),
+    Verification(&'a str),
+    Publication(&'a str),
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct ModelCallRequest<'a> {
     pub project_id: &'a str,
     pub round: i64,
     pub worker_id: Option<&'a str>,
     pub task_id: Option<&'a str>,
     pub model: Option<&'a str>,
+    pub purpose: ModelCallPurpose<'a>,
     pub max_total_calls: u32,
     pub max_task_calls: u32,
 }
@@ -67,6 +81,201 @@ pub struct VerificationCommit {
     pub verification: Verification,
     pub fact: Option<Fact>,
     pub events: Vec<DomainEvent>,
+}
+
+pub(crate) struct UncommittedArtifactFile {
+    path: String,
+    committed: bool,
+}
+
+impl UncommittedArtifactFile {
+    pub(crate) fn new(artifact: &Artifact) -> Self {
+        Self {
+            path: artifact.storage_path.clone(),
+            committed: false,
+        }
+    }
+
+    pub(crate) const fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for UncommittedArtifactFile {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+pub(crate) fn validate_project_input(
+    name: &str,
+    contract: &ProblemContract,
+    budget: &Budget,
+) -> StorageResult<()> {
+    if name.trim().is_empty() || contract.target_statement.trim().is_empty() {
+        return Err(StorageError::InvalidTransition(
+            "project name and target statement must not be empty".into(),
+        ));
+    }
+    validate_project_budget(budget)?;
+    Ok(())
+}
+
+pub(crate) fn validate_project_budget(budget: &Budget) -> StorageResult<()> {
+    if budget.max_rounds == 0
+        || budget.max_model_calls_per_task == 0
+        || budget.max_total_model_calls == 0
+    {
+        return Err(StorageError::InvalidTransition(
+            "max_rounds and model-call limits must be greater than zero".into(),
+        ));
+    }
+    if !(1..=16).contains(&budget.max_parallel_workers) {
+        return Err(StorageError::InvalidTransition(
+            "max_parallel_workers must be between 1 and 16".into(),
+        ));
+    }
+    if !(1..=1_440).contains(&budget.max_minutes_per_task) {
+        return Err(StorageError::InvalidTransition(
+            "max_minutes_per_task must be between 1 and 1440".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Creates the complete initial project aggregate inside the caller's transaction.
+///
+/// Problem-draft confirmation uses this helper so project, Goal, Bottleneck, planner health,
+/// and the `project.created` event cannot diverge from the ordinary creation path.
+pub(crate) async fn create_project_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    name: &str,
+    contract: ProblemContract,
+    budget: Budget,
+    review_mode: ReviewMode,
+) -> StorageResult<(Project, DomainEvent)> {
+    validate_project_input(name, &contract, &budget)?;
+    let human_route_approval = review_mode == ReviewMode::Strict;
+    let project_id = new_id("project");
+    let goal_id = new_id("goal");
+    let bottleneck_id = new_id("bottleneck");
+    let now = Utc::now();
+    sqlx::query("INSERT INTO projects(project_id,name,problem_contract_json,status,revision,current_round,budget_json,created_at,updated_at,human_route_approval,review_mode) VALUES(?,?,?,?,1,0,?,?,?,?,?)")
+        .bind(&project_id).bind(name.trim()).bind(json_text(&contract)?)
+        .bind(ProjectStatus::Created.to_string()).bind(json_text(&budget)?)
+        .bind(now.to_rfc3339()).bind(now.to_rfc3339()).bind(human_route_approval)
+        .bind(review_mode.to_string()).execute(&mut **tx).await?;
+    sqlx::query("INSERT INTO goals(goal_id,project_id,statement,parent_goal_ids_json,status,priority,blocked_by_json,created_in_round) VALUES(?,?,?,?,?,?,?,0)")
+        .bind(&goal_id).bind(&project_id).bind(&contract.target_statement).bind("[]")
+        .bind(GoalStatus::Open.to_string()).bind(1.0_f64).bind("[]").execute(&mut **tx).await?;
+    sqlx::query("INSERT INTO bottlenecks(bottleneck_id,project_id,target_goal_ids_json,kind,precise_statement,completion_contract_json,priority,status,created_revision,updated_revision,created_at,updated_at) VALUES(?,?,?,?,?,?,1.0,'open',1,1,?,?)")
+        .bind(&bottleneck_id).bind(&project_id).bind(json_text(&vec![goal_id.clone()])?)
+        .bind("main_goal_unresolved").bind(format!("Resolve the main goal exactly as stated: {}", contract.target_statement))
+        .bind(json_text(&json!({"success_outputs":["a self-contained candidate proving the exact target, or a verified counterexample"],"partial_outputs":["a strictly narrower named lemma with an explicit implication to the target"],"reject_outputs":["generic discussion","a silently weakened target","an unsupported solved claim"]}))?)
+        .bind(now.to_rfc3339()).bind(now.to_rfc3339()).execute(&mut **tx).await?;
+    let root_obligation_id = crate::proof_obligations::create_root_obligation_tx(
+        tx,
+        &project_id,
+        &goal_id,
+        &bottleneck_id,
+        &contract.target_statement,
+        1.0,
+        1,
+        &json!({"source":"project_creation","goal_id":goal_id}),
+        &now,
+    )
+    .await?;
+    sqlx::query("INSERT INTO planner_health(project_id,updated_at) VALUES(?,?)")
+        .bind(&project_id)
+        .bind(now.to_rfc3339())
+        .execute(&mut **tx)
+        .await?;
+    let event = append_event(
+        tx,
+        &project_id,
+        1,
+        "project.created",
+        entity("project", &project_id),
+        json!({"main_goal_id": goal_id,"initial_bottleneck_id":bottleneck_id,"root_obligation_id":root_obligation_id,"human_route_approval":human_route_approval}),
+        None,
+    )
+    .await?;
+    Ok((
+        Project {
+            project_id,
+            name: name.trim().into(),
+            contract,
+            status: ProjectStatus::Created,
+            revision: 1,
+            current_round: 0,
+            budget,
+            review_mode,
+            human_route_approval,
+            created_at: now,
+            updated_at: now,
+        },
+        event,
+    ))
+}
+
+pub(crate) async fn enqueue_command_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    project_id: &str,
+    draft: CommandDraft,
+) -> StorageResult<(HumanCommand, DomainEvent)> {
+    if draft.idempotency_key.trim().is_empty() {
+        return Err(StorageError::InvalidTransition(
+            "Idempotency-Key must not be empty".into(),
+        ));
+    }
+    let actual = current_revision(tx, project_id).await?;
+    if actual != draft.expected_project_revision {
+        return Err(StorageError::RevisionConflict {
+            expected: draft.expected_project_revision,
+            actual,
+        });
+    }
+    let command_id = new_id("cmd");
+    let now = Utc::now();
+    sqlx::query("INSERT INTO human_commands(command_id,project_id,type,target_kind,target_id,mode,payload_json,expected_project_revision,idempotency_key,reason,requested_by,status,before_revision,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        .bind(&command_id).bind(project_id).bind(&draft.command_type).bind(&draft.target_kind).bind(&draft.target_id)
+        .bind(draft.mode.to_string()).bind(json_text(&draft.payload)?).bind(draft.expected_project_revision)
+        .bind(&draft.idempotency_key).bind(&draft.reason).bind(&draft.requested_by).bind(CommandStatus::Queued.to_string())
+        .bind(actual).bind(now.to_rfc3339()).execute(&mut **tx).await?;
+    let revision = bump_revision(tx, project_id).await?;
+    let event = append_event(
+        tx,
+        project_id,
+        revision,
+        "human_command.queued",
+        entity("command", &command_id),
+        json!({"type": draft.command_type, "mode": draft.mode}),
+        None,
+    )
+    .await?;
+    let command = HumanCommand {
+        command_id,
+        project_id: project_id.into(),
+        command_type: draft.command_type,
+        target_kind: draft.target_kind,
+        target_id: draft.target_id,
+        mode: draft.mode,
+        payload: draft.payload,
+        expected_project_revision: draft.expected_project_revision,
+        idempotency_key: draft.idempotency_key,
+        reason: draft.reason,
+        requested_by: draft.requested_by,
+        status: CommandStatus::Queued,
+        before_revision: Some(actual),
+        after_revision: None,
+        affected_entities: vec![],
+        error: None,
+        created_at: now,
+        applied_at: None,
+    };
+    Ok((command, event))
 }
 
 impl SqliteStore {
@@ -87,74 +296,32 @@ impl SqliteStore {
         budget: Budget,
         human_route_approval: bool,
     ) -> StorageResult<(Project, DomainEvent)> {
+        let review_mode = if human_route_approval {
+            ReviewMode::Strict
+        } else {
+            ReviewMode::Balanced
+        };
+        self.create_project_with_review_mode(name, contract, budget, review_mode)
+            .await
+    }
+
+    pub async fn create_project_with_review_mode(
+        &self,
+        name: String,
+        contract: ProblemContract,
+        budget: Budget,
+        review_mode: ReviewMode,
+    ) -> StorageResult<(Project, DomainEvent)> {
         let _admission = self
             .admit_write(
                 crate::state_writer::WritePriority::PlanningOrCheckpoint,
                 "create_project",
             )
             .await?;
-        if name.trim().is_empty() || contract.target_statement.trim().is_empty() {
-            return Err(StorageError::InvalidTransition(
-                "project name and target statement must not be empty".into(),
-            ));
-        }
-        if budget.max_rounds == 0
-            || budget.max_parallel_workers == 0
-            || budget.max_minutes_per_task == 0
-            || budget.max_model_calls_per_task == 0
-            || budget.max_total_model_calls == 0
-        {
-            return Err(StorageError::InvalidTransition(
-                "all budget limits must be greater than zero".into(),
-            ));
-        }
-        let project_id = new_id("project");
-        let goal_id = new_id("goal");
-        let bottleneck_id = new_id("bottleneck");
-        let now = Utc::now();
         let mut tx = self.pool().begin().await?;
-        sqlx::query("INSERT INTO projects(project_id,name,problem_contract_json,status,revision,current_round,budget_json,created_at,updated_at,human_route_approval) VALUES(?,?,?,?,1,0,?,?,?,?)")
-            .bind(&project_id).bind(name.trim()).bind(json_text(&contract)?)
-            .bind(ProjectStatus::Created.to_string()).bind(json_text(&budget)?)
-            .bind(now.to_rfc3339()).bind(now.to_rfc3339()).bind(human_route_approval).execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO goals(goal_id,project_id,statement,parent_goal_ids_json,status,priority,blocked_by_json,created_in_round) VALUES(?,?,?,?,?,?,?,0)")
-            .bind(&goal_id).bind(&project_id).bind(&contract.target_statement).bind("[]")
-            .bind(GoalStatus::Open.to_string()).bind(1.0_f64).bind("[]").execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO bottlenecks(bottleneck_id,project_id,target_goal_ids_json,kind,precise_statement,completion_contract_json,priority,status,created_revision,updated_revision,created_at,updated_at) VALUES(?,?,?,?,?,?,1.0,'open',1,1,?,?)")
-            .bind(&bottleneck_id).bind(&project_id).bind(json_text(&vec![goal_id.clone()])?)
-            .bind("main_goal_unresolved").bind(format!("Resolve the main goal exactly as stated: {}", contract.target_statement))
-            .bind(json_text(&json!({"success_outputs":["a self-contained candidate proving the exact target, or a verified counterexample"],"partial_outputs":["a strictly narrower named lemma with an explicit implication to the target"],"reject_outputs":["generic discussion","a silently weakened target","an unsupported solved claim"]}))?)
-            .bind(now.to_rfc3339()).bind(now.to_rfc3339()).execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO planner_health(project_id,updated_at) VALUES(?,?)")
-            .bind(&project_id)
-            .bind(now.to_rfc3339())
-            .execute(&mut *tx)
-            .await?;
-        let event = append_event(
-            &mut tx,
-            &project_id,
-            1,
-            "project.created",
-            entity("project", &project_id),
-            json!({"main_goal_id": goal_id,"initial_bottleneck_id":bottleneck_id,"human_route_approval":human_route_approval}),
-            None,
-        )
-        .await?;
+        let result = create_project_tx(&mut tx, &name, contract, budget, review_mode).await?;
         tx.commit().await?;
-        Ok((
-            Project {
-                project_id,
-                name: name.trim().into(),
-                contract,
-                status: ProjectStatus::Created,
-                revision: 1,
-                current_round: 0,
-                budget,
-                created_at: now,
-                updated_at: now,
-            },
-            event,
-        ))
+        Ok(result)
     }
 
     pub async fn enqueue_command(
@@ -193,54 +360,10 @@ impl SqliteStore {
             }
             return Ok((existing, None));
         }
-        let command_id = new_id("cmd");
-        let now = Utc::now();
         let mut tx = self.pool().begin().await?;
-        let actual = current_revision(&mut tx, project_id).await?;
-        if actual != draft.expected_project_revision {
-            return Err(StorageError::RevisionConflict {
-                expected: draft.expected_project_revision,
-                actual,
-            });
-        }
-        sqlx::query("INSERT INTO human_commands(command_id,project_id,type,target_kind,target_id,mode,payload_json,expected_project_revision,idempotency_key,reason,requested_by,status,before_revision,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-            .bind(&command_id).bind(project_id).bind(&draft.command_type).bind(&draft.target_kind).bind(&draft.target_id)
-            .bind(draft.mode.to_string()).bind(json_text(&draft.payload)?).bind(draft.expected_project_revision)
-            .bind(&draft.idempotency_key).bind(&draft.reason).bind(&draft.requested_by).bind(CommandStatus::Queued.to_string())
-            .bind(actual).bind(now.to_rfc3339()).execute(&mut *tx).await?;
-        let revision = bump_revision(&mut tx, project_id).await?;
-        let event = append_event(
-            &mut tx,
-            project_id,
-            revision,
-            "human_command.queued",
-            entity("command", &command_id),
-            json!({"type": draft.command_type, "mode": draft.mode}),
-            None,
-        )
-        .await?;
+        let result = enqueue_command_tx(&mut tx, project_id, draft).await?;
         tx.commit().await?;
-        let command = HumanCommand {
-            command_id,
-            project_id: project_id.into(),
-            command_type: draft.command_type,
-            target_kind: draft.target_kind,
-            target_id: draft.target_id,
-            mode: draft.mode,
-            payload: draft.payload,
-            expected_project_revision: draft.expected_project_revision,
-            idempotency_key: draft.idempotency_key,
-            reason: draft.reason,
-            requested_by: draft.requested_by,
-            status: CommandStatus::Queued,
-            before_revision: Some(actual),
-            after_revision: None,
-            affected_entities: vec![],
-            error: None,
-            created_at: now,
-            applied_at: None,
-        };
-        Ok((command, Some(event)))
+        Ok((result.0, Some(result.1)))
     }
 
     pub async fn apply_command(
@@ -266,10 +389,7 @@ impl SqliteStore {
                     id: command_id.into(),
                 })?;
         let mut command = rows::command(&row)?;
-        if !matches!(
-            command.status,
-            CommandStatus::Queued | CommandStatus::Validated
-        ) {
+        if command.status != CommandStatus::Queued {
             tx.rollback().await?;
             return Ok((command, vec![]));
         }
@@ -307,10 +427,43 @@ impl SqliteStore {
                 ));
             }
             "resume_project" => {
+                // Explicit operator resume starts fresh scheduling after a stop;
+                // cancelled attempts, route epochs and verification fences stay intact.
+                let row = sqlx::query(
+                    "SELECT status,budget_json,current_round FROM projects WHERE project_id=?",
+                )
+                .bind(project_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                let status: String = row.try_get("status")?;
+                if status == "partial_success" {
+                    let budget: Budget = serde_json::from_str(row.try_get("budget_json")?)?;
+                    let round: i64 = row.try_get("current_round")?;
+                    let calls: i64 = sqlx::query_scalar(
+                        "SELECT COALESCE(SUM(model_calls),0) FROM usage_records WHERE project_id=?",
+                    )
+                    .bind(project_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    let exhausted: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM events WHERE project_id=? AND type='project.budget_exhausted')")
+                        .bind(project_id).fetch_one(&mut *tx).await?;
+                    if !exhausted
+                        || round >= i64::from(budget.max_rounds)
+                        || calls >= i64::from(budget.max_total_model_calls)
+                    {
+                        return Err(StorageError::InvalidTransition(
+                            "budget-limited research requires additional round and call headroom before resume".into(),
+                        ));
+                    }
+                }
                 update_project_status(
                     &mut tx,
                     project_id,
-                    &[ProjectStatus::Paused],
+                    &[
+                        ProjectStatus::Paused,
+                        ProjectStatus::StoppedByHuman,
+                        ProjectStatus::PartialSuccess,
+                    ],
                     ProjectStatus::Running,
                 )
                 .await?;
@@ -329,19 +482,83 @@ impl SqliteStore {
                         ProjectStatus::Created,
                         ProjectStatus::Running,
                         ProjectStatus::Paused,
+                        ProjectStatus::NeedsHumanReview,
                     ],
                     ProjectStatus::StoppedByHuman,
                 )
                 .await?;
-                sqlx::query("UPDATE tasks SET status = ?, revision = revision + 1 WHERE project_id = ? AND status IN ('open','assigned','running','blocked')")
-                    .bind(TaskStatus::HumanStopped.to_string()).bind(project_id).execute(&mut *tx).await?;
+                let now = Utc::now().to_rfc3339();
+                let task_ids = sqlx::query_scalar::<_, String>("SELECT task_id FROM tasks WHERE project_id=? AND status IN ('open','queued','assigned','offered','leased','running','checkpointed','result_submitted','ingesting','paused','blocked') ORDER BY task_id")
+                    .bind(project_id).fetch_all(&mut *tx).await?;
+                let stopped_tasks = sqlx::query("UPDATE tasks SET status=?,revision=revision+1 WHERE project_id=? AND status IN ('open','queued','assigned','offered','leased','running','checkpointed','result_submitted','ingesting','paused','blocked')")
+                    .bind(TaskStatus::HumanStopped.to_string()).bind(project_id).execute(&mut *tx).await?.rows_affected();
+                let stopped_routes = sqlx::query("UPDATE routes SET status='human_stopped',cancellation_epoch=cancellation_epoch+1 WHERE project_id=? AND status IN ('proposed','incubating','active','blocked','probation','paused','revived')")
+                    .bind(project_id).execute(&mut *tx).await?.rows_affected();
+                sqlx::query("UPDATE task_leases SET status='cancelled',completed_at=? WHERE project_id=? AND status='active'")
+                    .bind(&now).bind(project_id).execute(&mut *tx).await?;
+                sqlx::query("UPDATE result_envelopes SET status='stale',rejection_reason='project stopped by human' WHERE project_id=? AND status='submitted'")
+                    .bind(project_id).execute(&mut *tx).await?;
+                sqlx::query("UPDATE task_attempts SET status='orphaned',failure_reason='project stopped by human',completed_at=? WHERE project_id=? AND status NOT IN ('completed','failed','orphaned','cancelled')")
+                    .bind(&now).bind(project_id).execute(&mut *tx).await?;
+                sqlx::query("UPDATE worker_instances SET status='exited',quarantine_reason='project stopped by human',exited_at=? WHERE project_id=? AND status NOT IN ('exited','quarantined')")
+                    .bind(&now).bind(project_id).execute(&mut *tx).await?;
+                sqlx::query("UPDATE rounds SET status='interrupted',completed_at=?,summary='project stopped by human' WHERE project_id=? AND status IN ('created','planning','running','verifying','publishing')")
+                    .bind(&now).bind(project_id).execute(&mut *tx).await?;
+                sqlx::query("UPDATE planning_stage_attempts SET status='failed',error='project stopped by human',last_heartbeat_at=?,completed_at=? WHERE project_id=? AND status='running'")
+                    .bind(&now).bind(&now).bind(project_id).execute(&mut *tx).await?;
+                sqlx::query("UPDATE usage_records SET outcome='cancelled',error_kind='human_stop',error_message='project stopped by human' WHERE project_id=? AND outcome='running'")
+                    .bind(project_id).execute(&mut *tx).await?;
+                sqlx::query("UPDATE publication_runs SET status='failed',error='project stopped by human',updated_at=?,completed_at=? WHERE project_id=? AND status='running'")
+                    .bind(&now).bind(&now).bind(project_id).execute(&mut *tx).await?;
                 sqlx::query("UPDATE workers SET status = ?, current_task_id = NULL, current_route_id = NULL WHERE project_id = ? AND status IN ('idle','running','paused')")
                     .bind(WorkerStatus::Stopped.to_string()).bind(project_id).execute(&mut *tx).await?;
+                sqlx::query("UPDATE task_steers SET status='stale',applied_at=? WHERE project_id=? AND status='pending'")
+                    .bind(&now).bind(project_id).execute(&mut *tx).await?;
+                sqlx::query("UPDATE suggestions SET status='rejected',decision=? WHERE project_id=? AND status='pending'")
+                    .bind(json_text(&json!({"disposition":"rejected","rationale":"project stopped by human"}))?)
+                    .bind(project_id).execute(&mut *tx).await?;
+                sqlx::query("UPDATE human_route_proposals SET status='rejected',decision_reason='project stopped by human',decided_at=? WHERE project_id=? AND status='queued'")
+                    .bind(&now).bind(project_id).execute(&mut *tx).await?;
+                sqlx::query("UPDATE human_commands SET status='superseded',error='project stopped by human',applied_at=? WHERE project_id=? AND command_id<>? AND status IN ('queued','validated','waiting_safe_point')")
+                    .bind(&now).bind(project_id).bind(command_id).execute(&mut *tx).await?;
+                let interrupted_report = json_text(&VerificationReport {
+                    verdict: VerificationVerdict::Unknown,
+                    summary:
+                        "Verification was interrupted because the project was stopped by a human."
+                            .into(),
+                    critical_errors: Vec::new(),
+                    gaps: Vec::new(),
+                    uncertainties: vec![
+                        "No mathematical verdict was committed before the stop boundary.".into(),
+                    ],
+                    repair_actions: Vec::new(),
+                    checked_fact_ids: Vec::new(),
+                    checked_source_ids: Vec::new(),
+                    evidence_level: "system_interrupted".into(),
+                })?;
+                let stopped_verifications = sqlx::query("UPDATE verifications SET status='unknown',report_json=?,completed_at=?,started_at=COALESCE(started_at,?) WHERE project_id=? AND status IN ('submitted','prechecking','verifying')")
+                    .bind(&interrupted_report).bind(&now).bind(&now).bind(project_id)
+                    .execute(&mut *tx).await?.rows_affected();
+                sqlx::query("UPDATE candidates SET status='unknown' WHERE project_id=? AND status IN ('submitted','prechecking','verifying')")
+                    .bind(project_id).execute(&mut *tx).await?;
+                let stopped_proof_searches = sqlx::query("UPDATE proof_searches SET status='cancelled',cancellation_epoch=cancellation_epoch+1,completed_at=? WHERE status='running' AND case_id IN (SELECT case_id FROM verification_cases WHERE project_id=?)")
+                    .bind(&now).bind(project_id).execute(&mut *tx).await?.rows_affected();
+                sqlx::query("UPDATE proof_nodes SET status='cancelled',cancellation_epoch=(SELECT cancellation_epoch FROM proof_searches WHERE proof_searches.search_id=proof_nodes.search_id),updated_at=? WHERE status IN ('open','running') AND search_id IN (SELECT ps.search_id FROM proof_searches ps JOIN verification_cases vc ON vc.case_id=ps.case_id WHERE vc.project_id=?)")
+                    .bind(&now).bind(project_id).execute(&mut *tx).await?;
+                sqlx::query("UPDATE verification_cases SET stage='cancelled',cancellation_epoch=cancellation_epoch+1,completed_at=?,updated_at=? WHERE project_id=? AND stage NOT IN ('committed','rejected','unknown','failed','cancelled')")
+                    .bind(&now).bind(&now).bind(project_id).execute(&mut *tx).await?;
+                sqlx::query("UPDATE verification_task_leases SET status='cancelled',completed_at=? WHERE project_id=? AND status='active'")
+                    .bind(&now).bind(project_id).execute(&mut *tx).await?;
+                sqlx::query("UPDATE verification_attempts SET status='cancelled',error_kind='human_stop',error_message='project stopped by human',completed_at=? WHERE case_id IN (SELECT case_id FROM verification_cases WHERE project_id=?) AND status NOT IN ('completed','failed','orphaned','cancelled')")
+                    .bind(&now).bind(project_id).execute(&mut *tx).await?;
+                sqlx::query("UPDATE verification_result_envelopes SET status='stale',rejection_reason='project stopped by human' WHERE project_id=? AND status='submitted'")
+                    .bind(project_id).execute(&mut *tx).await?;
+                affected.extend(task_ids.iter().map(|task_id| entity("task", task_id)));
                 affected.push(entity("project", project_id));
                 event_specs.push((
                     "project.stopped".into(),
                     entity("project", project_id),
-                    json!({}),
+                    json!({"stopped_task_count":stopped_tasks,"stopped_route_count":stopped_routes,"stopped_verification_count":stopped_verifications,"stopped_proof_search_count":stopped_proof_searches}),
                 ));
             }
             "pause_route" | "resume_route" | "stop_route" => {
@@ -380,24 +597,27 @@ impl SqliteStore {
                             json!({}),
                         ));
                     }
-                    "stop_route" if matches!(status.as_str(), "proposed" | "active" | "paused") => {
-                        sqlx::query("UPDATE routes SET status = 'human_stopped', cancellation_epoch = cancellation_epoch + 1 WHERE route_id = ?")
-                            .bind(route_id).execute(&mut *tx).await?;
-                        let task_rows = sqlx::query("SELECT task_id, worker_id FROM tasks WHERE project_id = ? AND route_id = ? AND status IN ('open','assigned','running','blocked')")
-                            .bind(project_id).bind(route_id).fetch_all(&mut *tx).await?;
-                        for row in task_rows {
-                            let task_id: String = row.try_get("task_id")?;
-                            affected.push(entity("task", &task_id));
-                            if let Some(worker_id) =
-                                row.try_get::<Option<String>, _>("worker_id")?
-                            {
-                                affected.push(entity("worker", &worker_id));
-                            }
-                        }
-                        sqlx::query("UPDATE tasks SET status = 'human_stopped', revision = revision + 1 WHERE project_id = ? AND route_id = ? AND status IN ('open','assigned','running','blocked')")
-                            .bind(project_id).bind(route_id).execute(&mut *tx).await?;
-                        sqlx::query("UPDATE workers SET status = 'idle', current_task_id = NULL, current_route_id = NULL WHERE project_id = ? AND current_route_id = ?")
-                            .bind(project_id).bind(route_id).execute(&mut *tx).await?;
+                    "stop_route" => {
+                        let stopped = stop_route_tx(
+                            &mut tx,
+                            project_id,
+                            route_id,
+                            &command.reason,
+                            &Utc::now(),
+                        )
+                        .await?;
+                        affected.extend(
+                            stopped
+                                .cancelled_task_ids
+                                .iter()
+                                .map(|task_id| entity("task", task_id)),
+                        );
+                        affected.extend(
+                            stopped
+                                .cancelled_worker_ids
+                                .iter()
+                                .map(|worker_id| entity("worker", worker_id)),
+                        );
                         event_specs.push((
                             "route.stopped".into(),
                             entity("route", route_id),
@@ -445,55 +665,34 @@ impl SqliteStore {
             }
             "prune_route" => {
                 let route_id = &command.target_id;
-                if command.reason.trim().is_empty() {
-                    return Err(StorageError::InvalidTransition(
-                        "route pruning requires a reason".into(),
-                    ));
-                }
-                let row = sqlx::query(
-                    "SELECT status,semantic_fingerprint FROM routes WHERE project_id=? AND route_id=?",
-                )
-                .bind(project_id)
-                .bind(route_id)
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or_else(|| StorageError::NotFound {
-                    kind: "route",
-                    id: route_id.clone(),
-                })?;
-                let status: String = row.try_get("status")?;
-                if !matches!(
-                    status.as_str(),
-                    "incubating" | "active" | "blocked" | "probation" | "revived" | "paused"
-                ) {
-                    return Err(StorageError::InvalidTransition(format!(
-                        "cannot prune route {route_id} from {status}"
-                    )));
-                }
-                let fingerprint: Option<String> = row.try_get("semantic_fingerprint")?;
-                sqlx::query("UPDATE routes SET status='pruned',human_review=CASE WHEN human_review='pending' THEN 'rejected' ELSE human_review END,cancellation_epoch=cancellation_epoch+1,merge_reason=? WHERE route_id=?")
-                    .bind(command.reason.trim()).bind(route_id).execute(&mut *tx).await?;
-                sqlx::query("UPDATE projects SET status='running' WHERE project_id=? AND status='needs_human_review' AND NOT EXISTS (SELECT 1 FROM routes WHERE project_id=? AND human_review='pending')")
-                    .bind(project_id).bind(project_id).execute(&mut *tx).await?;
-                sqlx::query("UPDATE tasks SET status='cancelled',revision=revision+1,result_summary=COALESCE(result_summary,'route pruned by operator') WHERE route_id=? AND status IN ('open','assigned','queued','offered','leased','running','checkpointed','result_submitted','ingesting','blocked','paused')")
-                    .bind(route_id).execute(&mut *tx).await?;
-                sqlx::query("UPDATE task_leases SET status='cancelled',completed_at=? WHERE task_id IN (SELECT task_id FROM tasks WHERE route_id=?) AND status='active'")
-                    .bind(Utc::now().to_rfc3339()).bind(route_id).execute(&mut *tx).await?;
-                sqlx::query("UPDATE worker_instances SET status='exited',exited_at=? WHERE worker_instance_id IN (SELECT worker_instance_id FROM task_attempts WHERE task_id IN (SELECT task_id FROM tasks WHERE route_id=?)) AND status IN ('handshaking','ready','running','draining')")
-                    .bind(Utc::now().to_rfc3339()).bind(route_id).execute(&mut *tx).await?;
-                let tombstone_id = new_id("routetombstone");
                 let applied_revision = current_revision(&mut tx, project_id).await? + 1;
-                sqlx::query("INSERT OR IGNORE INTO route_tombstones(tombstone_id,project_id,route_id,semantic_fingerprint,reason,revive_only_if_json,created_revision,created_at) VALUES(?,?,?,?,?,?,?,?)")
-                    .bind(&tombstone_id).bind(project_id).bind(route_id)
-                    .bind(fingerprint.unwrap_or_else(|| route_id.clone())).bind(command.reason.trim())
-                    .bind("[\"new_certified_evidence\",\"changed_assumption_or_goal\",\"human_explicit_revival\"]")
-                    .bind(applied_revision).bind(Utc::now().to_rfc3339())
-                    .execute(&mut *tx).await?;
+                let now = Utc::now();
+                let mutation = prune_route_tx(
+                    &mut tx,
+                    project_id,
+                    route_id,
+                    applied_revision,
+                    &command.reason,
+                    &now,
+                )
+                .await?;
+                affected.extend(
+                    mutation
+                        .cancelled_task_ids
+                        .iter()
+                        .map(|task_id| entity("task", task_id)),
+                );
+                affected.extend(
+                    mutation
+                        .cancelled_worker_ids
+                        .iter()
+                        .map(|worker_id| entity("worker", worker_id)),
+                );
                 affected.push(entity("route", route_id));
                 event_specs.push((
                     "route.pruned".into(),
                     entity("route", route_id),
-                    json!({"reason":command.reason,"tombstone_id":tombstone_id}),
+                    json!({"reason":command.reason,"tombstone_id":mutation.tombstone_id}),
                 ));
             }
             "merge_routes" => {
@@ -515,50 +714,30 @@ impl SqliteStore {
                     .filter_map(Value::as_str)
                     .map(ToOwned::to_owned)
                     .collect::<Vec<_>>();
-                if command.reason.trim().is_empty() || source_route_ids.is_empty() {
-                    return Err(StorageError::InvalidTransition(
-                        "route merge requires a reason and at least one source route".into(),
-                    ));
-                }
-                if source_route_ids.iter().any(|id| id == canonical_route_id) {
-                    return Err(StorageError::InvalidTransition(
-                        "canonical route cannot also be a source route".into(),
-                    ));
-                }
-                let canonical_status: String = sqlx::query_scalar(
-                    "SELECT status FROM routes WHERE project_id=? AND route_id=?",
+                let merged = merge_routes_tx(
+                    &mut tx,
+                    project_id,
+                    canonical_route_id,
+                    &source_route_ids,
+                    &command.reason,
+                    &Utc::now(),
                 )
-                .bind(project_id)
-                .bind(canonical_route_id)
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or_else(|| StorageError::NotFound {
-                    kind: "route",
-                    id: canonical_route_id.into(),
-                })?;
-                if !matches!(
-                    canonical_status.as_str(),
-                    "incubating" | "active" | "blocked" | "probation" | "revived"
-                ) {
-                    return Err(StorageError::InvalidTransition(format!(
-                        "canonical route is not live: {canonical_status}"
-                    )));
-                }
-                for source_route_id in &source_route_ids {
-                    let changed=sqlx::query("UPDATE routes SET status='merged',merged_into=?,merge_reason=?,cancellation_epoch=cancellation_epoch+1 WHERE project_id=? AND route_id=? AND status IN ('incubating','active','blocked','probation','revived','paused')")
-                        .bind(canonical_route_id).bind(command.reason.trim()).bind(project_id).bind(source_route_id)
-                        .execute(&mut *tx).await?;
-                    if changed.rows_affected() != 1 {
-                        return Err(StorageError::InvalidTransition(format!(
-                            "source route {source_route_id} is missing or not mergeable"
-                        )));
-                    }
-                    sqlx::query("UPDATE tasks SET status='cancelled',revision=revision+1,result_summary=COALESCE(result_summary,'route merged into canonical route') WHERE route_id=? AND status IN ('open','assigned','queued','offered','leased','running','checkpointed','result_submitted','ingesting','blocked','paused')")
-                        .bind(source_route_id).execute(&mut *tx).await?;
-                    sqlx::query("UPDATE task_leases SET status='cancelled',completed_at=? WHERE task_id IN (SELECT task_id FROM tasks WHERE route_id=?) AND status='active'")
-                        .bind(Utc::now().to_rfc3339()).bind(source_route_id).execute(&mut *tx).await?;
+                .await?;
+                for source_route_id in &merged.routes {
                     affected.push(entity("route", source_route_id));
                 }
+                affected.extend(
+                    merged
+                        .cancelled_tasks
+                        .iter()
+                        .map(|task_id| entity("task", task_id)),
+                );
+                affected.extend(
+                    merged
+                        .cancelled_workers
+                        .iter()
+                        .map(|worker_id| entity("worker", worker_id)),
+                );
                 affected.push(entity("route", canonical_route_id));
                 event_specs.push((
                     "route.merged".into(),
@@ -577,21 +756,16 @@ impl SqliteStore {
                     .filter_map(Value::as_str)
                     .map(ToOwned::to_owned)
                     .collect::<Vec<_>>();
-                if command.reason.trim().is_empty() || evidence_ids.is_empty() {
-                    return Err(StorageError::InvalidTransition(
-                        "route revival requires a reason and evidence_ids".into(),
-                    ));
-                }
-                let changed=sqlx::query("UPDATE routes SET status='revived',cancellation_epoch=cancellation_epoch+1,consecutive_no_progress_plans=0,merge_reason=NULL WHERE project_id=? AND route_id=? AND status='pruned'")
-                    .bind(project_id).bind(route_id).execute(&mut *tx).await?;
-                if changed.rows_affected() != 1 {
-                    return Err(StorageError::InvalidTransition(
-                        "only a pruned route can be revived".into(),
-                    ));
-                }
                 let applied_revision = current_revision(&mut tx, project_id).await? + 1;
-                sqlx::query("UPDATE route_tombstones SET revived_revision=? WHERE project_id=? AND route_id=? AND revived_revision IS NULL")
-                    .bind(applied_revision).bind(project_id).bind(route_id).execute(&mut *tx).await?;
+                revive_route_tx(
+                    &mut tx,
+                    project_id,
+                    route_id,
+                    applied_revision,
+                    &command.reason,
+                    &evidence_ids,
+                )
+                .await?;
                 affected.push(entity("route", route_id));
                 event_specs.push((
                     "route.revived".into(),
@@ -618,8 +792,21 @@ impl SqliteStore {
                         if let Some(task_id) =
                             row.try_get::<Option<String>, _>("current_task_id")?
                         {
-                            sqlx::query("UPDATE tasks SET status='paused',revision=revision+1 WHERE task_id=? AND status='running'")
-                                .bind(&task_id).execute(&mut *tx).await?;
+                            let cancelled = cancel_task_execution_tx(
+                                &mut tx,
+                                project_id,
+                                &task_id,
+                                "paused",
+                                &format!("worker paused by command {command_id}"),
+                                &Utc::now(),
+                            )
+                            .await?;
+                            affected.extend(
+                                cancelled
+                                    .worker_ids
+                                    .iter()
+                                    .map(|affected_worker_id| entity("worker", affected_worker_id)),
+                            );
                             affected.push(entity("task", &task_id));
                         }
                         sqlx::query("UPDATE workers SET status='paused',current_task_id=NULL,current_route_id=NULL WHERE worker_id=?")
@@ -666,8 +853,21 @@ impl SqliteStore {
                 sqlx::query("UPDATE workers SET status = 'stopped', current_task_id = NULL, current_route_id = NULL WHERE worker_id = ?")
                     .bind(worker_id).execute(&mut *tx).await?;
                 if let Some(task_id) = task_id {
-                    sqlx::query("UPDATE tasks SET status = 'cancelled', revision = revision + 1 WHERE task_id = ? AND status IN ('open','assigned','running','blocked')")
-                        .bind(&task_id).execute(&mut *tx).await?;
+                    let cancelled = cancel_task_execution_tx(
+                        &mut tx,
+                        project_id,
+                        &task_id,
+                        "cancelled",
+                        &format!("worker stopped by command {command_id}"),
+                        &Utc::now(),
+                    )
+                    .await?;
+                    affected.extend(
+                        cancelled
+                            .worker_ids
+                            .iter()
+                            .map(|affected_worker_id| entity("worker", affected_worker_id)),
+                    );
                     affected.push(entity("task", &task_id));
                 }
                 affected.push(entity("worker", worker_id));
@@ -913,10 +1113,7 @@ impl SqliteStore {
                         "task {task_id} is revision/epoch {task_revision}/{route_epoch}"
                     )));
                 }
-                if matches!(
-                    task_status.as_str(),
-                    "completed" | "rejected" | "cancelled" | "human_stopped"
-                ) {
+                if !matches!(task_status.as_str(), "leased" | "running" | "checkpointed") {
                     return Err(StorageError::InvalidTransition(format!(
                         "cannot steer task {task_id} in {task_status}"
                     )));
@@ -1057,16 +1254,33 @@ impl SqliteStore {
                     "pause_task"
                         if matches!(
                             status.as_str(),
-                            "open" | "assigned" | "running" | "blocked"
+                            "open"
+                                | "queued"
+                                | "assigned"
+                                | "offered"
+                                | "leased"
+                                | "running"
+                                | "checkpointed"
+                                | "result_submitted"
+                                | "ingesting"
+                                | "blocked"
                         ) =>
                     {
-                        sqlx::query(
-                            "UPDATE tasks SET status='paused',revision=revision+1 WHERE task_id=?",
+                        let cancelled = cancel_task_execution_tx(
+                            &mut tx,
+                            project_id,
+                            task_id,
+                            "paused",
+                            &format!("task paused by command {command_id}"),
+                            &Utc::now(),
                         )
-                        .bind(task_id)
-                        .execute(&mut *tx)
                         .await?;
-                        sqlx::query("UPDATE workers SET status='idle',current_task_id=NULL,current_route_id=NULL WHERE current_task_id=?").bind(task_id).execute(&mut *tx).await?;
+                        affected.extend(
+                            cancelled
+                                .worker_ids
+                                .iter()
+                                .map(|worker_id| entity("worker", worker_id)),
+                        );
                         event_specs.push((
                             "task.paused".into(),
                             entity("task", task_id),
@@ -1094,9 +1308,19 @@ impl SqliteStore {
                         ));
                     }
                     "reassign_task"
-                        if !matches!(
+                        if matches!(
                             status.as_str(),
-                            "completed" | "rejected" | "cancelled" | "human_stopped"
+                            "open"
+                                | "queued"
+                                | "assigned"
+                                | "offered"
+                                | "leased"
+                                | "running"
+                                | "checkpointed"
+                                | "result_submitted"
+                                | "ingesting"
+                                | "paused"
+                                | "blocked"
                         ) =>
                     {
                         let worker_id = command
@@ -1119,8 +1343,23 @@ impl SqliteStore {
                                 id: worker_id.into(),
                             });
                         }
-                        sqlx::query("UPDATE workers SET status='idle',current_task_id=NULL,current_route_id=NULL WHERE current_task_id=?").bind(task_id).execute(&mut *tx).await?;
-                        sqlx::query("UPDATE tasks SET worker_id=?,status='assigned',revision=revision+1 WHERE task_id=?").bind(worker_id).bind(task_id).execute(&mut *tx).await?;
+                        let cancelled = cancel_task_execution_tx(
+                            &mut tx,
+                            project_id,
+                            task_id,
+                            "assigned",
+                            &format!("task reassigned by command {command_id}"),
+                            &Utc::now(),
+                        )
+                        .await?;
+                        affected.extend(
+                            cancelled
+                                .worker_ids
+                                .iter()
+                                .map(|old_worker_id| entity("worker", old_worker_id)),
+                        );
+                        sqlx::query("UPDATE tasks SET worker_id=? WHERE project_id=? AND task_id=? AND status='assigned'")
+                            .bind(worker_id).bind(project_id).bind(task_id).execute(&mut *tx).await?;
                         event_specs.push((
                             "task.reassigned".into(),
                             entity("task", task_id),
@@ -1128,15 +1367,36 @@ impl SqliteStore {
                         ));
                     }
                     "cancel_task"
-                        if !matches!(
+                        if matches!(
                             status.as_str(),
-                            "completed" | "rejected" | "cancelled" | "human_stopped"
+                            "open"
+                                | "queued"
+                                | "assigned"
+                                | "offered"
+                                | "leased"
+                                | "running"
+                                | "checkpointed"
+                                | "result_submitted"
+                                | "ingesting"
+                                | "paused"
+                                | "blocked"
                         ) =>
                     {
-                        sqlx::query("UPDATE tasks SET status='cancelled',revision=revision+1 WHERE task_id=?")
-                            .bind(task_id).execute(&mut *tx).await?;
-                        sqlx::query("UPDATE workers SET status='idle',current_task_id=NULL,current_route_id=NULL WHERE current_task_id=?")
-                            .bind(task_id).execute(&mut *tx).await?;
+                        let cancelled = cancel_task_execution_tx(
+                            &mut tx,
+                            project_id,
+                            task_id,
+                            "cancelled",
+                            &format!("task cancelled by command {command_id}"),
+                            &Utc::now(),
+                        )
+                        .await?;
+                        affected.extend(
+                            cancelled
+                                .worker_ids
+                                .iter()
+                                .map(|worker_id| entity("worker", worker_id)),
+                        );
                         event_specs.push((
                             "task.cancelled".into(),
                             entity("task", task_id),
@@ -1181,6 +1441,263 @@ impl SqliteStore {
                 }
                 affected.push(entity("task", task_id));
             }
+            "goal_review" => {
+                let focus = command
+                    .payload
+                    .get("focus")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim();
+                if focus.is_empty() {
+                    return Err(StorageError::InvalidTransition(
+                        "goal review focus must not be empty".into(),
+                    ));
+                }
+                let status: String =
+                    sqlx::query_scalar("SELECT status FROM projects WHERE project_id=?")
+                        .bind(project_id)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                if !matches!(
+                    status.as_str(),
+                    "created" | "running" | "paused" | "needs_human_review"
+                ) {
+                    return Err(StorageError::InvalidTransition(format!(
+                        "goal review cannot restart a project in {status}"
+                    )));
+                }
+                let unfinished_rows = sqlx::query("SELECT task_id,route_id FROM tasks WHERE project_id=? AND status IN ('open','queued','assigned','offered','leased','running','checkpointed','result_submitted','ingesting','paused','blocked') ORDER BY task_id")
+                    .bind(project_id)
+                    .fetch_all(&mut *tx)
+                    .await?;
+                let task_ids = unfinished_rows
+                    .iter()
+                    .map(|row| row.try_get::<String, _>("task_id"))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut route_ids = unfinished_rows
+                    .iter()
+                    .map(|row| row.try_get::<String, _>("route_id"))
+                    .collect::<Result<Vec<_>, _>>()?;
+                route_ids.sort();
+                route_ids.dedup();
+                let interrupted_round_ids = sqlx::query_scalar::<_, String>("SELECT round_id FROM rounds WHERE project_id=? AND status IN ('created','planning','running','verifying','publishing') ORDER BY number")
+                    .bind(project_id)
+                    .fetch_all(&mut *tx)
+                    .await?;
+                let now = Utc::now().to_rfc3339();
+                sqlx::query("UPDATE routes SET cancellation_epoch=cancellation_epoch+1 WHERE project_id=? AND route_id IN (SELECT DISTINCT route_id FROM tasks WHERE project_id=? AND status IN ('open','queued','assigned','offered','leased','running','checkpointed','result_submitted','ingesting','paused','blocked'))")
+                    .bind(project_id)
+                    .bind(project_id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("UPDATE tasks SET status='cancelled',revision=revision+1,route_cancellation_epoch=(SELECT cancellation_epoch FROM routes WHERE routes.route_id=tasks.route_id),result_summary=COALESCE(result_summary,'Cancelled for a human-requested goal review') WHERE project_id=? AND status IN ('open','queued','assigned','offered','leased','running','checkpointed','result_submitted','ingesting','paused','blocked')")
+                    .bind(project_id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("UPDATE context_packets SET status='invalidated',invalidation_reason='superseded by human-requested goal review' WHERE project_id=? AND task_id IN (SELECT task_id FROM tasks WHERE project_id=? AND status='cancelled') AND status='active'")
+                    .bind(project_id)
+                    .bind(project_id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("UPDATE task_leases SET status='cancelled',completed_at=? WHERE project_id=? AND status='active'")
+                    .bind(&now)
+                    .bind(project_id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("UPDATE result_envelopes SET status='stale',rejection_reason='superseded by human-requested goal review' WHERE project_id=? AND status='submitted'")
+                    .bind(project_id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("UPDATE task_attempts SET status='cancelled',failure_reason='superseded by human-requested goal review',completed_at=? WHERE project_id=? AND status NOT IN ('completed','failed','orphaned','cancelled')")
+                    .bind(&now)
+                    .bind(project_id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("UPDATE worker_instances SET status='exited',quarantine_reason='superseded by human-requested goal review',exited_at=? WHERE project_id=? AND status NOT IN ('exited','quarantined')")
+                    .bind(&now)
+                    .bind(project_id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("UPDATE workers SET status='stopped',current_task_id=NULL,current_route_id=NULL WHERE project_id=? AND status NOT IN ('stopped','offline')")
+                    .bind(project_id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("UPDATE planning_stage_attempts SET status='failed',error='superseded by human-requested goal review',last_heartbeat_at=?,completed_at=? WHERE project_id=? AND status='running'")
+                    .bind(&now)
+                    .bind(&now)
+                    .bind(project_id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("UPDATE rounds SET status='interrupted',completed_at=?,summary='Interrupted for a human-requested goal review' WHERE project_id=? AND status IN ('created','planning','running','verifying','publishing')")
+                    .bind(&now)
+                    .bind(project_id)
+                    .execute(&mut *tx)
+                    .await?;
+                // A goal review is an explicit instruction to start a fresh planning
+                // round. Existing per-route review decisions remain auditable but may
+                // not hold the project itself in needs_human_review.
+                sqlx::query("UPDATE projects SET status='running' WHERE project_id=?")
+                    .bind(project_id)
+                    .execute(&mut *tx)
+                    .await?;
+                affected.extend(task_ids.iter().map(|task_id| entity("task", task_id)));
+                affected.extend(route_ids.iter().map(|route_id| entity("route", route_id)));
+                affected.push(entity("project", project_id));
+                event_specs.push((
+                    "goal_review.requested".into(),
+                    entity("project", project_id),
+                    json!({
+                        "focus": focus,
+                        "cancelled_task_ids": task_ids,
+                        "interrupted_round_ids": interrupted_round_ids,
+                        "preserved": ["facts", "artifacts", "event_history"],
+                        "pending_route_reviews_block_new_round": false,
+                    }),
+                ));
+            }
+            "research_settings" => {
+                let limits =
+                    command.payload.get("limits").cloned().ok_or_else(|| {
+                        StorageError::InvalidTransition("limits are required".into())
+                    })?;
+                let budget: Budget = serde_json::from_value(limits.clone())?;
+                validate_project_budget(&budget)?;
+                let used: i64 = sqlx::query_scalar(
+                    "SELECT COALESCE(SUM(model_calls),0) FROM usage_records WHERE project_id=?",
+                )
+                .bind(project_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                if i64::from(budget.max_total_model_calls) < used {
+                    return Err(StorageError::BudgetExhausted(format!(
+                        "new total limit {} is below already used {used}",
+                        budget.max_total_model_calls
+                    )));
+                }
+                let requested_mode = command
+                    .payload
+                    .get("review_mode")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        StorageError::InvalidTransition("review_mode is required".into())
+                    })?;
+                let review_mode = ReviewMode::from_str(requested_mode)
+                    .map_err(StorageError::InvalidTransition)?;
+                let previous: String =
+                    sqlx::query_scalar("SELECT review_mode FROM projects WHERE project_id=?")
+                        .bind(project_id)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                let approval_required = review_mode == ReviewMode::Strict;
+                let released_route_ids = if !approval_required && previous == "strict" {
+                    sqlx::query_scalar::<_, String>("SELECT route_id FROM routes WHERE project_id=? AND human_review='pending' ORDER BY route_id")
+                        .bind(project_id)
+                        .fetch_all(&mut *tx)
+                        .await?
+                } else {
+                    Vec::new()
+                };
+                if !released_route_ids.is_empty() {
+                    sqlx::query("UPDATE routes SET human_review='not_required' WHERE project_id=? AND human_review='pending'")
+                        .bind(project_id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                sqlx::query("UPDATE projects SET budget_json=?,review_mode=?,human_route_approval=?,status=CASE WHEN ?=0 AND status='needs_human_review' AND NOT EXISTS (SELECT 1 FROM human_questions WHERE project_id=? AND status='open') THEN 'running' ELSE status END WHERE project_id=?")
+                    .bind(json_text(&budget)?)
+                    .bind(review_mode.to_string())
+                    .bind(approval_required)
+                    .bind(approval_required)
+                    .bind(project_id)
+                    .bind(project_id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("INSERT INTO budget_overrides(budget_override_id,project_id,scope_kind,scope_id,limits_json,reason,requested_by,created_at) VALUES(?,?,'project',?,?,?,?,?) ON CONFLICT(project_id,scope_kind,scope_id) DO UPDATE SET limits_json=excluded.limits_json,reason=excluded.reason,requested_by=excluded.requested_by,created_at=excluded.created_at")
+                    .bind(new_id("budget"))
+                    .bind(project_id)
+                    .bind(project_id)
+                    .bind(json_text(&limits)?)
+                    .bind(&command.reason)
+                    .bind(&command.requested_by)
+                    .bind(Utc::now().to_rfc3339())
+                    .execute(&mut *tx)
+                    .await?;
+                affected.push(entity("project", project_id));
+                affected.extend(
+                    released_route_ids
+                        .iter()
+                        .map(|route_id| entity("route", route_id)),
+                );
+                event_specs.push((
+                    "research_settings.updated".into(),
+                    entity("project", project_id),
+                    json!({
+                        "limits": limits,
+                        "previous_review_mode": previous,
+                        "review_mode": review_mode,
+                        "human_route_approval": approval_required,
+                        "released_route_ids": released_route_ids,
+                        "running_tasks_interrupted": false,
+                        "task_contract_policy": "new_tasks_only",
+                    }),
+                ));
+            }
+            "review_policy" => {
+                let requested = command
+                    .payload
+                    .get("review_mode")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        StorageError::InvalidTransition("review_mode is required".into())
+                    })?;
+                let review_mode =
+                    ReviewMode::from_str(requested).map_err(StorageError::InvalidTransition)?;
+                let previous: String =
+                    sqlx::query_scalar("SELECT review_mode FROM projects WHERE project_id=?")
+                        .bind(project_id)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                let approval_required = review_mode == ReviewMode::Strict;
+                let released_route_ids = if !approval_required && previous == "strict" {
+                    sqlx::query_scalar::<_, String>("SELECT route_id FROM routes WHERE project_id=? AND human_review='pending' ORDER BY route_id")
+                        .bind(project_id)
+                        .fetch_all(&mut *tx)
+                        .await?
+                } else {
+                    Vec::new()
+                };
+                if !released_route_ids.is_empty() {
+                    sqlx::query("UPDATE routes SET human_review='not_required' WHERE project_id=? AND human_review='pending'")
+                        .bind(project_id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                sqlx::query("UPDATE projects SET review_mode=?,human_route_approval=?,status=CASE WHEN ?=0 AND status='needs_human_review' AND NOT EXISTS (SELECT 1 FROM human_questions WHERE project_id=? AND status='open') THEN 'running' ELSE status END WHERE project_id=?")
+                    .bind(review_mode.to_string())
+                    .bind(approval_required)
+                    .bind(approval_required)
+                    .bind(project_id)
+                    .bind(project_id)
+                    .execute(&mut *tx)
+                    .await?;
+                affected.push(entity("project", project_id));
+                affected.extend(
+                    released_route_ids
+                        .iter()
+                        .map(|route_id| entity("route", route_id)),
+                );
+                event_specs.push((
+                    "review_policy.updated".into(),
+                    entity("project", project_id),
+                    json!({
+                        "previous_review_mode": previous,
+                        "review_mode": review_mode,
+                        "human_route_approval": approval_required,
+                        "released_route_ids": released_route_ids,
+                        "existing_running_routes_interrupted": false,
+                    }),
+                ));
+            }
             "adjust_budget" => {
                 let scope_kind = command
                     .payload
@@ -1198,6 +1715,7 @@ impl SqliteStore {
                     })?;
                 if scope_kind == "project" {
                     let budget: Budget = serde_json::from_value(limits.clone())?;
+                    validate_project_budget(&budget)?;
                     let used: i64 = sqlx::query_scalar(
                         "SELECT COALESCE(SUM(model_calls),0) FROM usage_records WHERE project_id=?",
                     )
@@ -1359,6 +1877,27 @@ impl SqliteStore {
                         "suggestion content must not be empty".into(),
                     ));
                 }
+                let target_route_id = command
+                    .payload
+                    .get("target_route_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|route_id| !route_id.is_empty())
+                    .map(str::to_owned);
+                if let Some(route_id) = &target_route_id {
+                    let belongs_to_project: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM routes WHERE project_id=? AND route_id=?",
+                    )
+                    .bind(project_id)
+                    .bind(route_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if belongs_to_project != 1 {
+                        return Err(StorageError::InvalidTransition(format!(
+                            "target_route_id {route_id} is not a route in this project"
+                        )));
+                    }
+                }
                 let current_round: i64 =
                     sqlx::query_scalar("SELECT current_round FROM projects WHERE project_id = ?")
                         .bind(project_id)
@@ -1367,7 +1906,7 @@ impl SqliteStore {
                 let suggestion_id = new_id("suggestion");
                 sqlx::query("INSERT INTO suggestions(suggestion_id,project_id,command_id,content,target_route_id,status,created_in_round,effective_round) VALUES(?,?,?,?,?,'pending',?,?)")
                     .bind(&suggestion_id).bind(project_id).bind(command_id).bind(content)
-                    .bind(command.payload.get("target_route_id").and_then(Value::as_str)).bind(current_round).bind(current_round + 1).execute(&mut *tx).await?;
+                    .bind(target_route_id.as_deref()).bind(current_round).bind(current_round + 1).execute(&mut *tx).await?;
                 sqlx::query("UPDATE human_commands SET status = 'validated' WHERE command_id = ?")
                     .bind(command_id)
                     .execute(&mut *tx)
@@ -1445,7 +1984,7 @@ impl SqliteStore {
         project_id: &str,
         command_id: &str,
         message: &str,
-    ) -> StorageResult<(HumanCommand, DomainEvent)> {
+    ) -> StorageResult<(HumanCommand, Option<DomainEvent>)> {
         let _admission = self
             .admit_write(
                 crate::state_writer::WritePriority::HumanSafety,
@@ -1453,8 +1992,29 @@ impl SqliteStore {
             )
             .await?;
         let mut tx = self.pool().begin().await?;
-        sqlx::query("UPDATE human_commands SET status = 'failed', error = ? WHERE project_id = ? AND command_id = ? AND status IN ('queued','validated','waiting_safe_point')")
+        let row = sqlx::query("SELECT * FROM human_commands WHERE project_id=? AND command_id=?")
+            .bind(project_id)
+            .bind(command_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| StorageError::NotFound {
+                kind: "command",
+                id: command_id.into(),
+            })?;
+        let command = rows::command(&row)?;
+        if !matches!(
+            command.status,
+            CommandStatus::Queued | CommandStatus::Validated | CommandStatus::WaitingSafePoint
+        ) {
+            tx.rollback().await?;
+            return Ok((command, None));
+        }
+        let changed = sqlx::query("UPDATE human_commands SET status = 'failed', error = ? WHERE project_id = ? AND command_id = ? AND status IN ('queued','validated','waiting_safe_point')")
             .bind(message).bind(project_id).bind(command_id).execute(&mut *tx).await?;
+        if changed.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok((self.get_command(project_id, command_id).await?, None));
+        }
         let revision = bump_revision(&mut tx, project_id).await?;
         let event = append_event(
             &mut tx,
@@ -1472,7 +2032,29 @@ impl SqliteStore {
             .await?;
         let command = rows::command(&row)?;
         tx.commit().await?;
-        Ok((command, event))
+        Ok((command, Some(event)))
+    }
+
+    /// Returns durable commands whose dispatch did not complete before a
+    /// process interruption. Callers may safely race: `apply_command` claims
+    /// only the queued state under the `StateWriter`.
+    pub async fn pending_command_ids(
+        &self,
+        project_id: Option<&str>,
+    ) -> StorageResult<Vec<(String, String)>> {
+        let rows = if let Some(project_id) = project_id {
+            sqlx::query("SELECT project_id,command_id FROM human_commands WHERE project_id=? AND status='queued' ORDER BY created_at,command_id")
+                .bind(project_id)
+                .fetch_all(self.pool())
+                .await?
+        } else {
+            sqlx::query("SELECT project_id,command_id FROM human_commands WHERE status='queued' ORDER BY created_at,command_id")
+                .fetch_all(self.pool())
+                .await?
+        };
+        rows.iter()
+            .map(|row| Ok((row.try_get("project_id")?, row.try_get("command_id")?)))
+            .collect()
     }
 
     pub async fn recover_project(&self, project_id: &str) -> StorageResult<Vec<DomainEvent>> {
@@ -1721,6 +2303,18 @@ impl SqliteStore {
             tx.rollback().await?;
             return Ok((attempt_id, None));
         }
+        let runnable: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM rounds r JOIN projects p ON p.project_id=r.project_id WHERE r.project_id=? AND r.round_id=? AND r.status='planning' AND p.status='running'",
+        )
+        .bind(project_id)
+        .bind(round_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if runnable != 1 {
+            return Err(StorageError::InvalidTransition(
+                "planning attempt requires a running project and active planning round".into(),
+            ));
+        }
         let attempt_id = new_id("planningattempt");
         let now = Utc::now();
         let soft_deadline = now + chrono::Duration::seconds(soft_timeout_seconds.max(1));
@@ -1827,6 +2421,42 @@ impl SqliteStore {
             .collect()
     }
 
+    /// The first persisted attempt anchors the shared planning budget across
+    /// stages, retries and service restarts. Reusing an attempt never resets it.
+    pub async fn planning_round_started_at(
+        &self,
+        project_id: &str,
+        round_id: &str,
+    ) -> StorageResult<Option<chrono::DateTime<Utc>>> {
+        let started = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT MIN(started_at) FROM planning_stage_attempts WHERE project_id=? AND round_id=?",
+        )
+        .bind(project_id)
+        .bind(round_id)
+        .fetch_one(self.pool())
+        .await?;
+        rows::optional_timestamp(started)
+    }
+
+    pub async fn planning_stage_attempt_completed(
+        &self,
+        project_id: &str,
+        round_id: &str,
+        stage: &str,
+        input_hash: &str,
+    ) -> StorageResult<bool> {
+        let completed: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM planning_stage_attempts WHERE project_id=? AND round_id=? AND stage=? AND input_hash=? AND status='completed')",
+        )
+        .bind(project_id)
+        .bind(round_id)
+        .bind(stage)
+        .bind(input_hash)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(completed != 0)
+    }
+
     pub async fn save_plan(
         &self,
         project_id: &str,
@@ -1867,7 +2497,7 @@ impl SqliteStore {
                 proposal.target_goal_ids.clone()
             };
             let score = proposal.score();
-            let attributes = BTreeMap::from([("risks".into(), json!(proposal.risks))]);
+            let attributes = route_attributes(proposal);
             sqlx::query("INSERT INTO routes(route_id,project_id,title,method_summary,target_goal_ids_json,required_fact_ids_json,status,score,priority,cancellation_epoch,created_in_round,attributes_json) VALUES(?,?,?,?,?,?,?,?,?,0,?,?)")
                 .bind(&route_id).bind(project_id).bind(&proposal.title).bind(&proposal.method_summary)
                 .bind(json_text(&target_goal_ids)?).bind(json_text(&proposal.required_fact_ids)?)
@@ -1989,38 +2619,19 @@ impl SqliteStore {
                 .await?,
             );
         }
-        let pending = sqlx::query("SELECT command_id, suggestion_id FROM suggestions WHERE project_id = ? AND status = 'pending' AND effective_round <= ?")
-            .bind(project_id).bind(round.number).fetch_all(&mut *tx).await?;
-        for item in pending {
-            let command_id: String = item.try_get("command_id")?;
-            let suggestion_id: String = item.try_get("suggestion_id")?;
-            sqlx::query(
-                "UPDATE suggestions SET status = 'applied', decision = ? WHERE suggestion_id = ?",
+        let suggestion_resolution_time = Utc::now();
+        events.extend(
+            crate::suggestions::resolve_plan_suggestions(
+                &mut tx,
+                project_id,
+                round.number,
+                revision,
+                None,
+                &plan.suggestion_decisions,
+                &suggestion_resolution_time,
             )
-            .bind(
-                plan.suggestion_decisions
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "considered by planner".into()),
-            )
-            .bind(&suggestion_id)
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query("UPDATE human_commands SET status = 'applied', after_revision = ?, applied_at = ? WHERE command_id = ?")
-                .bind(revision).bind(Utc::now().to_rfc3339()).bind(&command_id).execute(&mut *tx).await?;
-            events.push(
-                append_event(
-                    &mut tx,
-                    project_id,
-                    revision,
-                    "human_command.applied",
-                    entity("command", &command_id),
-                    json!({"suggestion_id": suggestion_id}),
-                    None,
-                )
-                .await?,
-            );
-        }
+            .await?,
+        );
         tx.commit().await?;
         let mut saved_round = round.clone();
         saved_round.status = RoundStatus::Running;
@@ -2125,157 +2736,19 @@ impl SqliteStore {
                 "task status={task_status}, revision={task_revision}, route status={route_status}, epoch={epoch}"
             )));
         }
-        for discovery in &output.discoveries {
-            sqlx::query("INSERT INTO hypotheses(hypothesis_id,project_id,kind,statement,status,route_id,created_in_round,attributes_json) VALUES(?,?,?,?,?,?,?,?)")
-                .bind(new_id("hyp")).bind(&task.project_id).bind(&discovery.kind).bind(&discovery.statement).bind("proposed").bind(&task.route_id).bind(task.round).bind(json_text(&discovery.attributes)?).execute(&mut *tx).await?;
-        }
-        for failure in &output.failures {
-            sqlx::query("INSERT INTO failures(failure_id,project_id,route_id,task_id,failure_type,summary,repairable,raw_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)")
-                .bind(new_id("failure")).bind(&task.project_id).bind(&task.route_id).bind(&task.task_id).bind(&failure.failure_type).bind(&failure.summary).bind(failure.repairable).bind(json_text(failure)?).bind(Utc::now().to_rfc3339()).execute(&mut *tx).await?;
-        }
-        for description in &output.uncertainties {
-            sqlx::query("INSERT INTO uncertainties(uncertainty_id,project_id,description,type,severity,affects_goal_ids_json,affects_route_ids_json,introduced_by,resolution_methods_json,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)")
-                .bind(new_id("unc")).bind(&task.project_id).bind(description).bind("worker_uncertainty").bind("medium").bind(json_text(&task.goal_ids)?).bind(json_text(&vec![task.route_id.clone()])?).bind(&task.task_id).bind("[]").bind(UncertaintyStatus::Open.to_string()).bind(Utc::now().to_rfc3339()).execute(&mut *tx).await?;
-        }
-        let mut accepted_source_count = 0_usize;
-        let mut rejected_source_drafts = Vec::new();
-        for source in &output.sources {
-            let (normalized_url, identifier_kind, identifier_value) =
-                crate::normalized_source_identity(source.url.as_deref());
-            let fulltext_artifact_valid = match &source.fulltext_artifact_id {
-                Some(artifact_id) => sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM artifacts WHERE artifact_id=? AND project_id=? AND kind='source_fulltext' AND (? IS NULL OR lower(sha256)=lower(?))")
-                    .bind(artifact_id).bind(&task.project_id).bind(&source.fulltext_sha256).bind(&source.fulltext_sha256)
-                    .fetch_one(&mut *tx).await? == 1,
-                None => task.worker_role != "literature_researcher" || source.status == "not_applicable",
-            };
-            let has_stable_identifier = source
-                .url
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty())
-                || source
-                    .citation_key
-                    .as_deref()
-                    .is_some_and(|value| !value.trim().is_empty());
-            let has_content_locator = source
-                .theorem_reference
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty());
-            let has_statement = source
-                .statement_excerpt
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty());
-            if source.title.trim().is_empty()
-                || !has_stable_identifier
-                || !has_content_locator
-                || !has_statement
-                || !fulltext_artifact_valid
-            {
-                let mut reasons = Vec::new();
-                if source.title.trim().is_empty() {
-                    reasons.push("missing_title");
-                }
-                if !has_stable_identifier {
-                    reasons.push("missing_stable_identifier");
-                }
-                if !has_content_locator {
-                    reasons.push("missing_theorem_or_content_locator");
-                }
-                if !has_statement {
-                    reasons.push("missing_statement_excerpt");
-                }
-                if !fulltext_artifact_valid {
-                    reasons.push("missing_or_invalid_fulltext_artifact");
-                }
-                let failure_id = new_id("failure");
-                sqlx::query("INSERT INTO failures(failure_id,project_id,route_id,task_id,failure_type,summary,repairable,raw_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)")
-                    .bind(&failure_id).bind(&task.project_id).bind(&task.route_id).bind(&task.task_id)
-                    .bind("invalid_source_draft").bind(format!("Rejected literature source draft: {}", reasons.join(", ")))
-                    .bind(true).bind(json_text(&json!({"source":source,"reasons":reasons}))?)
-                    .bind(Utc::now().to_rfc3339()).execute(&mut *tx).await?;
-                sqlx::query("INSERT INTO source_ingestion_records(ingestion_id,project_id,task_id,route_id,source_id,disposition,reasons_json,normalized_url,identifier_kind,identifier_value,raw_json,created_at) VALUES(?,?,?,?,NULL,'rejected',?,?,?,?,?,?)")
-                    .bind(new_id("sourceingest")).bind(&task.project_id).bind(&task.task_id).bind(&task.route_id)
-                    .bind(json_text(&reasons)?).bind(&normalized_url).bind(&identifier_kind).bind(&identifier_value)
-                    .bind(json_text(source)?).bind(Utc::now().to_rfc3339()).execute(&mut *tx).await?;
-                rejected_source_drafts.push((failure_id, reasons));
-                continue;
-            }
-            let duplicate_source_id = sqlx::query_scalar::<_, String>("SELECT source_id FROM sources WHERE project_id=? AND ((? IS NOT NULL AND normalized_url=?) OR (? IS NOT NULL AND identifier_kind=? AND identifier_value=?)) LIMIT 1")
-                .bind(&task.project_id).bind(&normalized_url).bind(&normalized_url).bind(&identifier_value)
-                .bind(&identifier_kind).bind(&identifier_value).fetch_optional(&mut *tx).await?;
-            if let Some(source_id) = duplicate_source_id {
-                sqlx::query("INSERT INTO source_ingestion_records(ingestion_id,project_id,task_id,route_id,source_id,disposition,reasons_json,normalized_url,identifier_kind,identifier_value,raw_json,created_at) VALUES(?,?,?,?,?,'duplicate','[\"same_normalized_identifier\"]',?,?,?,?,?)")
-                    .bind(new_id("sourceingest")).bind(&task.project_id).bind(&task.task_id).bind(&task.route_id).bind(source_id)
-                    .bind(&normalized_url).bind(&identifier_kind).bind(&identifier_value).bind(json_text(source)?)
-                    .bind(Utc::now().to_rfc3339()).execute(&mut *tx).await?;
-                continue;
-            }
-            let source_id = new_id("source");
-            sqlx::query("INSERT INTO sources(source_id,project_id,title,authors_json,url,normalized_url,identifier_kind,identifier_value,citation_key,theorem_reference,statement_excerpt,assumptions_json,applicability,status,origin_task_id,origin_route_id,fulltext_artifact_id,provenance_json,retrieved_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-                .bind(&source_id)
-                .bind(&task.project_id)
-                .bind(source.title.trim())
-                .bind(json_text(&source.authors)?)
-                .bind(&source.url)
-                .bind(&normalized_url)
-                .bind(&identifier_kind)
-                .bind(&identifier_value)
-                .bind(&source.citation_key)
-                .bind(&source.theorem_reference)
-                .bind(&source.statement_excerpt)
-                .bind(json_text(&source.assumptions)?)
-                .bind(&source.applicability)
-                .bind("reported_unverified")
-                .bind(&task.task_id)
-                .bind(&task.route_id)
-                .bind(&source.fulltext_artifact_id)
-                .bind(json_text(&json!({"ingestion":"worker_output","trust":"reported_unverified","retrieval_query":source.retrieval_query,"document_version":source.document_version,"fulltext_sha256":source.fulltext_sha256}))?)
-                .bind(Utc::now().to_rfc3339())
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query("INSERT INTO source_ingestion_records(ingestion_id,project_id,task_id,route_id,source_id,disposition,reasons_json,normalized_url,identifier_kind,identifier_value,raw_json,created_at) VALUES(?,?,?,?,?,'inserted','[]',?,?,?,?,?)")
-                .bind(new_id("sourceingest")).bind(&task.project_id).bind(&task.task_id).bind(&task.route_id).bind(&source_id)
-                .bind(&normalized_url).bind(&identifier_kind).bind(&identifier_value).bind(json_text(source)?)
-                .bind(Utc::now().to_rfc3339()).execute(&mut *tx).await?;
-            accepted_source_count += 1;
-        }
-        let mut capsule_events = Vec::new();
-        for experiment in &output.experiments {
-            let canonical = json!({
-                "language": experiment.language,
-                "program_text": experiment.program_text,
-                "input": experiment.input,
-                "environment": experiment.environment,
-                "stdout": experiment.stdout,
-                "stderr": experiment.stderr,
-                "exit_code": experiment.exit_code,
-                "artifacts": experiment.artifacts,
-                "conclusion_mapping": experiment.conclusion_mapping,
-                "replay_command": experiment.replay_command,
-            });
-            let content_hash = hex::encode(Sha256::digest(serde_json::to_vec(&canonical)?));
-            let capsule_id = new_id("capsule");
-            sqlx::query("INSERT INTO experiment_capsules(capsule_id,project_id,task_id,route_id,language,program_text,input_json,environment_json,stdout,stderr,exit_code,artifacts_json,conclusion_mapping_json,replay_command_json,status,content_hash,created_at,replayed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)")
-                .bind(&capsule_id)
-                .bind(&task.project_id)
-                .bind(&task.task_id)
-                .bind(&task.route_id)
-                .bind(&experiment.language)
-                .bind(&experiment.program_text)
-                .bind(json_text(&experiment.input)?)
-                .bind(json_text(&experiment.environment)?)
-                .bind(&experiment.stdout)
-                .bind(&experiment.stderr)
-                .bind(experiment.exit_code)
-                .bind(json_text(&experiment.artifacts)?)
-                .bind(json_text(&experiment.conclusion_mapping)?)
-                .bind(json_text(&experiment.replay_command)?)
-                .bind("reported_unverified")
-                .bind(&content_hash)
-                .bind(Utc::now().to_rfc3339())
-                .execute(&mut *tx)
-                .await?;
-            capsule_events.push((capsule_id, content_hash));
-        }
+        let ingestion = crate::worker_output_ingestion::ingest_worker_output_tx(
+            &mut tx,
+            task,
+            output,
+            crate::worker_output_ingestion::WorkerOutputOrigin::Legacy,
+        )
+        .await?;
+        let crate::worker_output_ingestion::WorkerOutputIngestion {
+            recorded_sources,
+            rejected_source_drafts,
+            capsule_events,
+            ..
+        } = ingestion;
         sqlx::query("UPDATE tasks SET status='completed', result_summary=?, revision=revision+1 WHERE task_id=?")
             .bind(&output.summary).bind(&task.task_id).execute(&mut *tx).await?;
         if let Some(worker_id) = &task.worker_id {
@@ -2283,8 +2756,9 @@ impl SqliteStore {
             .bind(Utc::now().to_rfc3339()).bind(worker_id).execute(&mut *tx).await?;
         }
         let revision = bump_revision(&mut tx, &task.project_id).await?;
-        let mut events =
-            Vec::with_capacity(capsule_events.len() + rejected_source_drafts.len() + 1);
+        let mut events = Vec::with_capacity(
+            capsule_events.len() + rejected_source_drafts.len() + recorded_sources.len() + 1,
+        );
         for (failure_id, reasons) in rejected_source_drafts {
             events.push(
                 append_event(
@@ -2294,6 +2768,20 @@ impl SqliteStore {
                     "source.draft.rejected",
                     entity("failure", &failure_id),
                     json!({"task_id":task.task_id,"route_id":task.route_id,"reasons":reasons}),
+                    Some(entity("task", &task.task_id)),
+                )
+                .await?,
+            );
+        }
+        for (source_id, title, admission) in &recorded_sources {
+            events.push(
+                append_event(
+                    &mut tx,
+                    &task.project_id,
+                    revision,
+                    admission.event_type(),
+                    entity("source", source_id),
+                    json!({"task_id":task.task_id,"route_id":task.route_id,"title":title,"trust":admission.stored_status()}),
                     Some(entity("task", &task.task_id)),
                 )
                 .await?,
@@ -2319,7 +2807,7 @@ impl SqliteStore {
             revision,
             "task.completed",
             entity("task", &task.task_id),
-            json!({"summary": output.summary, "candidate_count": output.candidates.len(), "source_draft_count": output.sources.len(), "accepted_source_count":accepted_source_count, "experiment_count": output.experiments.len()}),
+            json!({"summary": output.summary, "candidate_count": output.candidates.len(), "source_draft_count": output.sources.len(), "recorded_source_count":recorded_sources.len(), "experiment_count": output.experiments.len()}),
             None,
         )
         .await?);
@@ -2418,39 +2906,6 @@ impl SqliteStore {
         Ok(events)
     }
 
-    pub async fn record_task_failure(
-        &self,
-        task: &Task,
-        message: &str,
-    ) -> StorageResult<DomainEvent> {
-        let _admission = self
-            .admit_write(
-                crate::state_writer::WritePriority::FactOrLease,
-                "record_task_failure",
-            )
-            .await?;
-        let mut tx = self.pool().begin().await?;
-        sqlx::query("UPDATE tasks SET status='blocked', result_summary=?, revision=revision+1 WHERE task_id=? AND status='running'").bind(message).bind(&task.task_id).execute(&mut *tx).await?;
-        if let Some(worker_id) = &task.worker_id {
-            sqlx::query("UPDATE workers SET status='failed', current_task_id=NULL, current_route_id=NULL WHERE worker_id=?").bind(worker_id).execute(&mut *tx).await?;
-        }
-        sqlx::query("INSERT INTO failures(failure_id,project_id,route_id,task_id,failure_type,summary,repairable,raw_json,created_at) VALUES(?,?,?,?,? ,?,1,?,?)")
-            .bind(new_id("failure")).bind(&task.project_id).bind(&task.route_id).bind(&task.task_id).bind("runtime_error").bind(message).bind(json_text(&json!({"error": message}))?).bind(Utc::now().to_rfc3339()).execute(&mut *tx).await?;
-        let revision = bump_revision(&mut tx, &task.project_id).await?;
-        let event = append_event(
-            &mut tx,
-            &task.project_id,
-            revision,
-            "task.failed",
-            entity("task", &task.task_id),
-            json!({"error": message}),
-            None,
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(event)
-    }
-
     pub async fn submit_candidate(
         &self,
         project_id: &str,
@@ -2463,107 +2918,37 @@ impl SqliteStore {
                 "submit_candidate",
             )
             .await?;
-        if submission.statement.trim().is_empty() || submission.proof_markdown.trim().is_empty() {
-            return Err(StorageError::InvalidTransition(
-                "candidate statement and proof must not be empty".into(),
-            ));
-        }
-        if idempotency_key.trim().is_empty() {
-            return Err(StorageError::InvalidTransition(
-                "candidate Idempotency-Key must not be empty".into(),
-            ));
-        }
         let mut tx = self.pool().begin().await?;
-        if let Some(existing) =
-            sqlx::query("SELECT * FROM candidates WHERE project_id=? AND idempotency_key=?")
-                .bind(project_id)
-                .bind(idempotency_key)
-                .fetch_optional(&mut *tx)
-                .await?
-        {
-            let candidate = rows::candidate(&existing)?;
-            let verification_row = sqlx::query("SELECT * FROM verifications WHERE candidate_id=?")
-                .bind(&candidate.candidate_id)
-                .fetch_one(&mut *tx)
-                .await?;
-            let verification = rows::verification(&verification_row)?;
+        let inserted = crate::candidate_ingestion::insert_candidate_tx(
+            &mut tx,
+            project_id,
+            submission,
+            idempotency_key,
+        )
+        .await?;
+        if !inserted.inserted {
             tx.rollback().await?;
             return Ok(SubmissionReceipt {
-                candidate,
-                verification,
+                candidate: inserted.candidate,
+                verification: inserted.verification,
                 event: None,
             });
         }
-        let row = sqlx::query("SELECT t.revision,t.status,r.status AS route_status,r.cancellation_epoch FROM tasks t JOIN routes r ON t.route_id=r.route_id WHERE t.project_id=? AND t.task_id=? AND t.route_id=?")
-            .bind(project_id).bind(&submission.task_id).bind(&submission.route_id).fetch_optional(&mut *tx).await?
-            .ok_or_else(|| StorageError::NotFound { kind: "task", id: submission.task_id.clone() })?;
-        let revision: i64 = row.try_get("revision")?;
-        let epoch: i64 = row.try_get("cancellation_epoch")?;
-        let route_status: String = row.try_get("route_status")?;
-        let task_status: String = row.try_get("status")?;
-        if revision != submission.task_revision
-            || epoch != submission.route_cancellation_epoch
-            || route_status == "human_stopped"
-        {
-            return Err(StorageError::LateSubmission(format!(
-                "expected task rev/epoch {}/{}, actual {revision}/{epoch}, route={route_status}",
-                submission.task_revision, submission.route_cancellation_epoch
-            )));
-        }
-        if !matches!(task_status.as_str(), "running" | "completed") {
-            return Err(StorageError::InvalidTransition(format!(
-                "task {0} cannot submit candidates while {task_status}",
-                submission.task_id
-            )));
-        }
-        for fact_id in &submission.dependency_fact_ids {
-            let active: Option<String> =
-                sqlx::query_scalar("SELECT f.status FROM facts f WHERE f.fact_id=? AND (f.project_id=? OR EXISTS (SELECT 1 FROM project_fact_imports i WHERE i.target_project_id=? AND i.source_fact_id=f.fact_id AND i.status='active'))")
-                    .bind(fact_id)
-                    .bind(project_id)
-                    .bind(project_id)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-            if active.as_deref() != Some("active") {
-                return Err(StorageError::InvalidDependency(fact_id.clone()));
-            }
-        }
-        let candidate_id = new_id("candidate");
-        let verification_id = new_id("verification");
-        let now = Utc::now();
-        sqlx::query("INSERT INTO candidates(candidate_id,project_id,submission_json,status,created_at,idempotency_key) VALUES(?,?,?,?,?,?)")
-            .bind(&candidate_id).bind(project_id).bind(json_text(&submission)?).bind(CandidateStatus::Submitted.to_string()).bind(now.to_rfc3339()).bind(idempotency_key).execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO verifications(verification_id,candidate_id,project_id,status) VALUES(?,?,?,?)")
-            .bind(&verification_id).bind(&candidate_id).bind(project_id).bind(CandidateStatus::Submitted.to_string()).execute(&mut *tx).await?;
         let project_revision = bump_revision(&mut tx, project_id).await?;
         let event = append_event(
             &mut tx,
             project_id,
             project_revision,
             "claim.submitted",
-            entity("candidate", &candidate_id),
-            json!({"verification_id": verification_id}),
-            Some(entity("task", &submission.task_id)),
+            entity("candidate", &inserted.candidate.candidate_id),
+            json!({"verification_id": inserted.verification.verification_id}),
+            Some(entity("task", &inserted.candidate.submission.task_id)),
         )
         .await?;
         tx.commit().await?;
         Ok(SubmissionReceipt {
-            candidate: Candidate {
-                candidate_id,
-                project_id: project_id.into(),
-                submission,
-                status: CandidateStatus::Submitted,
-                created_at: now,
-            },
-            verification: Verification {
-                verification_id,
-                candidate_id: event.entity.id.clone(),
-                project_id: project_id.into(),
-                status: CandidateStatus::Submitted,
-                report: None,
-                started_at: None,
-                completed_at: None,
-            },
+            candidate: inserted.candidate,
+            verification: inserted.verification,
             event: Some(event),
         })
     }
@@ -2572,15 +2957,32 @@ impl SqliteStore {
         &self,
         verification_id: &str,
     ) -> StorageResult<(Verification, DomainEvent)> {
+        self.try_mark_verification_started(verification_id)
+            .await?
+            .ok_or_else(|| {
+                StorageError::InvalidTransition(format!(
+                    "verification {verification_id} is not submitted"
+                ))
+            })
+    }
+
+    /// Atomically claims a submitted verification for execution.
+    ///
+    /// `None` means another executor already claimed or completed it. This is
+    /// the normal idempotent outcome for concurrent result ingestion.
+    pub async fn try_mark_verification_started(
+        &self,
+        verification_id: &str,
+    ) -> StorageResult<Option<(Verification, DomainEvent)>> {
         let _admission = self
             .admit_write(
                 crate::state_writer::WritePriority::FactOrLease,
-                "mark_verification_started",
+                "try_mark_verification_started",
             )
             .await?;
         let mut tx = self.pool().begin().await?;
         let now = Utc::now();
-        let row = sqlx::query("SELECT * FROM verifications WHERE verification_id=?")
+        let row = sqlx::query("SELECT v.* FROM verifications v WHERE v.verification_id=?")
             .bind(verification_id)
             .fetch_optional(&mut *tx)
             .await?
@@ -2589,13 +2991,21 @@ impl SqliteStore {
                 id: verification_id.into(),
             })?;
         let mut verification = rows::verification(&row)?;
-        if verification.status != CandidateStatus::Submitted {
-            return Err(StorageError::InvalidTransition(format!(
-                "verification {verification_id} is {}, expected submitted",
-                verification.status
-            )));
+        let route_released =
+            crate::verification_execution_is_released(&mut tx, verification_id).await?;
+        if verification.status != CandidateStatus::Submitted || !route_released {
+            tx.rollback().await?;
+            return Ok(None);
         }
-        sqlx::query("UPDATE verifications SET status='verifying',started_at=? WHERE verification_id=? AND status='submitted'").bind(now.to_rfc3339()).bind(verification_id).execute(&mut *tx).await?;
+        let claimed = sqlx::query("UPDATE verifications SET status='verifying',started_at=? WHERE verification_id=? AND status='submitted'")
+            .bind(now.to_rfc3339())
+            .bind(verification_id)
+            .execute(&mut *tx)
+            .await?;
+        if claimed.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(None);
+        }
         sqlx::query("UPDATE candidates SET status='verifying' WHERE candidate_id=?")
             .bind(&verification.candidate_id)
             .execute(&mut *tx)
@@ -2614,7 +3024,127 @@ impl SqliteStore {
         tx.commit().await?;
         verification.status = CandidateStatus::Verifying;
         verification.started_at = Some(now);
-        Ok((verification, event))
+        Ok(Some((verification, event)))
+    }
+
+    /// Releases a verification claim after orchestration failed before a
+    /// verdict was committed. The claim and its in-flight worker state are
+    /// reset together so a later recovery can safely retry it.
+    pub async fn release_verification_claim(
+        &self,
+        verification_id: &str,
+        reason: &str,
+    ) -> StorageResult<Option<DomainEvent>> {
+        let _admission = self
+            .admit_write(
+                crate::state_writer::WritePriority::FactOrLease,
+                "release_verification_claim",
+            )
+            .await?;
+        let mut tx = self.pool().begin().await?;
+        let row = sqlx::query("SELECT v.project_id,v.candidate_id,v.status,p.status AS project_status FROM verifications v JOIN projects p ON p.project_id=v.project_id WHERE v.verification_id=?")
+            .bind(verification_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| StorageError::NotFound {
+                kind: "verification",
+                id: verification_id.into(),
+            })?;
+        let status: String = row.try_get("status")?;
+        if status != "verifying" {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        let project_id: String = row.try_get("project_id")?;
+        let candidate_id: String = row.try_get("candidate_id")?;
+        let project_status: String = row.try_get("project_status")?;
+        let route_released =
+            crate::verification_execution_is_released(&mut tx, verification_id).await?;
+        let retryable = project_status == "paused" || route_released;
+        let next_status = if retryable { "submitted" } else { "unknown" };
+        let now = Utc::now();
+        let report = (!retryable).then(|| VerificationReport {
+            verdict: VerificationVerdict::Unknown,
+            summary: "Verification was interrupted after the project left its runnable state."
+                .into(),
+            critical_errors: Vec::new(),
+            gaps: Vec::new(),
+            uncertainties: vec![reason.to_owned()],
+            repair_actions: Vec::new(),
+            checked_fact_ids: Vec::new(),
+            checked_source_ids: Vec::new(),
+            evidence_level: "system_interrupted".into(),
+        });
+        let updated = sqlx::query("UPDATE verifications SET status=?,report_json=?,started_at=NULL,completed_at=? WHERE verification_id=? AND status='verifying'")
+            .bind(next_status)
+            .bind(report.as_ref().map(json_text).transpose()?)
+            .bind((!retryable).then(|| now.to_rfc3339()))
+            .bind(verification_id)
+            .execute(&mut *tx)
+            .await?;
+        if updated.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        sqlx::query("UPDATE candidates SET status=? WHERE candidate_id=? AND status='verifying'")
+            .bind(next_status)
+            .bind(&candidate_id)
+            .execute(&mut *tx)
+            .await?;
+        let case_ids = sqlx::query_scalar::<_, String>(
+            "SELECT case_id FROM verification_cases WHERE verification_id=?",
+        )
+        .bind(verification_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        for case_id in &case_ids {
+            sqlx::query("UPDATE verification_cases SET stage=CASE WHEN ? THEN CASE WHEN snapshot_id IS NULL THEN 'intake' ELSE 'precheck' END ELSE 'cancelled' END,cancellation_epoch=cancellation_epoch+1,achieved_acceptance=NULL,completed_at=?,updated_at=? WHERE case_id=? AND stage NOT IN ('committed','rejected','unknown','failed','cancelled')")
+                .bind(retryable)
+                .bind((!retryable).then(|| now.to_rfc3339()))
+                .bind(now.to_rfc3339())
+                .bind(case_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("UPDATE verification_task_leases SET status='failed',completed_at=? WHERE case_id=? AND status='active'")
+                .bind(now.to_rfc3339())
+                .bind(case_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("UPDATE verification_attempts SET status='failed',error_kind='orchestrator_error',error_message=?,completed_at=? WHERE case_id=? AND status NOT IN ('completed','failed','orphaned','cancelled')")
+                .bind(reason)
+                .bind(now.to_rfc3339())
+                .bind(case_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("UPDATE verification_result_envelopes SET status='stale',rejection_reason='verification claim released after orchestration error' WHERE case_id=? AND status='submitted'")
+                .bind(case_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query("UPDATE worker_instances SET status='exited',quarantine_reason=COALESCE(quarantine_reason,?),exited_at=? WHERE project_id=? AND worker_instance_id IN (SELECT worker_instance_id FROM verification_attempts WHERE case_id IN (SELECT case_id FROM verification_cases WHERE verification_id=?)) AND status NOT IN ('exited','quarantined')")
+            .bind(reason)
+            .bind(now.to_rfc3339())
+            .bind(&project_id)
+            .bind(verification_id)
+            .execute(&mut *tx)
+            .await?;
+        let revision = bump_revision(&mut tx, &project_id).await?;
+        let event = append_event(
+            &mut tx,
+            &project_id,
+            revision,
+            if retryable {
+                "verification.claim_released"
+            } else {
+                "verification.interrupted"
+            },
+            entity("verification", verification_id),
+            json!({"candidate_id":candidate_id,"reason":reason,"retryable":retryable}),
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Some(event))
     }
 
     #[allow(clippy::missing_panics_doc)]
@@ -2630,12 +3160,18 @@ impl SqliteStore {
             )
             .await?;
         let mut tx = self.pool().begin().await?;
-        let row = sqlx::query("SELECT v.*,c.submission_json,c.status AS candidate_status FROM verifications v JOIN candidates c ON v.candidate_id=c.candidate_id WHERE v.verification_id=?")
+        let row = sqlx::query("SELECT v.*,c.submission_json,c.status AS candidate_status,p.status AS project_status FROM verifications v JOIN candidates c ON v.candidate_id=c.candidate_id JOIN projects p ON p.project_id=v.project_id WHERE v.verification_id=?")
             .bind(verification_id).fetch_optional(&mut *tx).await?
             .ok_or_else(|| StorageError::NotFound { kind: "verification", id: verification_id.into() })?;
         let project_id: String = row.try_get("project_id")?;
         let candidate_id: String = row.try_get("candidate_id")?;
         let verification_status: String = row.try_get("status")?;
+        let project_status: String = row.try_get("project_status")?;
+        if !crate::verification_execution_is_released(&mut tx, verification_id).await? {
+            return Err(StorageError::LateSubmission(format!(
+                "verification {verification_id} cannot commit while project is {project_status}"
+            )));
+        }
         if verification_status != CandidateStatus::Verifying.to_string() {
             return Err(StorageError::LateSubmission(format!(
                 "verification {verification_id} is {verification_status}, expected verifying"
@@ -2643,6 +3179,51 @@ impl SqliteStore {
         }
         let submission: CandidateSubmission =
             serde_json::from_str(row.try_get("submission_json")?)?;
+        let governance_challenge = sqlx::query(
+            "SELECT challenge_id,fact_id FROM fact_challenges WHERE verification_id=? AND status='open'",
+        )
+        .bind(verification_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(|row| {
+            Ok::<_, StorageError>((
+                row.try_get::<String, _>("challenge_id")?,
+                row.try_get::<String, _>("fact_id")?,
+            ))
+        })
+        .transpose()?;
+        if governance_challenge.is_none() {
+            let execution_fence = sqlx::query(
+                "SELECT t.revision AS task_revision,t.route_cancellation_epoch AS task_route_epoch,r.cancellation_epoch AS current_route_epoch FROM tasks t JOIN routes r ON r.project_id=t.project_id AND r.route_id=t.route_id WHERE t.project_id=? AND t.task_id=? AND t.route_id=?",
+            )
+            .bind(&project_id)
+            .bind(&submission.task_id)
+            .bind(&submission.route_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| {
+                StorageError::LateSubmission(format!(
+                    "verification {verification_id} no longer has its authoritative task and route"
+                ))
+            })?;
+            let task_revision: i64 = execution_fence.try_get("task_revision")?;
+            let task_route_epoch: i64 = execution_fence.try_get("task_route_epoch")?;
+            let current_route_epoch: i64 = execution_fence.try_get("current_route_epoch")?;
+            if submission.route_cancellation_epoch != task_route_epoch
+                || submission.route_cancellation_epoch != current_route_epoch
+            {
+                return Err(StorageError::LateSubmission(format!(
+                    "verification {verification_id} belongs to route epoch {}, task epoch is {task_route_epoch}, current route epoch is {current_route_epoch}",
+                    submission.route_cancellation_epoch
+                )));
+            }
+            if task_revision != submission.task_revision {
+                return Err(StorageError::LateSubmission(format!(
+                    "verification {verification_id} belongs to task revision {}, current revision is {task_revision}",
+                    submission.task_revision
+                )));
+            }
+        }
         let status = match report.verdict {
             VerificationVerdict::Accepted => CandidateStatus::Accepted,
             VerificationVerdict::Rejected => CandidateStatus::Rejected,
@@ -2666,33 +3247,29 @@ impl SqliteStore {
             }
             Some(gate)
         } else {
-            let case_id: Option<String> = sqlx::query_scalar(
-                "SELECT case_id FROM verification_cases WHERE verification_id=?",
+            let (case, _) =
+                crate::verification::validate_verification_snapshot_fence(&mut tx, verification_id)
+                    .await?;
+            let adverse_mandatory_checks: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM verification_checks WHERE case_id=? AND mandatory=1 AND status IN ('failed','unknown','error')",
             )
-            .bind(verification_id)
-            .fetch_optional(&mut *tx)
+            .bind(&case.case_id)
+            .fetch_one(&mut *tx)
             .await?;
-            if case_id.is_none() {
+            if !matches!(
+                case.stage,
+                VerificationStage::Adjudication | VerificationStage::CommitReady
+            ) && adverse_mandatory_checks == 0
+            {
                 return Err(StorageError::InvalidTransition(format!(
-                    "verification {verification_id} has no trusted verification case"
+                    "verification case {} cannot commit an adverse verdict from {} without a failed, unknown, or error mandatory check",
+                    case.case_id, case.stage
                 )));
             }
             None
         };
         let now = Utc::now();
-        let governance_challenge = sqlx::query(
-            "SELECT challenge_id,fact_id FROM fact_challenges WHERE verification_id=? AND status='open'",
-        )
-        .bind(verification_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .map(|row| {
-            Ok::<_, StorageError>((
-                row.try_get::<String, _>("challenge_id")?,
-                row.try_get::<String, _>("fact_id")?,
-            ))
-        })
-        .transpose()?;
+        let obligation_revision = current_revision(&mut tx, &project_id).await? + 1;
         sqlx::query("UPDATE verifications SET status=?,report_json=?,completed_at=? WHERE verification_id=?")
             .bind(status.to_string()).bind(json_text(&report)?).bind(now.to_rfc3339()).bind(verification_id).execute(&mut *tx).await?;
         sqlx::query("UPDATE candidates SET status=? WHERE candidate_id=?")
@@ -2702,6 +3279,10 @@ impl SqliteStore {
             .await?;
         let mut fact = None;
         let mut admitted_source_ids = Vec::new();
+        let mut advisory_bottleneck_id = None;
+        let mut created_obligation_ids = Vec::new();
+        let mut updated_obligation_ids = Vec::new();
+        let mut obligation_coverage = Vec::new();
         if report.verdict == VerificationVerdict::Accepted {
             for dependency in &submission.dependency_fact_ids {
                 let active: Option<String> =
@@ -2729,6 +3310,26 @@ impl SqliteStore {
                 .clone()
                 .unwrap_or_else(|| format!("fact_{}", &content_hash[..24]));
             if existing.is_some() {
+                let existing_status: String =
+                    sqlx::query_scalar("SELECT status FROM facts WHERE fact_id=?")
+                        .bind(&fact_id)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                let is_matching_governance_review = governance_challenge
+                    .as_ref()
+                    .is_some_and(|(_, challenged_fact_id)| challenged_fact_id == &fact_id);
+                if existing_status == "revoked" {
+                    return Err(StorageError::InvalidTransition(format!(
+                        "revoked Fact {fact_id} is terminal and cannot be recertified"
+                    )));
+                }
+                if existing_status != "active" && !is_matching_governance_review {
+                    return Err(StorageError::InvalidTransition(format!(
+                        "ordinary verification cannot reuse non-active Fact {fact_id} ({existing_status}); an identity-matched open governance challenge is required"
+                    )));
+                }
+            }
+            if existing.is_some() {
                 let stored: String =
                     sqlx::query_scalar("SELECT verification_ids_json FROM facts WHERE fact_id=?")
                         .bind(&fact_id)
@@ -2753,42 +3354,273 @@ impl SqliteStore {
                 sqlx::query("INSERT OR IGNORE INTO fact_edges(edge_id,project_id,source_id,target_id,kind) VALUES(?,?,?,?,?)")
                     .bind(new_id("edge")).bind(&project_id).bind(dependency).bind(&fact_id).bind("depends_on").execute(&mut *tx).await?;
             }
+            let gate = gate.as_ref().expect("accepted verdict has gate context");
+            // A passed semantic coverage review is not enough to solve a goal:
+            // non-counterexamples need the Fact Gate's strongest assurance.
+            let closure_certified = gate.acceptance == AcceptanceClass::FullyCertified;
             let coverage_check = sqlx::query(
-                "SELECT c.check_id,c.status,c.details_json FROM verification_checks c JOIN verification_cases vc ON vc.case_id=c.case_id WHERE vc.verification_id=? AND c.kind='goal_coverage_review' ORDER BY c.completed_at DESC LIMIT 1",
-            )
-            .bind(verification_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if let Some(coverage) = coverage_check.filter(|row| {
-                row.try_get::<String, _>("status")
-                    .is_ok_and(|status| status == "passed")
-            }) {
-                let check_id: String = coverage.try_get("check_id")?;
-                let evidence_json: String = coverage.try_get("details_json")?;
-                let outcome = if submission.candidate_type == CandidateType::Counterexample {
-                    "refuted"
-                } else {
-                    "solved"
-                };
-                for goal_id in &submission.target_goal_ids {
-                    if submission.candidate_type == CandidateType::Counterexample {
-                        sqlx::query("UPDATE goals SET status='refuted',solved_by_fact_id=? WHERE project_id=? AND goal_id=?")
-                            .bind(&fact_id).bind(&project_id).bind(goal_id).execute(&mut *tx).await?;
-                    } else {
-                        sqlx::query("UPDATE goals SET status='solved',solved_by_fact_id=? WHERE project_id=? AND goal_id=?")
-                            .bind(&fact_id).bind(&project_id).bind(goal_id).execute(&mut *tx).await?;
-                    }
-                    sqlx::query("INSERT OR IGNORE INTO goal_closure_records(closure_id,project_id,goal_id,fact_id,verification_id,check_id,outcome,evidence_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)")
-                        .bind(new_id("closure")).bind(&project_id).bind(goal_id).bind(&fact_id)
-                        .bind(verification_id).bind(&check_id).bind(outcome).bind(&evidence_json)
-                        .bind(now.to_rfc3339()).execute(&mut *tx).await?;
-                }
-                if submission.candidate_type == CandidateType::Counterexample {
-                    sqlx::query("UPDATE projects SET status='refuted' WHERE project_id=?")
-                        .bind(&project_id)
-                        .execute(&mut *tx)
+                    "SELECT c.check_id,c.status,c.summary,c.details_json FROM verification_checks c JOIN verification_cases vc ON vc.case_id=c.case_id WHERE vc.verification_id=? AND c.kind='goal_coverage_review' ORDER BY c.completed_at DESC LIMIT 1",
+                )
+                .bind(verification_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+            let passed_coverage = if closure_certified {
+                coverage_check.as_ref().filter(|row| {
+                    row.try_get::<String, _>("status")
+                        .is_ok_and(|status| status == "passed")
+                })
+            } else {
+                None
+            };
+            let nonpassing_coverage = coverage_check
+                .as_ref()
+                .filter(|row| {
+                    row.try_get::<String, _>("status")
+                        .is_ok_and(|status| status != "passed")
+                })
+                .map(|row| {
+                    let status: String = row.try_get("status")?;
+                    let summary: String = row.try_get("summary")?;
+                    let details_json: String = row.try_get("details_json")?;
+                    crate::proof_obligations::nonpassing_goal_coverage_report(
+                        &status,
+                        &summary,
+                        &details_json,
+                    )
+                })
+                .transpose()?
+                .flatten();
+            let nonpassing_disposition = coverage_check
+                .as_ref()
+                .and_then(|row| row.try_get::<String, _>("status").ok())
+                .and_then(|status| match status.as_str() {
+                    "failed" => Some(ObligationCoverageDisposition::Insufficient),
+                    "passed" => None,
+                    _ => Some(ObligationCoverageDisposition::Unknown),
+                });
+            let target_goal_ids = submission.target_goal_ids.iter().collect::<BTreeSet<_>>();
+            let mut counterexample_refuted_main_goal = false;
+            for goal_id in target_goal_ids {
+                let root_obligation_id =
+                    crate::proof_obligations::root_obligation_id_tx(&mut tx, &project_id, goal_id)
                         .await?;
+                let root_status: String = sqlx::query_scalar(
+                    "SELECT status FROM proof_obligations WHERE obligation_id=?",
+                )
+                .bind(&root_obligation_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                let mut disposition =
+                    nonpassing_disposition.unwrap_or(ObligationCoverageDisposition::Supports);
+                let mut rationale = match disposition {
+                    ObligationCoverageDisposition::Insufficient => "the mathematical candidate was accepted as a Fact, but its Goal coverage review rejected root coverage".to_owned(),
+                    ObligationCoverageDisposition::Unknown => "the mathematical candidate was accepted as a Fact, but its Goal coverage review was inconclusive".to_owned(),
+                    ObligationCoverageDisposition::Supports | ObligationCoverageDisposition::Satisfies => "accepted Fact supports the root obligation but did not close it".to_owned(),
+                };
+                if let Some(coverage) = passed_coverage {
+                    let check_id: String = coverage.try_get("check_id")?;
+                    let evidence_json: String = coverage.try_get("details_json")?;
+                    if submission.candidate_type == CandidateType::Counterexample {
+                        if root_status == "open" {
+                            let goal_priority: f64 = sqlx::query_scalar(
+                                "SELECT priority FROM goals WHERE project_id=? AND goal_id=?",
+                            )
+                            .bind(&project_id)
+                            .bind(goal_id)
+                            .fetch_one(&mut *tx)
+                            .await?;
+                            sqlx::query("UPDATE goals SET status='refuted',solved_by_fact_id=? WHERE project_id=? AND goal_id=?")
+                                .bind(&fact_id).bind(&project_id).bind(goal_id).execute(&mut *tx).await?;
+                            crate::proof_obligations::mark_root_obsolete_tx(
+                                &mut tx,
+                                &root_obligation_id,
+                                obligation_revision,
+                                &now,
+                            )
+                            .await?;
+                            updated_obligation_ids.push(root_obligation_id.clone());
+                            counterexample_refuted_main_goal |= goal_priority >= 1.0;
+                            rationale = "FullyCertified counterexample passed Goal coverage and refuted the Goal; the proof obligation became obsolete rather than satisfied".into();
+                        } else if root_status == "obsolete" {
+                            let goal_priority: f64 = sqlx::query_scalar(
+                                "SELECT priority FROM goals WHERE project_id=? AND goal_id=?",
+                            )
+                            .bind(&project_id)
+                            .bind(goal_id)
+                            .fetch_one(&mut *tx)
+                            .await?;
+                            sqlx::query("UPDATE goals SET status='refuted',solved_by_fact_id=COALESCE(solved_by_fact_id,?) WHERE project_id=? AND goal_id=?")
+                                .bind(&fact_id).bind(&project_id).bind(goal_id).execute(&mut *tx).await?;
+                            counterexample_refuted_main_goal |= goal_priority >= 1.0;
+                            rationale = "another FullyCertified counterexample independently confirms the already-refuted Goal".into();
+                        } else {
+                            if root_status == "satisfied" {
+                                crate::proof_obligations::mark_root_conflicted_tx(
+                                    &mut tx,
+                                    &root_obligation_id,
+                                    obligation_revision,
+                                    &now,
+                                )
+                                .await?;
+                                updated_obligation_ids.push(root_obligation_id.clone());
+                            }
+                            sqlx::query("UPDATE goals SET status='open',solved_by_fact_id=NULL WHERE project_id=? AND goal_id=?")
+                                .bind(&project_id).bind(goal_id).execute(&mut *tx).await?;
+                            sqlx::query("UPDATE projects SET status='needs_human_review' WHERE project_id=? AND status NOT IN ('stopped_by_human','error')")
+                                .bind(&project_id).execute(&mut *tx).await?;
+                            sqlx::query("INSERT INTO uncertainties(uncertainty_id,project_id,description,type,severity,affects_goal_ids_json,affects_route_ids_json,introduced_by,resolution_methods_json,status,created_at) SELECT ?,?,?,?,?,?,?,?,?,'open',? WHERE NOT EXISTS (SELECT 1 FROM uncertainties WHERE project_id=? AND type='certified_closure_conflict' AND status IN ('open','investigating') AND EXISTS (SELECT 1 FROM json_each(affects_goal_ids_json) WHERE value=?))")
+                                .bind(new_id("unc")).bind(&project_id)
+                                .bind("Mutually incompatible FullyCertified proof and counterexample closures require independent adjudication.")
+                                .bind("certified_closure_conflict").bind("critical")
+                                .bind(json_text(&vec![goal_id.to_owned()])?)
+                                .bind(json_text(&vec![submission.route_id.clone()])?)
+                                .bind(verification_id)
+                                .bind(json_text(&vec!["independent replay of both closure artifacts", "human adjudication of the conflicting certified results"])?)
+                                .bind(now.to_rfc3339()).bind(&project_id).bind(goal_id)
+                                .execute(&mut *tx).await?;
+                            disposition = ObligationCoverageDisposition::Unknown;
+                            rationale = "the FullyCertified counterexample conflicts with an existing certified closure; the Goal and root obligation were conservatively reopened for adjudication".into();
+                        }
+                    } else {
+                        let blocked_by_required =
+                            crate::proof_obligations::has_unresolved_required_children_tx(
+                                &mut tx,
+                                &project_id,
+                                goal_id,
+                                &root_obligation_id,
+                            )
+                            .await?;
+                        if root_status == "obsolete" {
+                            crate::proof_obligations::mark_root_conflicted_tx(
+                                &mut tx,
+                                &root_obligation_id,
+                                obligation_revision,
+                                &now,
+                            )
+                            .await?;
+                            updated_obligation_ids.push(root_obligation_id.clone());
+                            sqlx::query("UPDATE goals SET status='open',solved_by_fact_id=NULL WHERE project_id=? AND goal_id=?")
+                                .bind(&project_id).bind(goal_id).execute(&mut *tx).await?;
+                            sqlx::query("UPDATE projects SET status='needs_human_review' WHERE project_id=? AND status NOT IN ('stopped_by_human','error')")
+                                .bind(&project_id).execute(&mut *tx).await?;
+                            sqlx::query("INSERT INTO uncertainties(uncertainty_id,project_id,description,type,severity,affects_goal_ids_json,affects_route_ids_json,introduced_by,resolution_methods_json,status,created_at) SELECT ?,?,?,?,?,?,?,?,?,'open',? WHERE NOT EXISTS (SELECT 1 FROM uncertainties WHERE project_id=? AND type='certified_closure_conflict' AND status IN ('open','investigating') AND EXISTS (SELECT 1 FROM json_each(affects_goal_ids_json) WHERE value=?))")
+                                .bind(new_id("unc")).bind(&project_id)
+                                .bind("Mutually incompatible FullyCertified counterexample and proof closures require independent adjudication.")
+                                .bind("certified_closure_conflict").bind("critical")
+                                .bind(json_text(&vec![goal_id.to_owned()])?)
+                                .bind(json_text(&vec![submission.route_id.clone()])?)
+                                .bind(verification_id)
+                                .bind(json_text(&vec!["independent replay of both closure artifacts", "human adjudication of the conflicting certified results"])?)
+                                .bind(now.to_rfc3339()).bind(&project_id).bind(goal_id)
+                                .execute(&mut *tx).await?;
+                            disposition = ObligationCoverageDisposition::Unknown;
+                            rationale = "the FullyCertified proof conflicts with an existing certified refutation; the Goal and root obligation were conservatively reopened for adjudication".into();
+                        } else if root_status == "blocked" {
+                            disposition = ObligationCoverageDisposition::Unknown;
+                            rationale = "the root obligation is blocked by a conflicting certified closure and requires adjudication".into();
+                        } else if blocked_by_required {
+                            rationale = "FullyCertified coverage was present, but an unresolved required child obligation blocked Goal closure".into();
+                        } else if root_status == "satisfied" {
+                            disposition = ObligationCoverageDisposition::Satisfies;
+                            rationale = "another FullyCertified Fact independently satisfies the already-closed root obligation".into();
+                        } else {
+                            sqlx::query("UPDATE goals SET status='solved',solved_by_fact_id=? WHERE project_id=? AND goal_id=?")
+                                .bind(&fact_id).bind(&project_id).bind(goal_id).execute(&mut *tx).await?;
+                            crate::proof_obligations::mark_root_satisfied_tx(
+                                &mut tx,
+                                &root_obligation_id,
+                                &fact_id,
+                                obligation_revision,
+                                &now,
+                            )
+                            .await?;
+                            updated_obligation_ids.push(root_obligation_id.clone());
+                            disposition = ObligationCoverageDisposition::Satisfies;
+                            rationale = "FullyCertified proof Fact passed Goal coverage with no unresolved required child obligations".into();
+                        }
+                    }
+                    if disposition == ObligationCoverageDisposition::Satisfies
+                        || (submission.candidate_type == CandidateType::Counterexample
+                            && matches!(root_status.as_str(), "open" | "obsolete"))
+                    {
+                        let outcome = if submission.candidate_type == CandidateType::Counterexample
+                        {
+                            "refuted"
+                        } else {
+                            "solved"
+                        };
+                        sqlx::query("INSERT OR IGNORE INTO goal_closure_records(closure_id,project_id,goal_id,fact_id,verification_id,check_id,outcome,evidence_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)")
+                            .bind(new_id("closure")).bind(&project_id).bind(goal_id).bind(&fact_id)
+                            .bind(verification_id).bind(&check_id).bind(outcome).bind(&evidence_json)
+                            .bind(now.to_rfc3339()).execute(&mut *tx).await?;
+                    }
                 }
+                crate::proof_obligations::record_root_coverage_tx(
+                    &mut tx,
+                    crate::proof_obligations::RootCoverage {
+                        project_id: &project_id,
+                        candidate_id: &candidate_id,
+                        verification_id,
+                        obligation_id: &root_obligation_id,
+                        disposition,
+                        fact_id: Some(&fact_id),
+                        rationale: &rationale,
+                        now: &now,
+                    },
+                )
+                .await?;
+                obligation_coverage.push(json!({
+                    "goal_id":goal_id,
+                    "obligation_id":root_obligation_id,
+                    "disposition":disposition,
+                }));
+            }
+            if let Some(coverage_report) = &nonpassing_coverage {
+                let bottleneck_id = new_id("bottleneck");
+                let coverage_outputs = coverage_report
+                    .gaps
+                    .iter()
+                    .map(|gap| format!("Close {} at {}: {}", gap.gap_type, gap.location, gap.issue))
+                    .chain(coverage_report.repair_actions.iter().cloned())
+                    .collect::<Vec<_>>();
+                let success_outputs = if coverage_outputs.is_empty() {
+                    vec![format!(
+                        "Resolve Goal coverage review: {}",
+                        coverage_report.summary
+                    )]
+                } else {
+                    coverage_outputs
+                };
+                sqlx::query("INSERT INTO bottlenecks(bottleneck_id,project_id,target_goal_ids_json,kind,precise_statement,completion_contract_json,evidence_ids_json,blocked_route_ids_json,attempted_task_ids_json,repair_action_ids_json,priority,status,created_revision,updated_revision,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,1.15,'open',(SELECT revision FROM projects WHERE project_id=?),(SELECT revision FROM projects WHERE project_id=?),?,?)")
+                    .bind(&bottleneck_id).bind(&project_id).bind(json_text(&submission.target_goal_ids)?)
+                    .bind("goal_coverage_debt").bind(format!("Resolve the non-passing Goal coverage review without changing the accepted intermediate Fact: {}", coverage_report.summary))
+                    .bind(json_text(&json!({"success_outputs":success_outputs,"partial_outputs":["a verified implication from the accepted Fact toward the exact target"],"reject_outputs":["claiming that Fact acceptance alone closes the Goal"]}))?)
+                    .bind(json_text(&vec![verification_id.to_owned()])?).bind(json_text(&vec![submission.route_id.clone()])?)
+                    .bind(json_text(&vec![submission.task_id.clone()])?).bind(json_text(&coverage_report.repair_actions)?)
+                    .bind(&project_id).bind(&project_id).bind(now.to_rfc3339()).bind(now.to_rfc3339()).execute(&mut *tx).await?;
+                created_obligation_ids.extend(
+                    crate::proof_obligations::insert_verifier_advisory_obligations_tx(
+                        &mut tx,
+                        crate::proof_obligations::AdvisoryObligationContext {
+                            project_id: &project_id,
+                            candidate_id: &candidate_id,
+                            verification_id,
+                            target_goal_ids: &submission.target_goal_ids,
+                            bottleneck_id: Some(&bottleneck_id),
+                            origin_kind: "goal_coverage_review",
+                            report: coverage_report,
+                            project_revision: obligation_revision,
+                            now: &now,
+                        },
+                    )
+                    .await?,
+                );
+            }
+            if counterexample_refuted_main_goal {
+                sqlx::query("UPDATE projects SET status='refuted' WHERE project_id=?")
+                    .bind(&project_id)
+                    .execute(&mut *tx)
+                    .await?;
             }
             sqlx::query("UPDATE candidates SET status='promoted_to_fact' WHERE candidate_id=?")
                 .bind(&candidate_id)
@@ -2799,7 +3631,6 @@ impl SqliteStore {
                 .fetch_one(&mut *tx)
                 .await?;
             fact = Some(rows::fact(&fact_row)?);
-            let gate = gate.as_ref().expect("accepted verdict has gate context");
             if let Some((_, challenged_fact_id)) = &governance_challenge {
                 if challenged_fact_id != &fact_id {
                     return Err(StorageError::CorruptData(format!(
@@ -2840,13 +3671,15 @@ impl SqliteStore {
                     report.repair_actions.join("; ")
                 )
             };
-            sqlx::query("INSERT INTO bottlenecks(bottleneck_id,project_id,target_goal_ids_json,kind,precise_statement,completion_contract_json,evidence_ids_json,blocked_route_ids_json,attempted_task_ids_json,repair_action_ids_json,priority,status,created_revision,updated_revision,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,0.9,'open',(SELECT revision FROM projects WHERE project_id=?),(SELECT revision FROM projects WHERE project_id=?),?,?)")
-                .bind(new_id("bottleneck")).bind(&project_id).bind(json_text(&submission.target_goal_ids)?)
+            let bottleneck_id = new_id("bottleneck");
+            sqlx::query("INSERT INTO bottlenecks(bottleneck_id,project_id,target_goal_ids_json,kind,precise_statement,completion_contract_json,evidence_ids_json,blocked_route_ids_json,attempted_task_ids_json,repair_action_ids_json,priority,status,created_revision,updated_revision,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,1.1,'open',(SELECT revision FROM projects WHERE project_id=?),(SELECT revision FROM projects WHERE project_id=?),?,?)")
+                .bind(&bottleneck_id).bind(&project_id).bind(json_text(&submission.target_goal_ids)?)
                 .bind("verification_proof_debt").bind(precise_statement)
                 .bind(json_text(&json!({"success_outputs":report.repair_actions,"partial_outputs":["a strictly narrower named lemma that removes part of the reported gap"],"reject_outputs":["the same rejected proof without new evidence"]}))?)
                 .bind(json_text(&vec![verification_id.to_owned()])?).bind(json_text(&vec![submission.route_id.clone()])?)
                 .bind(json_text(&vec![submission.task_id.clone()])?).bind(json_text(&report.repair_actions)?)
                 .bind(&project_id).bind(&project_id).bind(now.to_rfc3339()).bind(now.to_rfc3339()).execute(&mut *tx).await?;
+            advisory_bottleneck_id = Some(bottleneck_id);
         } else {
             let uncertainties = if report.uncertainties.is_empty() {
                 vec![report.summary.clone()]
@@ -2856,6 +3689,83 @@ impl SqliteStore {
             for description in uncertainties {
                 sqlx::query("INSERT INTO uncertainties(uncertainty_id,project_id,description,type,severity,affects_goal_ids_json,affects_route_ids_json,introduced_by,resolution_methods_json,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)")
                     .bind(new_id("unc")).bind(&project_id).bind(description).bind("verification_unknown").bind("high").bind(json_text(&submission.target_goal_ids)?).bind(json_text(&vec![submission.route_id.clone()])?).bind(verification_id).bind(json_text(&report.repair_actions)?).bind(UncertaintyStatus::Open.to_string()).bind(now.to_rfc3339()).execute(&mut *tx).await?;
+            }
+            if !report.gaps.is_empty() || !report.repair_actions.is_empty() {
+                let bottleneck_id = new_id("bottleneck");
+                let gap_outputs = report
+                    .gaps
+                    .iter()
+                    .map(|gap| format!("Close {} at {}: {}", gap.gap_type, gap.location, gap.issue))
+                    .chain(report.repair_actions.iter().cloned())
+                    .collect::<Vec<_>>();
+                sqlx::query("INSERT INTO bottlenecks(bottleneck_id,project_id,target_goal_ids_json,kind,precise_statement,completion_contract_json,evidence_ids_json,blocked_route_ids_json,attempted_task_ids_json,repair_action_ids_json,priority,status,created_revision,updated_revision,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,1.05,'open',(SELECT revision FROM projects WHERE project_id=?),(SELECT revision FROM projects WHERE project_id=?),?,?)")
+                    .bind(&bottleneck_id).bind(&project_id).bind(json_text(&submission.target_goal_ids)?)
+                    .bind("verification_uncertainty_debt").bind(format!("Resolve the verifier's structured unknowns: {}", gap_outputs.join("; ")))
+                    .bind(json_text(&json!({"success_outputs":gap_outputs,"partial_outputs":["new evidence narrowing a named verifier uncertainty"],"reject_outputs":["repeating the inconclusive candidate without new evidence"]}))?)
+                    .bind(json_text(&vec![verification_id.to_owned()])?).bind(json_text(&vec![submission.route_id.clone()])?)
+                    .bind(json_text(&vec![submission.task_id.clone()])?).bind(json_text(&report.repair_actions)?)
+                    .bind(&project_id).bind(&project_id).bind(now.to_rfc3339()).bind(now.to_rfc3339()).execute(&mut *tx).await?;
+                advisory_bottleneck_id = Some(bottleneck_id);
+            }
+        }
+        if matches!(
+            report.verdict,
+            VerificationVerdict::Rejected | VerificationVerdict::Unknown
+        ) {
+            created_obligation_ids.extend(
+                crate::proof_obligations::insert_verifier_advisory_obligations_tx(
+                    &mut tx,
+                    crate::proof_obligations::AdvisoryObligationContext {
+                        project_id: &project_id,
+                        candidate_id: &candidate_id,
+                        verification_id,
+                        target_goal_ids: &submission.target_goal_ids,
+                        bottleneck_id: advisory_bottleneck_id.as_deref(),
+                        origin_kind: "verification_report",
+                        report: &report,
+                        project_revision: obligation_revision,
+                        now: &now,
+                    },
+                )
+                .await?,
+            );
+            let disposition = match report.verdict {
+                VerificationVerdict::Rejected => ObligationCoverageDisposition::Insufficient,
+                VerificationVerdict::Unknown => ObligationCoverageDisposition::Unknown,
+                VerificationVerdict::Accepted => unreachable!("accepted handled above"),
+            };
+            let rationale = match report.verdict {
+                VerificationVerdict::Rejected => {
+                    "verification rejected the candidate as insufficient for the root obligation"
+                }
+                VerificationVerdict::Unknown => {
+                    "verification could not determine whether the candidate covers the root obligation"
+                }
+                VerificationVerdict::Accepted => unreachable!("accepted handled above"),
+            };
+            for goal_id in submission.target_goal_ids.iter().collect::<BTreeSet<_>>() {
+                let root_obligation_id =
+                    crate::proof_obligations::root_obligation_id_tx(&mut tx, &project_id, goal_id)
+                        .await?;
+                crate::proof_obligations::record_root_coverage_tx(
+                    &mut tx,
+                    crate::proof_obligations::RootCoverage {
+                        project_id: &project_id,
+                        candidate_id: &candidate_id,
+                        verification_id,
+                        obligation_id: &root_obligation_id,
+                        disposition,
+                        fact_id: None,
+                        rationale,
+                        now: &now,
+                    },
+                )
+                .await?;
+                obligation_coverage.push(json!({
+                    "goal_id":goal_id,
+                    "obligation_id":root_obligation_id,
+                    "disposition":disposition,
+                }));
             }
         }
         let mut governance_event: Option<(&str, String, Value)> = None;
@@ -2869,10 +3779,16 @@ impl SqliteStore {
                         .await?;
                     sqlx::query("UPDATE fact_challenges SET status='resolved',resolved_at=? WHERE challenge_id=?")
                         .bind(now.to_rfc3339()).bind(challenge_id).execute(&mut *tx).await?;
+                    let reconciled_project_status =
+                        crate::fact_governance::reconcile_project_after_governance_acceptance_tx(
+                            &mut tx,
+                            &project_id,
+                        )
+                        .await?;
                     governance_event = Some((
                         "fact.reverified",
                         challenged_fact_id.clone(),
-                        json!({"challenge_id":challenge_id,"verification_id":verification_id,"outcome":"accepted"}),
+                        json!({"challenge_id":challenge_id,"verification_id":verification_id,"outcome":"accepted","project_status":reconciled_project_status}),
                     ));
                 }
                 VerificationVerdict::Rejected => {
@@ -2901,12 +3817,8 @@ impl SqliteStore {
                         )
                         .await?;
                     external_governance_events = invalidation_events;
-                    sqlx::query(
-                        "UPDATE fact_challenges SET status='inconclusive' WHERE challenge_id=?",
-                    )
-                    .bind(challenge_id)
-                    .execute(&mut *tx)
-                    .await?;
+                    sqlx::query("UPDATE fact_challenges SET status='inconclusive',resolved_at=? WHERE challenge_id=?")
+                        .bind(now.to_rfc3339()).bind(challenge_id).execute(&mut *tx).await?;
                     governance_event = Some((
                         "fact.suspended",
                         challenged_fact_id.clone(),
@@ -2988,6 +3900,15 @@ impl SqliteStore {
                 .collect::<Vec<_>>();
             sqlx::query("UPDATE bottlenecks SET status='resolved',updated_revision=?,updated_at=? WHERE project_id=? AND status='open' AND NOT EXISTS (SELECT 1 FROM json_each(bottlenecks.target_goal_ids_json) j JOIN goals g ON g.goal_id=j.value WHERE g.status NOT IN ('solved','refuted'))")
                 .bind(revision).bind(now.to_rfc3339()).bind(&project_id).execute(&mut *tx).await?;
+            updated_obligation_ids.extend(
+                crate::proof_obligations::obsolete_resolved_bottleneck_advisories_tx(
+                    &mut tx,
+                    &project_id,
+                    revision,
+                    &now,
+                )
+                .await?,
+            );
             sqlx::query("INSERT INTO fact_impact_records(impact_id,project_id,fact_id,source_revision,closed_goal_ids_json,unblocked_route_ids_json,invalidated_task_ids_json,newly_enabled_task_templates_json,dominated_route_ids_json,resolved_uncertainty_ids_json,planner_disposition,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,'pending',?)")
                 .bind(new_id("factimpact")).bind(&project_id).bind(&accepted_fact.fact_id).bind(revision)
                 .bind(json_text(&closed_goal_ids)?).bind(json_text(&unblocked_route_ids)?).bind(json_text(&invalidated_task_ids)?)
@@ -2999,6 +3920,10 @@ impl SqliteStore {
                 .bind(verification_id)
                 .fetch_one(&mut *tx)
                 .await?;
+        created_obligation_ids.sort();
+        created_obligation_ids.dedup();
+        updated_obligation_ids.sort();
+        updated_obligation_ids.dedup();
         let mut events = external_governance_events;
         for source_id in admitted_source_ids {
             events.push(
@@ -3014,7 +3939,7 @@ impl SqliteStore {
                 .await?,
             );
         }
-        events.push(append_event(&mut tx, &project_id, revision, "verification.finished", entity("verification", verification_id), json!({"verdict": report.verdict, "candidate_id": candidate_id, "gap_count": report.gaps.len(), "case_id": case_id}), None).await?);
+        events.push(append_event(&mut tx, &project_id, revision, "verification.finished", entity("verification", verification_id), json!({"verdict": report.verdict, "candidate_id": candidate_id, "gap_count": report.gaps.len(), "case_id": case_id,"created_obligation_ids":created_obligation_ids.clone(),"updated_obligation_ids":updated_obligation_ids.clone(),"obligation_coverage":obligation_coverage.clone()}), None).await?);
         events.push(
             append_event(
                 &mut tx,
@@ -3027,6 +3952,63 @@ impl SqliteStore {
             )
             .await?,
         );
+        for obligation_id in &created_obligation_ids {
+            events.push(
+                append_event(
+                    &mut tx,
+                    &project_id,
+                    revision,
+                    "proof_obligation.created",
+                    entity("proof_obligation", obligation_id),
+                    json!({"verification_id":verification_id,"candidate_id":candidate_id}),
+                    Some(entity("verification", verification_id)),
+                )
+                .await?,
+            );
+        }
+        for obligation_id in &updated_obligation_ids {
+            let obligation_status: String = sqlx::query_scalar(
+                "SELECT status FROM proof_obligations WHERE obligation_id=? AND project_id=?",
+            )
+            .bind(obligation_id)
+            .bind(&project_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            events.push(
+                append_event(
+                    &mut tx,
+                    &project_id,
+                    revision,
+                    "proof_obligation.updated",
+                    entity("proof_obligation", obligation_id),
+                    json!({"status":obligation_status,"verification_id":verification_id,"candidate_id":candidate_id}),
+                    Some(entity("verification", verification_id)),
+                )
+                .await?,
+            );
+        }
+        for coverage in &obligation_coverage {
+            let obligation_id = coverage
+                .get("obligation_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    StorageError::CorruptData(
+                        "obligation coverage event has no obligation_id".into(),
+                    )
+                })?;
+            events.push(
+                append_event(
+                    &mut tx,
+                    &project_id,
+                    revision,
+                    "candidate_obligation.coverage_recorded",
+                    entity("proof_obligation", obligation_id),
+                    coverage.clone(),
+                    Some(entity("verification", verification_id)),
+                )
+                .await?,
+            );
+        }
         if let Some(accepted_fact) = &fact {
             events.push(
                 append_event(
@@ -3085,8 +4067,33 @@ impl SqliteStore {
             .await?;
         let mut tx = self.pool().begin().await?;
         let now = Utc::now();
-        sqlx::query("UPDATE rounds SET status='completed',completed_at=?,summary=? WHERE project_id=? AND round_id=? AND status IN ('running','verifying','publishing')")
+        let project_row =
+            sqlx::query("SELECT status,budget_json,current_round FROM projects WHERE project_id=?")
+                .bind(project_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| StorageError::NotFound {
+                    kind: "project",
+                    id: project_id.into(),
+                })?;
+        let project_status: String = project_row.try_get("status")?;
+        if !matches!(
+            project_status.as_str(),
+            "running" | "refuted" | "needs_human_review"
+        ) {
+            tx.rollback().await?;
+            return Err(StorageError::InvalidTransition(format!(
+                "cannot complete a round while project is {project_status}"
+            )));
+        }
+        let completed = sqlx::query("UPDATE rounds SET status='completed',completed_at=?,summary=? WHERE project_id=? AND round_id=? AND status IN ('running','verifying','publishing')")
             .bind(now.to_rfc3339()).bind(summary).bind(project_id).bind(round_id).execute(&mut *tx).await?;
+        if completed.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Err(StorageError::InvalidTransition(format!(
+                "round {round_id} is missing or is not completable"
+            )));
+        }
         let main_goal_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM goals WHERE project_id=? AND priority>=1.0")
                 .bind(project_id)
@@ -3099,12 +4106,58 @@ impl SqliteStore {
         .fetch_one(&mut *tx)
         .await?;
         let blocking: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM uncertainties WHERE project_id=? AND status IN ('open','investigating') AND severity IN ('critical','high')").bind(project_id).fetch_one(&mut *tx).await?;
-        let project_succeeded = main_goal_count > 0 && unresolved_main_goals == 0 && blocking == 0;
+        let unresolved_required_obligations: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM proof_obligations o JOIN goals g ON g.goal_id=o.goal_id AND g.project_id=o.project_id WHERE o.project_id=? AND g.priority>=1.0 AND o.necessity='required' AND o.status<>'obsolete' AND ((o.source_kind='root_goal' AND o.status!='satisfied') OR (o.source_kind!='root_goal' AND o.status!='satisfied'))",
+        )
+        .bind(project_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let project_succeeded = project_status == ProjectStatus::Running.to_string()
+            && main_goal_count > 0
+            && unresolved_main_goals == 0
+            && blocking == 0
+            && unresolved_required_obligations == 0;
+        let budget: Budget = serde_json::from_str(project_row.try_get("budget_json")?)?;
+        let current_round: i64 = project_row.try_get("current_round")?;
+        let total_calls: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(model_calls),0) FROM usage_records WHERE project_id=?",
+        )
+        .bind(project_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let successful_calls: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM usage_records WHERE project_id=? AND outcome='succeeded'",
+        )
+        .bind(project_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let round_budget_exhausted = current_round >= i64::from(budget.max_rounds);
+        let call_budget_exhausted = total_calls >= i64::from(budget.max_total_model_calls);
+        let budget_exhausted = project_status == ProjectStatus::Running.to_string()
+            && !project_succeeded
+            && (round_budget_exhausted || call_budget_exhausted);
+        let environment_failed = budget_exhausted && total_calls > 0 && successful_calls == 0;
         if project_succeeded {
-            sqlx::query("UPDATE projects SET status='success' WHERE project_id=?")
-                .bind(project_id)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "UPDATE projects SET status='success',updated_at=? WHERE project_id=? AND status='running'",
+            )
+            .bind(now.to_rfc3339())
+            .bind(project_id)
+            .execute(&mut *tx)
+            .await?;
+        } else if budget_exhausted {
+            sqlx::query(
+                "UPDATE projects SET status=?,updated_at=? WHERE project_id=? AND status='running'",
+            )
+            .bind(if environment_failed {
+                ProjectStatus::EnvironmentFailed.to_string()
+            } else {
+                ProjectStatus::PartialSuccess.to_string()
+            })
+            .bind(now.to_rfc3339())
+            .bind(project_id)
+            .execute(&mut *tx)
+            .await?;
         }
         let revision = bump_revision(&mut tx, project_id).await?;
         let mut events = vec![
@@ -3132,6 +4185,28 @@ impl SqliteStore {
                 )
                 .await?,
             );
+        } else if budget_exhausted {
+            events.push(
+                append_event(
+                    &mut tx,
+                    project_id,
+                    revision,
+                    if environment_failed {
+                        "project.environment_failed"
+                    } else {
+                        "project.budget_exhausted"
+                    },
+                    entity("project", project_id),
+                    json!({
+                        "model_calls": total_calls,
+                        "successful_model_calls": successful_calls,
+                        "round_limit_reached": round_budget_exhausted,
+                        "model_call_limit_reached": call_budget_exhausted,
+                    }),
+                    Some(entity("round", round_id)),
+                )
+                .await?,
+            );
         }
         tx.commit().await?;
         Ok(events)
@@ -3154,22 +4229,77 @@ impl SqliteStore {
             worker_id,
             task_id,
             model,
+            purpose,
             max_total_calls,
             max_task_calls,
         } = request;
+        let mut tx = self.pool().begin().await?;
+        let project_row = sqlx::query("SELECT status,budget_json FROM projects WHERE project_id=?")
+            .bind(project_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| StorageError::NotFound {
+                kind: "project",
+                id: project_id.into(),
+            })?;
+        let project_status: String = project_row.try_get("status")?;
+        let lifecycle_allows_call = match purpose {
+            ModelCallPurpose::Research => project_status == "running",
+            ModelCallPurpose::RouteScopedResearch(route_id) => {
+                if matches!(project_status.as_str(), "running" | "needs_human_review") {
+                    let released: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM routes WHERE project_id=? AND route_id=? \
+                         AND human_review IN ('approved','not_required') \
+                         AND status IN ('incubating','active','probation','revived')",
+                    )
+                    .bind(project_id)
+                    .bind(route_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    released == 1
+                } else {
+                    false
+                }
+            }
+            ModelCallPurpose::Verification(verification_id) => {
+                crate::verification_execution_is_released(&mut tx, verification_id).await?
+            }
+            ModelCallPurpose::Publication(publication_id) => {
+                let active_publication: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM publication_runs WHERE publication_id=? AND project_id=? AND status='running'",
+                )
+                .bind(publication_id)
+                .bind(project_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                active_publication == 1
+                    && !matches!(project_status.as_str(), "created" | "stopped_by_human")
+            }
+        };
+        if !lifecycle_allows_call {
+            return Err(StorageError::InvalidTransition(format!(
+                "model calls cannot start while project is {project_status}"
+            )));
+        }
+        let budget_json: String = project_row.try_get("budget_json")?;
+        let project_budget: Budget = serde_json::from_str(&budget_json)?;
+        let effective_total_calls =
+            i64::from(max_total_calls.min(project_budget.max_total_model_calls));
         let task_override: Option<i64> = if let Some(task_id) = task_id {
             sqlx::query_scalar("SELECT CAST(json_extract(limits_json,'$.max_model_calls') AS INTEGER) FROM budget_overrides WHERE project_id=? AND scope_kind='task' AND scope_id=?")
-                .bind(project_id).bind(task_id).fetch_optional(self.pool()).await?
+                .bind(project_id).bind(task_id).fetch_optional(&mut *tx).await?
         } else {
             None
         };
-        let effective_task_calls = task_override.unwrap_or(i64::from(max_task_calls));
+        let configured_task_calls =
+            task_override.unwrap_or_else(|| i64::from(project_budget.max_model_calls_per_task));
+        let effective_task_calls = configured_task_calls.min(i64::from(max_task_calls));
         let round_override: Option<i64> = sqlx::query_scalar("SELECT CAST(json_extract(limits_json,'$.max_model_calls') AS INTEGER) FROM budget_overrides WHERE project_id=? AND scope_kind='round' AND scope_id=?")
-            .bind(project_id).bind(round.to_string()).fetch_optional(self.pool()).await?;
+            .bind(project_id).bind(round.to_string()).fetch_optional(&mut *tx).await?;
         let usage_id = new_id("usage");
         let result = sqlx::query(
-            "INSERT INTO usage_records(usage_id,project_id,round,worker_id,task_id,model,model_calls,input_tokens,output_tokens,elapsed_ms,created_at) \
-             SELECT ?,?,?,?,?,?,1,0,0,0,? \
+            "INSERT INTO usage_records(usage_id,project_id,round,worker_id,task_id,model,model_calls,input_tokens,output_tokens,elapsed_ms,created_at,outcome) \
+             SELECT ?,?,?,?,?,?,1,0,0,0,?,'running' \
              WHERE (SELECT COALESCE(SUM(model_calls),0) FROM usage_records WHERE project_id=?) < ? \
              AND (? IS NULL OR (SELECT COALESCE(SUM(model_calls),0) FROM usage_records WHERE project_id=? AND task_id=?) < ?) \
              AND (? IS NULL OR (SELECT COALESCE(SUM(model_calls),0) FROM usage_records WHERE project_id=? AND round=?) < ?)",
@@ -3182,7 +4312,7 @@ impl SqliteStore {
         .bind(model)
         .bind(Utc::now().to_rfc3339())
         .bind(project_id)
-        .bind(i64::from(max_total_calls))
+        .bind(effective_total_calls)
         .bind(task_id)
         .bind(project_id)
         .bind(task_id)
@@ -3191,13 +4321,16 @@ impl SqliteStore {
         .bind(project_id)
         .bind(round)
         .bind(round_override)
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 0 {
+            tx.rollback().await?;
             return Err(StorageError::BudgetExhausted(format!(
-                "project limit {max_total_calls}, task limit {effective_task_calls}, or round override {round_override:?} reached"
+                "effective project limit {effective_total_calls} (stored {}, caller {max_total_calls}), effective task limit {effective_task_calls} (stored {configured_task_calls}, caller {max_task_calls}), or round override {round_override:?} reached",
+                project_budget.max_total_model_calls,
             )));
         }
+        tx.commit().await?;
         Ok(UsageReservation { usage_id })
     }
 
@@ -3220,7 +4353,7 @@ impl SqliteStore {
             )
             .await?;
         let updated = sqlx::query(
-            "UPDATE usage_records SET elapsed_ms=?,input_tokens=?,output_tokens=? WHERE usage_id=?",
+            "UPDATE usage_records SET elapsed_ms=?,input_tokens=?,output_tokens=?,outcome='succeeded',error_kind=NULL,error_message=NULL WHERE usage_id=? AND outcome='running'",
         )
         .bind(elapsed_ms.max(0))
         .bind(input_tokens.max(0))
@@ -3228,7 +4361,63 @@ impl SqliteStore {
         .bind(usage_id)
         .execute(self.pool())
         .await?;
-        if updated.rows_affected() == 0 {
+        self.accept_model_call_terminal_transition(usage_id, updated.rows_affected())
+            .await
+    }
+
+    pub async fn fail_model_call(
+        &self,
+        usage_id: &str,
+        elapsed_ms: i64,
+        error_kind: &str,
+        error_message: &str,
+    ) -> StorageResult<()> {
+        self.fail_model_call_with_tokens(usage_id, elapsed_ms, error_kind, error_message, 0, 0)
+            .await
+    }
+
+    pub async fn fail_model_call_with_tokens(
+        &self,
+        usage_id: &str,
+        elapsed_ms: i64,
+        error_kind: &str,
+        error_message: &str,
+        input_tokens: i64,
+        output_tokens: i64,
+    ) -> StorageResult<()> {
+        let _admission = self
+            .admit_write(
+                crate::state_writer::WritePriority::Telemetry,
+                "fail_model_call",
+            )
+            .await?;
+        let updated = sqlx::query(
+            "UPDATE usage_records SET elapsed_ms=?,input_tokens=?,output_tokens=?,outcome='failed',error_kind=?,error_message=? WHERE usage_id=? AND outcome='running'",
+        )
+        .bind(elapsed_ms.max(0))
+        .bind(input_tokens.max(0))
+        .bind(output_tokens.max(0))
+        .bind(error_kind)
+        .bind(error_message)
+        .bind(usage_id)
+        .execute(self.pool())
+        .await?;
+        self.accept_model_call_terminal_transition(usage_id, updated.rows_affected())
+            .await
+    }
+
+    async fn accept_model_call_terminal_transition(
+        &self,
+        usage_id: &str,
+        rows_affected: u64,
+    ) -> StorageResult<()> {
+        if rows_affected == 0
+            && sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM usage_records WHERE usage_id=?")
+                .bind(usage_id)
+                .fetch_one(self.pool())
+                .await?
+                == 0
+        {
             return Err(StorageError::NotFound {
                 kind: "usage",
                 id: usage_id.into(),
@@ -3240,6 +4429,15 @@ impl SqliteStore {
     pub async fn total_model_calls(&self, project_id: &str) -> StorageResult<i64> {
         Ok(sqlx::query_scalar(
             "SELECT COALESCE(SUM(model_calls),0) FROM usage_records WHERE project_id=?",
+        )
+        .bind(project_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+
+    pub async fn successful_model_calls(&self, project_id: &str) -> StorageResult<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT COUNT(*) FROM usage_records WHERE project_id=? AND outcome='succeeded'",
         )
         .bind(project_id)
         .fetch_one(self.pool())
@@ -3267,7 +4465,25 @@ impl SqliteStore {
                 "cannot exhaust budget from {status}"
             )));
         }
-        sqlx::query("UPDATE projects SET status='partial_success' WHERE project_id=?")
+        let total_calls: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM usage_records WHERE project_id=?")
+                .bind(project_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let successful_calls: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM usage_records WHERE project_id=? AND outcome='succeeded'",
+        )
+        .bind(project_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let environment_failed = total_calls > 0 && successful_calls == 0;
+        let terminal_status = if environment_failed {
+            "environment_failed"
+        } else {
+            "partial_success"
+        };
+        sqlx::query("UPDATE projects SET status=? WHERE project_id=?")
+            .bind(terminal_status)
             .bind(project_id)
             .execute(&mut *tx)
             .await?;
@@ -3276,9 +4492,13 @@ impl SqliteStore {
             &mut tx,
             project_id,
             revision,
-            "project.budget_exhausted",
+            if environment_failed {
+                "project.environment_failed"
+            } else {
+                "project.budget_exhausted"
+            },
             entity("project", project_id),
-            json!({}),
+            json!({"model_calls":total_calls,"successful_model_calls":successful_calls}),
             None,
         )
         .await?;
@@ -3295,6 +4515,43 @@ impl SqliteStore {
         round: i64,
         related: Vec<String>,
     ) -> StorageResult<(Artifact, DomainEvent)> {
+        let artifact = self
+            .prepare_artifact_file(project_id, kind, filename, content, round, related)
+            .await?;
+        let mut artifact_file = UncommittedArtifactFile::new(&artifact);
+        let _admission = self
+            .admit_write(
+                crate::state_writer::WritePriority::PlanningOrCheckpoint,
+                "store_artifact_reference",
+            )
+            .await?;
+        let mut tx = self.pool().begin().await?;
+        insert_artifact_record_tx(&mut tx, &artifact).await?;
+        let revision = bump_revision(&mut tx, project_id).await?;
+        let event = append_event(
+            &mut tx,
+            project_id,
+            revision,
+            "artifact.published",
+            entity("artifact", &artifact.artifact_id),
+            json!({"kind": kind, "filename": filename}),
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        artifact_file.commit();
+        Ok((artifact, event))
+    }
+
+    pub(crate) async fn prepare_artifact_file(
+        &self,
+        project_id: &str,
+        kind: &str,
+        filename: &str,
+        content: &[u8],
+        round: i64,
+        related: Vec<String>,
+    ) -> StorageResult<Artifact> {
         if filename.contains(['/', '\\']) || filename == "." || filename == ".." {
             return Err(StorageError::InvalidTransition(
                 "unsafe artifact filename".into(),
@@ -3310,44 +4567,42 @@ impl SqliteStore {
         let now = Utc::now();
         let storage_path = path.to_string_lossy().into_owned();
         let media_type = mime_from_filename(filename);
-        let _admission = self
-            .admit_write(
-                crate::state_writer::WritePriority::PlanningOrCheckpoint,
-                "store_artifact_reference",
-            )
-            .await?;
-        let mut tx = self.pool().begin().await?;
-        sqlx::query("INSERT INTO artifacts(artifact_id,project_id,kind,media_type,filename,size,sha256,created_in_round,related_entity_ids_json,storage_path,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)")
-            .bind(&artifact_id).bind(project_id).bind(kind).bind(&media_type).bind(filename).bind(i64::try_from(content.len()).unwrap_or(i64::MAX)).bind(&sha256).bind(round).bind(json_text(&related)?).bind(&storage_path).bind(now.to_rfc3339()).execute(&mut *tx).await?;
-        let revision = bump_revision(&mut tx, project_id).await?;
-        let event = append_event(
-            &mut tx,
-            project_id,
-            revision,
-            "artifact.published",
-            entity("artifact", &artifact_id),
-            json!({"kind": kind, "filename": filename}),
-            None,
-        )
-        .await?;
-        tx.commit().await?;
-        Ok((
-            Artifact {
-                artifact_id,
-                project_id: project_id.into(),
-                kind: kind.into(),
-                media_type,
-                filename: filename.into(),
-                size: i64::try_from(content.len()).unwrap_or(i64::MAX),
-                sha256,
-                created_in_round: round,
-                related_entity_ids: related,
-                created_at: now,
-                storage_path,
-            },
-            event,
-        ))
+        Ok(Artifact {
+            artifact_id,
+            project_id: project_id.into(),
+            kind: kind.into(),
+            media_type,
+            filename: filename.into(),
+            size: i64::try_from(content.len()).unwrap_or(i64::MAX),
+            sha256,
+            created_in_round: round,
+            related_entity_ids: related,
+            created_at: now,
+            storage_path,
+        })
     }
+}
+
+pub(crate) async fn insert_artifact_record_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    artifact: &Artifact,
+) -> StorageResult<()> {
+    sqlx::query("INSERT INTO artifacts(artifact_id,project_id,kind,media_type,filename,size,sha256,created_in_round,related_entity_ids_json,storage_path,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)")
+        .bind(&artifact.artifact_id).bind(&artifact.project_id).bind(&artifact.kind)
+        .bind(&artifact.media_type).bind(&artifact.filename).bind(artifact.size)
+        .bind(&artifact.sha256).bind(artifact.created_in_round)
+        .bind(json_text(&artifact.related_entity_ids)?).bind(&artifact.storage_path)
+        .bind(artifact.created_at.to_rfc3339()).execute(&mut **tx).await?;
+    // Persist an explicit unverified audit state atomically with the artifact
+    // reference. Computing the write-time digest protects content addressing,
+    // but it is not a later independent read of the durable file.
+    sqlx::query("INSERT INTO artifact_integrity_audit_state(artifact_id,project_id,status,check_count,updated_at) VALUES(?,?,'unverified',0,?)")
+        .bind(&artifact.artifact_id)
+        .bind(&artifact.project_id)
+        .bind(artifact.created_at.to_rfc3339())
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 async fn update_project_status(

@@ -6,7 +6,7 @@ use std::{
     collections::{HashMap, VecDeque},
     ffi::OsString,
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{ExitStatus, Stdio},
     sync::Arc,
     time::Duration,
 };
@@ -18,12 +18,13 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    process::Command,
+    process::{Child, Command},
     sync::Mutex,
 };
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
+pub mod research_v2;
 mod verification;
 
 pub use verification::{
@@ -64,6 +65,7 @@ pub struct AgentHandle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentTaskKind {
+    ProblemGenerator,
     Planner,
     Worker,
     Verifier,
@@ -78,11 +80,6 @@ pub struct AgentTask {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentInput {
-    pub prompt: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRunResult {
     pub structured_output: Value,
     pub session_id: Option<String>,
@@ -94,27 +91,12 @@ pub struct AgentRunResult {
     pub completed_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CancellationCause {
-    HumanStop,
-    RouteStopped,
-    ProjectStopped,
-    Timeout,
-    Shutdown,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SteerReceipt {
-    pub accepted: bool,
-    pub effective_mode: String,
-    pub message: String,
-}
-
 #[derive(Debug, Error)]
 pub enum AgentError {
     #[error("agent process failed: {0}")]
     Process(String),
+    #[error("agent session is unavailable: {0}")]
+    SessionUnavailable(String),
     #[error("agent output was not valid structured JSON: {0}")]
     InvalidOutput(String),
     #[error("agent run timed out after {0} seconds")]
@@ -127,6 +109,34 @@ pub enum AgentError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error("{error}")]
+    WithUsage {
+        error: Box<AgentError>,
+        input_tokens: i64,
+        output_tokens: i64,
+    },
+}
+
+impl AgentError {
+    #[must_use]
+    pub const fn token_usage(&self) -> (i64, i64) {
+        match self {
+            Self::WithUsage {
+                input_tokens,
+                output_tokens,
+                ..
+            } => (*input_tokens, *output_tokens),
+            _ => (0, 0),
+        }
+    }
+
+    fn with_usage(self, input_tokens: i64, output_tokens: i64) -> Self {
+        Self::WithUsage {
+            error: Box::new(self),
+            input_tokens: input_tokens.max(0),
+            output_tokens: output_tokens.max(0),
+        }
+    }
 }
 
 #[async_trait]
@@ -140,19 +150,12 @@ pub trait AgentBackend: Send + Sync {
         task: AgentTask,
         cancellation: CancellationToken,
     ) -> Result<AgentRunResult, AgentError>;
-    async fn continue_run(&self, handle: &AgentHandle, input: AgentInput)
-    -> Result<(), AgentError>;
-    async fn steer(
+    async fn resume(
         &self,
         handle: &AgentHandle,
-        input: AgentInput,
-    ) -> Result<SteerReceipt, AgentError>;
-    async fn cancel(
-        &self,
-        handle: &AgentHandle,
-        cause: CancellationCause,
-    ) -> Result<(), AgentError>;
-    async fn wait_idle(&self, handle: &AgentHandle) -> Result<(), AgentError>;
+        task: AgentTask,
+        cancellation: CancellationToken,
+    ) -> Result<AgentRunResult, AgentError>;
 }
 
 #[derive(Debug, Clone)]
@@ -177,7 +180,16 @@ impl Default for CodexCliConfig {
 #[derive(Clone)]
 pub struct CodexCliBackend {
     config: CodexCliConfig,
-    runs: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    sessions: Arc<Mutex<HashMap<String, SessionBinding>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionBinding {
+    handle_id: String,
+    project_id: String,
+    role: String,
+    model: Option<String>,
+    working_directory: PathBuf,
 }
 
 impl std::fmt::Debug for CodexCliBackend {
@@ -193,7 +205,7 @@ impl CodexCliBackend {
     pub fn new(config: CodexCliConfig) -> Self {
         Self {
             config,
-            runs: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -202,109 +214,144 @@ impl CodexCliBackend {
         handle: &AgentHandle,
         task: &AgentTask,
         cancellation: CancellationToken,
+        resume_session_id: Option<&str>,
     ) -> Result<AgentRunResult, AgentError> {
         tokio::fs::create_dir_all(&handle.working_directory).await?;
+        // Runtime roots may be configured as relative paths.  Once the child process changes
+        // into that directory, forwarding the same relative path to Codex (`--cd`) and to the
+        // output file flags would resolve it a second time (for example
+        // `runtime/.../planner/runtime/.../planner`) and Codex fails with OS error 3 on Windows.
+        // Resolve it once before building every child-process path.
+        let working_directory = tokio::fs::canonicalize(&handle.working_directory).await?;
+        let binding = SessionBinding {
+            handle_id: handle.handle_id.clone(),
+            project_id: handle.project_id.clone(),
+            role: handle.role.clone(),
+            model: handle
+                .model
+                .clone()
+                .or_else(|| self.config.default_model.clone()),
+            working_directory: working_directory.clone(),
+        };
+        if let Some(session_id) = resume_session_id {
+            validate_session_id(session_id)?;
+            let recorded = self.sessions.lock().await.get(session_id).cloned();
+            match recorded {
+                None => {
+                    return Err(AgentError::SessionUnavailable(format!(
+                        "Codex session {session_id} is not registered in this backend process"
+                    )));
+                }
+                Some(recorded) if recorded != binding => {
+                    return Err(AgentError::InvalidOutput(format!(
+                        "Codex session {session_id} is bound to a different handle, project, role, model, or workspace"
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
         let nonce = Ulid::new();
-        let schema_path = handle
-            .working_directory
-            .join(format!("output-schema-{nonce}.json"));
-        let output_path = handle
-            .working_directory
-            .join(format!("last-message-{nonce}.json"));
+        let schema_path = working_directory.join(format!("output-schema-{nonce}.json"));
+        let output_path = working_directory.join(format!("last-message-{nonce}.json"));
         tokio::fs::write(
             &schema_path,
             serde_json::to_vec_pretty(&task.output_schema)?,
         )
         .await?;
 
+        let isolated_problem_generation = task.kind == AgentTaskKind::ProblemGenerator;
+        let sandbox = if isolated_problem_generation {
+            "read-only"
+        } else {
+            &self.config.sandbox
+        };
         let mut command = codex_process_command(&self.config.command);
         command
             .arg("exec")
+            .arg("--sandbox")
+            .arg(sandbox)
+            .arg("--cd")
+            .arg(&working_directory);
+        if isolated_problem_generation {
+            // Problem-definition material is explicitly untrusted.  Keep this one-shot intake
+            // call isolated from repository instructions and user configuration, and never
+            // persist a resumable Codex session for it.
+            command
+                .arg("--ephemeral")
+                .arg("--ignore-rules")
+                .arg("--ignore-user-config");
+        }
+        if resume_session_id.is_some() {
+            command.arg("resume");
+        }
+        command
             .arg("--json")
             .arg("--skip-git-repo-check")
-            .arg("--sandbox")
-            .arg(&self.config.sandbox)
             .arg("--output-schema")
             .arg(&schema_path)
             .arg("--output-last-message")
-            .arg(&output_path)
-            .arg("--cd")
-            .arg(&handle.working_directory);
+            .arg(&output_path);
         if let Some(config) = live_web_search_config(&handle.role) {
             command.arg("--config").arg(config);
         }
         if let Some(model) = handle.model.as_ref().or(self.config.default_model.as_ref()) {
             command.arg("--model").arg(model);
         }
+        if let Some(session_id) = resume_session_id {
+            command.arg("--").arg(session_id);
+        }
         command
             .arg("-")
+            .current_dir(&working_directory)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
         let started_at = Utc::now();
-        let mut child = command.spawn().map_err(|error| {
-            AgentError::Process(format!(
-                "failed to start {}: {error}",
-                self.config.command.display()
-            ))
-        })?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| AgentError::Process("stdin pipe unavailable".into()))?;
-        stdin.write_all(task.prompt.as_bytes()).await?;
-        stdin.shutdown().await?;
-        drop(stdin);
-        let mut stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| AgentError::Process("stdout pipe unavailable".into()))?;
-        let mut stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| AgentError::Process("stderr pipe unavailable".into()))?;
-        let stdout_task = tokio::spawn(async move {
-            let mut bytes = Vec::new();
-            stdout.read_to_end(&mut bytes).await.map(|_| bytes)
-        });
-        let stderr_task = tokio::spawn(async move {
-            let mut bytes = Vec::new();
-            stderr.read_to_end(&mut bytes).await.map(|_| bytes)
-        });
-        let internal_cancel = CancellationToken::new();
-        self.runs
-            .lock()
-            .await
-            .insert(handle.handle_id.clone(), internal_cancel.clone());
         let timeout_seconds = if task.timeout_seconds == 0 {
             self.config.default_timeout.as_secs()
         } else {
             task.timeout_seconds
         };
-        let status_result = tokio::select! {
-            status = child.wait() => status.map_err(AgentError::Io),
-            () = cancellation.cancelled() => { let _ = child.kill().await; let _ = child.wait().await; Err(AgentError::Cancelled) },
-            () = internal_cancel.cancelled() => { let _ = child.kill().await; let _ = child.wait().await; Err(AgentError::Cancelled) },
-            () = tokio::time::sleep(Duration::from_secs(timeout_seconds)) => { let _ = child.kill().await; let _ = child.wait().await; Err(AgentError::Timeout(timeout_seconds)) },
+        let capture = match run_codex_process(
+            command,
+            task.prompt.as_bytes(),
+            timeout_seconds,
+            cancellation,
+            &self.config.command,
+        )
+        .await
+        {
+            Ok(capture) => capture,
+            Err(error) => {
+                cleanup_codex_temp_files(&schema_path, &output_path).await;
+                return Err(error);
+            }
         };
-        self.runs.lock().await.remove(&handle.handle_id);
-        let stdout_bytes = stdout_task
-            .await
-            .map_err(|error| AgentError::Process(error.to_string()))??;
-        let stderr_bytes = stderr_task
-            .await
-            .map_err(|error| AgentError::Process(error.to_string()))??;
-        let stderr_text = String::from_utf8_lossy(&stderr_bytes).into_owned();
+        let stdout_bytes = capture.stdout;
+        let stderr_bytes = capture.stderr;
+        let status_result = capture.status;
+        let mut stderr_text = String::from_utf8_lossy(&stderr_bytes).into_owned();
         let stdout_text = String::from_utf8_lossy(&stdout_bytes).into_owned();
-        let status = status_result?;
-        let raw_events: Vec<Value> = stdout_text
-            .lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect();
-        let session_id = raw_events.iter().find_map(find_session_id);
+        let (raw_events, invalid_jsonl_lines) = parse_jsonl_events(&stdout_text);
+        if !invalid_jsonl_lines.is_empty() {
+            use std::fmt::Write as _;
+            let _ = write!(
+                stderr_text,
+                "\nCodex JSONL protocol warning: {} non-empty stdout line(s) were not JSON (line numbers: {:?})",
+                invalid_jsonl_lines.len(),
+                invalid_jsonl_lines
+            );
+        }
         let (input_tokens, output_tokens) = token_usage_from_events(&raw_events);
+        let status = match status_result {
+            Ok(status) => status,
+            Err(error) => {
+                cleanup_codex_temp_files(&schema_path, &output_path).await;
+                return Err(error.with_usage(input_tokens, output_tokens));
+            }
+        };
         if !status.success() {
             let stdout_tail: String = stdout_text
                 .chars()
@@ -314,16 +361,52 @@ impl CodexCliBackend {
                 .chars()
                 .rev()
                 .collect();
-            return Err(AgentError::Process(format!(
+            cleanup_codex_temp_files(&schema_path, &output_path).await;
+            let message = format!(
                 "Codex exited with {status}; stdout tail: {stdout_tail}; stderr: {stderr_text}"
-            )));
+            );
+            let error = if resume_session_id.is_some() && reports_unavailable_session(&stderr_text)
+            {
+                AgentError::SessionUnavailable(message)
+            } else {
+                AgentError::Process(message)
+            };
+            return Err(error.with_usage(input_tokens, output_tokens));
         }
-        let output_bytes = tokio::fs::read(&output_path).await.map_err(|error| {
-            AgentError::InvalidOutput(format!("missing {}: {error}", output_path.display()))
-        })?;
-        let structured_output = parse_structured_output(&output_bytes)?;
-        let _ = tokio::fs::remove_file(&schema_path).await;
-        let _ = tokio::fs::remove_file(&output_path).await;
+        let session_id = match resolve_session_id(&raw_events, resume_session_id) {
+            Ok(session_id) => session_id,
+            Err(error) => {
+                cleanup_codex_temp_files(&schema_path, &output_path).await;
+                return Err(error.with_usage(input_tokens, output_tokens));
+            }
+        };
+        let output_bytes = match tokio::fs::read(&output_path).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                cleanup_codex_temp_files(&schema_path, &output_path).await;
+                return Err(AgentError::InvalidOutput(format!(
+                    "missing {}: {error}",
+                    output_path.display()
+                ))
+                .with_usage(input_tokens, output_tokens));
+            }
+        };
+        let structured_output = match parse_structured_output(&output_bytes) {
+            Ok(output) => output,
+            Err(error) => {
+                cleanup_codex_temp_files(&schema_path, &output_path).await;
+                return Err(error.with_usage(input_tokens, output_tokens));
+            }
+        };
+        cleanup_codex_temp_files(&schema_path, &output_path).await;
+        if let Some(session_id) = &session_id
+            && !isolated_problem_generation
+        {
+            self.sessions
+                .lock()
+                .await
+                .insert(session_id.clone(), binding);
+        }
         Ok(AgentRunResult {
             structured_output,
             session_id,
@@ -335,6 +418,204 @@ impl CodexCliBackend {
             completed_at: Utc::now(),
         })
     }
+}
+
+#[derive(Debug)]
+struct CodexProcessCapture {
+    status: Result<ExitStatus, AgentError>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+enum PromptInputOutcome {
+    Finished(std::io::Result<()>),
+    Cancelled,
+    TimedOut,
+}
+
+async fn run_codex_process(
+    mut command: Command,
+    prompt: &[u8],
+    timeout_seconds: u64,
+    cancellation: CancellationToken,
+    configured_command: &Path,
+) -> Result<CodexProcessCapture, AgentError> {
+    if cancellation.is_cancelled() {
+        return Err(AgentError::Cancelled);
+    }
+    let mut child = command.spawn().map_err(|error| {
+        AgentError::Process(format!(
+            "failed to start {}: {error}",
+            configured_command.display()
+        ))
+    })?;
+    let Some(mut stdin) = child.stdin.take() else {
+        terminate_process_tree(&mut child).await;
+        return Err(AgentError::Process("stdin pipe unavailable".into()));
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        terminate_process_tree(&mut child).await;
+        return Err(AgentError::Process("stdout pipe unavailable".into()));
+    };
+    let Some(mut stderr) = child.stderr.take() else {
+        terminate_process_tree(&mut child).await;
+        return Err(AgentError::Process("stderr pipe unavailable".into()));
+    };
+    let mut stdout_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        let failure = stdout
+            .read_to_end(&mut bytes)
+            .await
+            .err()
+            .map(|error| format!("Codex stdout reader failed: {error}"));
+        (bytes, failure)
+    });
+    let mut stderr_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        let failure = stderr
+            .read_to_end(&mut bytes)
+            .await
+            .err()
+            .map(|error| format!("Codex stderr reader failed: {error}"));
+        (bytes, failure)
+    });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);
+    let input_outcome = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => PromptInputOutcome::Cancelled,
+        () = tokio::time::sleep_until(deadline) => PromptInputOutcome::TimedOut,
+        result = async {
+            stdin.write_all(prompt).await?;
+            stdin.shutdown().await
+        } => PromptInputOutcome::Finished(result),
+    };
+    let (mut status, stdin_failure) = match input_outcome {
+        PromptInputOutcome::Cancelled => {
+            drop(stdin);
+            terminate_process_tree(&mut child).await;
+            (Err(AgentError::Cancelled), None)
+        }
+        PromptInputOutcome::TimedOut => {
+            drop(stdin);
+            terminate_process_tree(&mut child).await;
+            (Err(AgentError::Timeout(timeout_seconds)), None)
+        }
+        PromptInputOutcome::Finished(write_result) => {
+            drop(stdin);
+            let stdin_failure = write_result
+                .err()
+                .map(|error| format!("failed to deliver the Codex prompt: {error}"));
+            let status = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => {
+                    terminate_process_tree(&mut child).await;
+                    Err(AgentError::Cancelled)
+                },
+                () = tokio::time::sleep_until(deadline) => {
+                    terminate_process_tree(&mut child).await;
+                    Err(AgentError::Timeout(timeout_seconds))
+                },
+                status = child.wait() => status.map_err(AgentError::Io),
+            };
+            (status, stdin_failure)
+        }
+    };
+    let drained = tokio::time::timeout(Duration::from_secs(5), async {
+        let stdout = match (&mut stdout_task).await {
+            Ok(capture) => capture,
+            Err(error) => (
+                Vec::new(),
+                Some(format!("Codex stdout reader task failed: {error}")),
+            ),
+        };
+        let stderr = match (&mut stderr_task).await {
+            Ok(capture) => capture,
+            Err(error) => (
+                Vec::new(),
+                Some(format!("Codex stderr reader task failed: {error}")),
+            ),
+        };
+        (stdout, stderr)
+    })
+    .await;
+    let (stdout, mut stderr, drain_failures) = if let Ok((stdout, stderr)) = drained {
+        let mut failures = Vec::new();
+        if let Some(error) = stdout.1 {
+            failures.push(error);
+        }
+        if let Some(error) = stderr.1 {
+            failures.push(error);
+        }
+        (stdout.0, stderr.0, failures)
+    } else {
+        stdout_task.abort();
+        stderr_task.abort();
+        (
+            Vec::new(),
+            Vec::new(),
+            vec!["Codex pipe drain timed out after process termination".into()],
+        )
+    };
+    if let Some(stdin_failure) = stdin_failure {
+        record_supervisor_failure(&mut status, &mut stderr, stdin_failure);
+    }
+    if !drain_failures.is_empty() {
+        let failure = drain_failures.join("; ");
+        record_supervisor_failure(&mut status, &mut stderr, failure);
+    }
+    Ok(CodexProcessCapture {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn record_supervisor_failure(
+    status: &mut Result<ExitStatus, AgentError>,
+    stderr: &mut Vec<u8>,
+    failure: String,
+) {
+    append_process_diagnostic(stderr, &failure);
+    // A known cancellation, timeout, wait error, or non-zero exit remains the
+    // primary outcome. Supervisor I/O only becomes primary after an otherwise
+    // successful exit.
+    if matches!(status, Ok(exit_status) if exit_status.success()) {
+        *status = Err(AgentError::Process(failure));
+    }
+}
+
+fn append_process_diagnostic(stderr: &mut Vec<u8>, diagnostic: &str) {
+    if !stderr.is_empty() && !stderr.ends_with(b"\n") {
+        stderr.push(b'\n');
+    }
+    stderr.extend_from_slice(diagnostic.as_bytes());
+    if !stderr.ends_with(b"\n") {
+        stderr.push(b'\n');
+    }
+}
+
+async fn terminate_process_tree(child: &mut Child) {
+    #[cfg(windows)]
+    if let Some(process_id) = child.id() {
+        let mut taskkill = Command::new("taskkill.exe");
+        taskkill
+            .arg("/PID")
+            .arg(process_id.to_string())
+            .arg("/T")
+            .arg("/F")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x0800_0000);
+        let _ = tokio::time::timeout(Duration::from_secs(10), taskkill.status()).await;
+    }
+    let _ = child.kill().await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+}
+
+async fn cleanup_codex_temp_files(schema_path: &Path, output_path: &Path) {
+    let _ = tokio::fs::remove_file(schema_path).await;
+    let _ = tokio::fs::remove_file(output_path).await;
 }
 
 #[async_trait]
@@ -373,66 +654,20 @@ impl AgentBackend for CodexCliBackend {
         task: AgentTask,
         cancellation: CancellationToken,
     ) -> Result<AgentRunResult, AgentError> {
-        self.execute(handle, &task, cancellation).await
+        self.execute(handle, &task, cancellation, None).await
     }
 
-    async fn continue_run(
+    async fn resume(
         &self,
         handle: &AgentHandle,
-        input: AgentInput,
-    ) -> Result<(), AgentError> {
-        let session_id = handle.session_id.as_deref().ok_or(AgentError::Unsupported(
-            "continue without a recorded session",
-        ))?;
-        let mut command = codex_process_command(&self.config.command);
-        command
-            .arg("exec")
-            .arg("resume")
-            .arg("--json")
-            .arg("--skip-git-repo-check");
-        if let Some(model) = handle.model.as_ref().or(self.config.default_model.as_ref()) {
-            command.arg("--model").arg(model);
-        }
-        let output = command
-            .arg(session_id)
-            .arg(input.prompt)
-            .current_dir(&handle.working_directory)
-            .output()
-            .await?;
-        if !output.status.success() {
-            return Err(AgentError::Process(format!(
-                "Codex resume exited with {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            )));
-        }
-        Ok(())
-    }
-
-    async fn steer(
-        &self,
-        _handle: &AgentHandle,
-        _input: AgentInput,
-    ) -> Result<SteerReceipt, AgentError> {
-        Err(AgentError::Unsupported("safe-point steering"))
-    }
-
-    async fn cancel(
-        &self,
-        handle: &AgentHandle,
-        _cause: CancellationCause,
-    ) -> Result<(), AgentError> {
-        if let Some(token) = self.runs.lock().await.get(&handle.handle_id) {
-            token.cancel();
-        }
-        Ok(())
-    }
-
-    async fn wait_idle(&self, handle: &AgentHandle) -> Result<(), AgentError> {
-        while self.runs.lock().await.contains_key(&handle.handle_id) {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        Ok(())
+        task: AgentTask,
+        cancellation: CancellationToken,
+    ) -> Result<AgentRunResult, AgentError> {
+        let session_id = handle.session_id.as_deref().ok_or_else(|| {
+            AgentError::SessionUnavailable("resume without a recorded session".into())
+        })?;
+        self.execute(handle, &task, cancellation, Some(session_id))
+            .await
     }
 }
 
@@ -450,45 +685,95 @@ fn live_web_search_config(role: &str) -> Option<&'static str> {
 fn codex_invocation(configured: &Path) -> (PathBuf, Vec<OsString>) {
     #[cfg(windows)]
     {
-        let is_batch = configured.extension().is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
-        });
-        if is_batch {
+        // Only the built-in bare `codex.cmd` may be replaced by the native npm
+        // binary/entrypoint. An explicit wrapper path is part of the caller's
+        // security and configuration boundary and must execute verbatim.
+        if is_default_codex_wrapper(configured) {
             let wrapper = resolve_command_path(configured).unwrap_or_else(|| configured.into());
-            let wrapper_parent = wrapper.parent().map(Path::to_path_buf);
-            let mut entrypoints = wrapper_parent
-                .iter()
-                .map(|parent| {
-                    parent
-                        .join("node_modules")
-                        .join("@openai")
-                        .join("codex")
-                        .join("bin")
-                        .join("codex.js")
-                })
-                .collect::<Vec<_>>();
-            if let Some(app_data) = std::env::var_os("APPDATA") {
-                entrypoints.push(
-                    PathBuf::from(app_data)
-                        .join("npm")
-                        .join("node_modules")
-                        .join("@openai")
-                        .join("codex")
-                        .join("bin")
-                        .join("codex.js"),
-                );
-            }
-            if let Some(entrypoint) = entrypoints.into_iter().find(|path| path.is_file()) {
-                let local_node = wrapper_parent
-                    .as_deref()
-                    .map(|parent| parent.join("node.exe"))
-                    .filter(|path| path.is_file());
-                let node = local_node.unwrap_or_else(|| PathBuf::from("node.exe"));
-                return (node, vec![entrypoint.into_os_string()]);
+            if let Some(invocation) = default_codex_batch_invocation(&wrapper) {
+                return invocation;
             }
         }
     }
     (configured.into(), Vec::new())
+}
+
+#[cfg(windows)]
+fn is_default_codex_wrapper(configured: &Path) -> bool {
+    configured
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("codex.cmd"))
+        && configured
+            .parent()
+            .is_none_or(|parent| parent.as_os_str().is_empty())
+}
+
+#[cfg(windows)]
+fn default_codex_batch_invocation(wrapper: &Path) -> Option<(PathBuf, Vec<OsString>)> {
+    if let Some(native) = windows_native_codex(wrapper) {
+        return Some((native, Vec::new()));
+    }
+    let wrapper_parent = wrapper.parent().map(Path::to_path_buf);
+    let mut entrypoints = wrapper_parent
+        .iter()
+        .map(|parent| {
+            parent
+                .join("node_modules")
+                .join("@openai")
+                .join("codex")
+                .join("bin")
+                .join("codex.js")
+        })
+        .collect::<Vec<_>>();
+    if let Some(app_data) = std::env::var_os("APPDATA") {
+        entrypoints.push(
+            PathBuf::from(app_data)
+                .join("npm")
+                .join("node_modules")
+                .join("@openai")
+                .join("codex")
+                .join("bin")
+                .join("codex.js"),
+        );
+    }
+    let entrypoint = entrypoints.into_iter().find(|path| path.is_file())?;
+    let local_node = wrapper_parent
+        .as_deref()
+        .map(|parent| parent.join("node.exe"))
+        .filter(|path| path.is_file());
+    let node = local_node.unwrap_or_else(|| PathBuf::from("node.exe"));
+    Some((node, vec![entrypoint.into_os_string()]))
+}
+
+#[cfg(windows)]
+fn windows_native_codex(wrapper: &Path) -> Option<PathBuf> {
+    let wrapper_parent = wrapper.parent()?;
+    let (platform_package, target_triple) = if cfg!(target_arch = "aarch64") {
+        ("codex-win32-arm64", "aarch64-pc-windows-msvc")
+    } else {
+        ("codex-win32-x64", "x86_64-pc-windows-msvc")
+    };
+    let package_root = wrapper_parent
+        .join("node_modules")
+        .join("@openai")
+        .join("codex");
+    [
+        package_root
+            .join("node_modules")
+            .join("@openai")
+            .join(platform_package)
+            .join("vendor")
+            .join(target_triple)
+            .join("bin")
+            .join("codex.exe"),
+        package_root
+            .join("vendor")
+            .join(target_triple)
+            .join("bin")
+            .join("codex.exe"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
 }
 
 #[cfg(windows)]
@@ -507,13 +792,80 @@ fn resolve_command_path(configured: &Path) -> Option<PathBuf> {
     })
 }
 
-fn find_session_id(value: &Value) -> Option<String> {
-    for key in ["thread_id", "session_id", "conversation_id"] {
-        if let Some(id) = value.get(key).and_then(Value::as_str) {
-            return Some(id.to_owned());
-        }
+fn resolve_session_id(
+    events: &[Value],
+    resumed_session_id: Option<&str>,
+) -> Result<Option<String>, AgentError> {
+    if let Some(expected) = resumed_session_id {
+        validate_session_id(expected)?;
     }
-    value.as_object()?.values().find_map(find_session_id)
+    let mut observed = None;
+    for event in events
+        .iter()
+        .filter(|event| event.get("type").and_then(Value::as_str) == Some("thread.started"))
+    {
+        let session_id = event
+            .get("thread_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                AgentError::InvalidOutput(
+                    "Codex thread.started event omitted a string thread_id".into(),
+                )
+            })?;
+        validate_session_id(session_id)?;
+        if let Some(first) = observed
+            && first != session_id
+        {
+            return Err(AgentError::InvalidOutput(format!(
+                "Codex emitted conflicting session identities {first} and {session_id}"
+            )));
+        }
+        observed = Some(session_id);
+    }
+    let observed = observed.ok_or_else(|| {
+        AgentError::InvalidOutput(if resumed_session_id.is_some() {
+            "resumed Codex run emitted no thread.started identity".into()
+        } else {
+            "Codex run emitted no thread.started identity".into()
+        })
+    })?;
+    if let Some(expected) = resumed_session_id
+        && observed != expected
+    {
+        return Err(AgentError::InvalidOutput(format!(
+            "resumed Codex session changed identity from {expected} to {observed}"
+        )));
+    }
+    Ok(Some(observed.to_owned()))
+}
+
+fn validate_session_id(session_id: &str) -> Result<(), AgentError> {
+    let bytes = session_id.as_bytes();
+    let canonical_uuid = bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => *byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        });
+    if canonical_uuid {
+        return Ok(());
+    }
+    Err(AgentError::InvalidOutput(format!(
+        "Codex session identity is not a canonical UUID: {session_id:?}"
+    )))
+}
+
+fn reports_unavailable_session(stderr: &str) -> bool {
+    stderr.lines().any(|line| {
+        let line = line.to_ascii_lowercase();
+        let names_session = line.contains("session") || line.contains("thread");
+        let reports_missing = line.contains("not found")
+            || line.contains("does not exist")
+            || line.contains("no saved session")
+            || line.contains("no saved thread")
+            || line.contains("unknown session")
+            || line.contains("unknown thread");
+        names_session && reports_missing
+    })
 }
 
 fn token_usage_from_events(events: &[Value]) -> (i64, i64) {
@@ -537,6 +889,21 @@ fn token_usage_from_events(events: &[Value]) -> (i64, i64) {
                         .max(0),
             )
         })
+}
+
+fn parse_jsonl_events(text: &str) -> (Vec<Value>, Vec<usize>) {
+    let mut events = Vec::new();
+    let mut invalid_lines = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str(line) {
+            Ok(event) => events.push(event),
+            Err(_) => invalid_lines.push(index + 1),
+        }
+    }
+    (events, invalid_lines)
 }
 
 fn parse_structured_output(bytes: &[u8]) -> Result<Value, AgentError> {
@@ -626,37 +993,54 @@ impl AgentBackend for MockBackend {
             completed_at: now,
         })
     }
-    async fn continue_run(
+    async fn resume(
         &self,
         _handle: &AgentHandle,
-        _input: AgentInput,
-    ) -> Result<(), AgentError> {
-        Ok(())
-    }
-    async fn steer(
-        &self,
-        _handle: &AgentHandle,
-        _input: AgentInput,
-    ) -> Result<SteerReceipt, AgentError> {
-        Err(AgentError::Unsupported("steer"))
-    }
-    async fn cancel(
-        &self,
-        _handle: &AgentHandle,
-        _cause: CancellationCause,
-    ) -> Result<(), AgentError> {
-        Ok(())
-    }
-    async fn wait_idle(&self, _handle: &AgentHandle) -> Result<(), AgentError> {
-        Ok(())
+        _task: AgentTask,
+        _cancellation: CancellationToken,
+    ) -> Result<AgentRunResult, AgentError> {
+        Err(AgentError::Unsupported("resumable session"))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    #[cfg(windows)]
+    use std::path::Path;
+    use std::{path::PathBuf, process::Stdio, time::Duration};
 
-    use super::{live_web_search_config, token_usage_from_events};
+    use serde_json::json;
+    use tokio::process::Command;
+    use tokio_util::sync::CancellationToken;
+
+    use super::{
+        AgentBackend, AgentError, AgentHandle, AgentTask, AgentTaskKind, CodexCliBackend,
+        CodexCliConfig, SessionBinding, live_web_search_config, parse_jsonl_events,
+        record_supervisor_failure, reports_unavailable_session, resolve_session_id,
+        run_codex_process, token_usage_from_events,
+    };
+
+    const SESSION_A: &str = "0198b86e-65ad-7c31-ae24-d3f6bb01b912";
+    const SESSION_B: &str = "0198b86e-65ad-7c31-ae24-d3f6bb01b913";
+
+    #[cfg(windows)]
+    fn native_codex_fixture_path(root: &Path) -> PathBuf {
+        let (platform_package, target_triple) = if cfg!(target_arch = "aarch64") {
+            ("codex-win32-arm64", "aarch64-pc-windows-msvc")
+        } else {
+            ("codex-win32-x64", "x86_64-pc-windows-msvc")
+        };
+        root.join("node_modules")
+            .join("@openai")
+            .join("codex")
+            .join("node_modules")
+            .join("@openai")
+            .join(platform_package)
+            .join("vendor")
+            .join(target_triple)
+            .join("bin")
+            .join("codex.exe")
+    }
 
     #[test]
     fn extracts_only_completed_turn_usage() {
@@ -669,6 +1053,138 @@ mod tests {
     }
 
     #[test]
+    fn jsonl_protocol_errors_are_reported_instead_of_silently_dropped() {
+        let (events, invalid_lines) = parse_jsonl_events(
+            "{\"type\":\"thread.started\"}\nnot-json\n\n{\"type\":\"turn.completed\"}\n",
+        );
+        assert_eq!(events.len(), 2);
+        assert_eq!(invalid_lines, vec![2]);
+    }
+
+    #[test]
+    fn session_identity_comes_only_from_the_thread_started_protocol_event() {
+        let events = vec![
+            json!({"type":"item.completed","payload":{"session_id":"injected"}}),
+            json!({"type":"thread.started","thread_id":SESSION_A}),
+        ];
+        assert_eq!(
+            resolve_session_id(&events, None).expect("session id"),
+            Some(SESSION_A.into())
+        );
+        assert!(matches!(
+            resolve_session_id(&events, Some(SESSION_B)),
+            Err(AgentError::InvalidOutput(_))
+        ));
+        assert!(matches!(
+            resolve_session_id(
+                &[json!({"type":"turn.completed","thread_id":"noise"})],
+                None
+            ),
+            Err(AgentError::InvalidOutput(_))
+        ));
+    }
+
+    #[test]
+    fn resumed_session_requires_an_explicit_consistent_protocol_identity() {
+        assert!(matches!(
+            resolve_session_id(&[], Some(SESSION_A)),
+            Err(AgentError::InvalidOutput(_))
+        ));
+        assert!(matches!(
+            resolve_session_id(
+                &[
+                    json!({"type":"thread.started"}),
+                    json!({"type":"thread.started","thread_id":SESSION_A}),
+                ],
+                Some(SESSION_A),
+            ),
+            Err(AgentError::InvalidOutput(_))
+        ));
+        assert!(matches!(
+            resolve_session_id(
+                &[
+                    json!({"type":"thread.started","thread_id":SESSION_A}),
+                    json!({"type":"thread.started","thread_id":SESSION_B}),
+                ],
+                Some(SESSION_A),
+            ),
+            Err(AgentError::InvalidOutput(_))
+        ));
+        for invalid in ["", "--last", "trusted-session", "00000000-0000-0000-0000"] {
+            assert!(matches!(
+                resolve_session_id(
+                    &[json!({"type":"thread.started","thread_id":invalid})],
+                    None,
+                ),
+                Err(AgentError::InvalidOutput(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn only_explicit_missing_session_diagnostics_are_retryable() {
+        assert!(reports_unavailable_session(
+            "Error: No saved session found with ID 0198..."
+        ));
+        assert!(reports_unavailable_session(
+            "requested thread does not exist"
+        ));
+        assert!(!reports_unavailable_session(
+            "HTTP 404: requested model route not found"
+        ));
+        assert!(!reports_unavailable_session(
+            "session transport failed while contacting the server"
+        ));
+    }
+
+    #[tokio::test]
+    async fn resume_requires_a_matching_in_process_session_binding() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let backend = CodexCliBackend::new(CodexCliConfig {
+            command: temp.path().join("must-not-run"),
+            ..CodexCliConfig::default()
+        });
+        let handle = AgentHandle {
+            handle_id: "agent-a".into(),
+            project_id: "project-a".into(),
+            role: "prover".into(),
+            model: Some("model-a".into()),
+            working_directory: temp.path().into(),
+            session_id: Some(SESSION_A.into()),
+        };
+        let task = AgentTask {
+            kind: AgentTaskKind::Worker,
+            prompt: "continue".into(),
+            output_schema: json!({"type":"object"}),
+            timeout_seconds: 1,
+        };
+        let missing = backend
+            .resume(&handle, task.clone(), CancellationToken::new())
+            .await
+            .expect_err("unregistered session must fail before spawn");
+        assert!(matches!(missing, AgentError::SessionUnavailable(_)));
+
+        let canonical = tokio::fs::canonicalize(temp.path())
+            .await
+            .expect("canonical tempdir");
+        backend.sessions.lock().await.insert(
+            SESSION_A.into(),
+            SessionBinding {
+                handle_id: "different-handle".into(),
+                project_id: handle.project_id.clone(),
+                role: handle.role.clone(),
+                model: handle.model.clone(),
+                working_directory: canonical,
+            },
+        );
+        let mismatch = backend
+            .resume(&handle, task, CancellationToken::new())
+            .await
+            .expect_err("a different handle must not reuse the session");
+        assert!(matches!(mismatch, AgentError::InvalidOutput(_)));
+    }
+
+    #[test]
     fn only_literature_workers_receive_supported_live_web_search_config() {
         assert_eq!(
             live_web_search_config("literature_researcher"),
@@ -677,26 +1193,106 @@ mod tests {
         assert_eq!(live_web_search_config("prover"), None);
         assert_eq!(live_web_search_config("paper_writer"), None);
         assert_eq!(live_web_search_config("math_review_1"), None);
+        assert_eq!(live_web_search_config("problem_generator"), None);
     }
 
     #[cfg(windows)]
     #[test]
-    fn batch_codex_wrapper_uses_node_entrypoint_for_multiline_safe_arguments() {
+    fn batch_codex_wrapper_resolves_the_native_binary_for_tree_safe_termination() {
         let temp = tempfile::tempdir().expect("tempdir");
         let wrapper = temp.path().join("codex.cmd");
-        let entrypoint = temp
-            .path()
-            .join("node_modules")
-            .join("@openai")
-            .join("codex")
-            .join("bin")
-            .join("codex.js");
-        std::fs::create_dir_all(entrypoint.parent().expect("entrypoint parent"))
-            .expect("entrypoint directory");
+        let native = native_codex_fixture_path(temp.path());
+        std::fs::create_dir_all(native.parent().expect("native parent")).expect("native directory");
         std::fs::write(&wrapper, "@node codex.js %*").expect("wrapper");
-        std::fs::write(&entrypoint, "// fixture").expect("entrypoint");
+        std::fs::write(&native, "fixture").expect("native binary");
+        let (program, prefix) =
+            super::default_codex_batch_invocation(&wrapper).expect("standard npm shim invocation");
+        assert_eq!(program, native);
+        assert!(prefix.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn explicit_batch_wrapper_is_never_replaced_by_an_adjacent_codex_installation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let wrapper = temp.path().join("restricted-codex.cmd");
+        std::fs::write(&wrapper, "@set CODEX_HOME=C:\\restricted\r\n@codex %*").expect("wrapper");
+        let native = native_codex_fixture_path(temp.path());
+        std::fs::create_dir_all(native.parent().expect("native parent")).expect("native directory");
+        std::fs::write(&native, "fixture").expect("native binary");
+
         let (program, prefix) = super::codex_invocation(&wrapper);
-        assert_eq!(program, std::path::Path::new("node.exe"));
-        assert_eq!(prefix, vec![entrypoint.into_os_string()]);
+        assert_eq!(program, wrapper);
+        assert!(prefix.is_empty());
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture; launched by supervisor tests"]
+    fn fake_process_exits_before_reading_prompt() {
+        if std::env::var_os("RESEARCH_RUNTIME_FAKE_EARLY_EXIT").is_none() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        eprintln!("fake-codex-early-exit");
+        std::process::exit(23);
+    }
+
+    #[tokio::test]
+    async fn early_child_exit_preserves_exit_status_and_stderr_after_broken_pipe() {
+        let executable = std::env::current_exe().expect("current test executable");
+        let mut command = Command::new(&executable);
+        command
+            .arg("--exact")
+            .arg("tests::fake_process_exits_before_reading_prompt")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env("RESEARCH_RUNTIME_FAKE_EARLY_EXIT", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let prompt = vec![b'x'; 8 * 1024 * 1024];
+        let capture = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_codex_process(command, &prompt, 5, CancellationToken::new(), &executable),
+        )
+        .await
+        .expect("supervisor did not hang")
+        .expect("capture");
+        let status = capture.status.expect("real child exit status");
+        assert_eq!(status.code(), Some(23));
+        let stderr = String::from_utf8_lossy(&capture.stderr);
+        assert!(stderr.contains("fake-codex-early-exit"));
+        assert!(stderr.contains("failed to deliver the Codex prompt"));
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_run_does_not_spawn_the_configured_program() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let command = Command::new(PathBuf::from("definitely-missing-codex-command"));
+        let error = run_codex_process(
+            command,
+            b"prompt",
+            1,
+            token,
+            PathBuf::from("missing").as_path(),
+        )
+        .await
+        .expect_err("pre-cancelled run");
+        assert!(matches!(error, AgentError::Cancelled));
+    }
+
+    #[test]
+    fn pipe_reader_failure_does_not_override_primary_cancellation_or_timeout() {
+        for primary in [AgentError::Cancelled, AgentError::Timeout(7)] {
+            let mut status = Err(primary);
+            let mut stderr = b"original stderr".to_vec();
+            record_supervisor_failure(&mut status, &mut stderr, "stdout reader failed".into());
+            assert!(matches!(
+                status,
+                Err(AgentError::Cancelled | AgentError::Timeout(7))
+            ));
+            assert!(String::from_utf8_lossy(&stderr).contains("stdout reader failed"));
+        }
     }
 }

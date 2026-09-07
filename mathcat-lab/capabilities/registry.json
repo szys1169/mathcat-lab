@@ -1,0 +1,150 @@
+{
+  "schemaVersion": "1.0",
+  "contracts": {
+    "request": "schemas/capability-request.schema.json",
+    "result": "schemas/capability-result.schema.json",
+    "artifact": "schemas/capability-artifact.schema.json",
+    "lifecycle": "schemas/capability-lifecycle.schema.json",
+    "manifest": "schemas/capability-manifest.schema.json"
+  },
+  "capabilities": [
+    {
+      "schemaVersion": "1.0",
+      "id": "math-literature-research",
+      "displayName": "文献调研",
+      "version": "0.1.0",
+      "ui": { "mode": "literature_research", "label": "文献调研喵", "description": "核验问题历史、论文与候选引理定理喵", "inputRequirements": ["明确、范围适中的数学问题", "可选：定义、猜想编号或已有论文"], "icon": "cat-search", "order": 1 },
+      "sourceOfTruth": "skills/math-literature-research",
+      "executors": {
+        "codex": { "status": "implemented", "entrypoint": "skills/math-literature-research/SKILL.md", "evidence": "test/math-literature-research-skill.test.mjs" },
+        "deepseek_harness": { "status": "implemented", "pluginVersion": "0.1.1", "entrypoint": "plugins/dsh-math-literature-research/lib/index.js", "evidence": "test/dsh-math-literature-plugin.test.mjs; test/task-manager.test.mjs; scripts/probe-dsh-capability-plugin.mjs" }
+      },
+      "contracts": {
+        "request": "schemas/capability-request.schema.json",
+        "result": "schemas/capability-result.schema.json",
+        "artifact": "schemas/capability-artifact.schema.json",
+        "lifecycle": "schemas/capability-lifecycle.schema.json"
+      },
+      "operations": ["preflight", "prepare", "run", "status", "stop", "finalize"],
+      "defaultTimeLimitSeconds": 7200,
+      "reportArtifactType": "literature_research_task_report",
+      "requiredArtifactTypes": ["literature_review_tex", "literature_review_pdf", "theorem_toolbox_tex", "theorem_toolbox_pdf", "bibliography", "source_ledger", "theorem_ledger", "literature_research_task_report"],
+      "dependencies": ["math-literature-core"]
+    },
+    {
+      "schemaVersion": "1.0",
+      "id": "math-related-work",
+      "displayName": "相关工作",
+      "version": "0.1.0",
+      "ui": { "mode": "related_work", "label": "相关工作喵", "description": "复用文献证据包并生成论文相关工作喵", "inputRequirements": ["论文草稿或本文主要结果", "可追溯文献包；缺少时将先建立最小来源包"], "icon": "cat-paper", "order": 2 },
+      "sourceOfTruth": "skills/math-related-work",
+      "executors": {
+        "codex": { "status": "implemented", "entrypoint": "skills/math-related-work/SKILL.md", "evidence": "test/math-related-work-skill.test.mjs" },
+        "deepseek_harness": { "status": "implemented", "pluginVersion": "0.1.1", "entrypoint": "plugins/dsh-math-related-work/lib/index.js", "evidence": "test/dsh-math-related-work-plugin.test.mjs; test/task-manager.test.mjs; scripts/probe-dsh-capability-plugin.mjs" }
+      },
+      "contracts": {
+        "request": "schemas/capability-request.schema.json",
+        "result": "schemas/capability-result.schema.json",
+        "artifact": "schemas/capability-artifact.schema.json",
+        "lifecycle": "schemas/capability-lifecycle.schema.json"
+      },
+      "operations": ["preflight", "prepare", "run", "status", "stop", "finalize"],
+      "defaultTimeLimitSeconds": 3600,
+      "reportArtifactType": "related_work_task_report",
+      "requiredArtifactTypes": ["related_work_tex", "related_work_inline_tex", "related_work_preview_pdf", "bibliography", "related_work_task_report"],
+      "dependencies": ["math-literature-core"]
+    },
+    {
+      "schemaVersion": "1.0",
+      "id": "rethlas-research",
+      "displayName": "Rethlas 研究",
+      "version": "0.1.0",
+      "ui": { "mode": "research", "label": "研究喵", "description": "调用本地 Rethlas 开展数学研究喵", "inputRequirements": ["明确的命题、猜想或计算目标", "完整假设、定义与必要上下文"], "icon": "cat-search", "order": 3 },
+      "sourceOfTruth": "external:RETHLAS_ROOT",
+      "executors": {
+        "codex": { "status": "implemented", "entrypoint": "skills/rethlas-research/SKILL.md", "evidence": "test/rethlas-research-skill.test.mjs; test/rethlas-safe-runtime.test.mjs" },
+        "deepseek_harness": { "status": "implemented", "pluginVersion": "0.1.1", "entrypoint": "plugins/dsh-rethlas-research/lib/index.js", "evidence": "test/dsh-rethlas-research-plugin.test.mjs; test/rethlas-safe-runtime.test.mjs; scripts/probe-rethlas-provider.mjs; scripts/probe-dsh-capability-plugin.mjs" }
+      },
+      "contracts": {
+        "request": "schemas/capability-request.schema.json",
+        "result": "schemas/capability-result.schema.json",
+        "artifact": "schemas/capability-artifact.schema.json",
+        "lifecycle": "schemas/capability-lifecycle.schema.json"
+      },
+      "operations": ["preflight", "prepare", "run", "status", "stop", "finalize"],
+      "defaultTimeLimitSeconds": 7200,
+      "reportArtifactType": "research_report",
+      "requiredArtifactTypes": ["research_report"],
+      "dependencies": ["Rethlas"]
+    },
+    {
+      "schemaVersion": "1.0",
+      "id": "math-paper-writing",
+      "displayName": "论文写作",
+      "version": "0.4.0",
+      "ui": { "mode": "paper", "label": "论文写作喵", "description": "根据已验证的 Source Packet 生成论文喵", "inputRequirements": ["已完成并验证的定理、证明或 Source Packet", "可追溯的文献与引用材料"], "icon": "cat-paper", "order": 4 },
+      "sourceOfTruth": "capabilities/math-paper-writing",
+      "executors": {
+        "codex": { "status": "implemented", "entrypoint": "capabilities/math-paper-writing/SKILL.md", "evidence": "capabilities/math-paper-writing/tests/test_core.py" },
+        "deepseek_harness": { "status": "implemented", "pluginVersion": "0.3.4", "entrypoint": "plugins/dsh-math-paper-writing/lib/index.js", "evidence": "capabilities/math-paper-writing/tests/test_harness_adapter.py; test/dsh-math-paper-writing-plugin.test.mjs; test/task-manager.test.mjs; scripts/probe-dsh-capability-plugin.mjs" }
+      },
+      "contracts": {
+        "request": "schemas/capability-request.schema.json",
+        "result": "schemas/capability-result.schema.json",
+        "artifact": "schemas/capability-artifact.schema.json",
+        "lifecycle": "schemas/capability-lifecycle.schema.json"
+      },
+      "operations": ["preflight", "prepare", "run", "status", "stop", "finalize"],
+      "defaultTimeLimitSeconds": 3600,
+      "reportArtifactType": "paper_task_report",
+      "requiredArtifactTypes": ["paper_tex", "paper_pdf", "claim_evidence_ledger", "paper_task_report"],
+      "dependencies": ["math-related-work"]
+    },
+    {
+      "schemaVersion": "1.0",
+      "id": "math-paper-revision",
+      "displayName": "论文修改",
+      "version": "0.1.0",
+      "ui": { "mode": "paper_revision", "label": "论文修改喵", "description": "先审数学缺口，再生成不覆盖原稿的修订喵", "inputRequirements": ["待修改的 LaTeX 数学论文", "可选：审稿意见、证明材料和来源包"], "icon": "cat-paper", "order": 5 },
+      "sourceOfTruth": "skills/math-paper-revision",
+      "executors": {
+        "codex": { "status": "implemented", "entrypoint": "skills/math-paper-revision/SKILL.md", "evidence": "test/paper-revision.test.mjs" },
+        "deepseek_harness": { "status": "implemented", "pluginVersion": "0.1.1", "entrypoint": "plugins/dsh-math-paper-revision/lib/index.js", "evidence": "test/dsh-math-paper-revision-plugin.test.mjs; test/paper-revision.test.mjs; scripts/probe-dsh-capability-plugin.mjs" }
+      },
+      "contracts": {
+        "request": "schemas/capability-request.schema.json",
+        "result": "schemas/capability-result.schema.json",
+        "artifact": "schemas/capability-artifact.schema.json",
+        "lifecycle": "schemas/capability-lifecycle.schema.json"
+      },
+      "operations": ["preflight", "prepare", "run", "status", "stop", "finalize"],
+      "defaultTimeLimitSeconds": 7200,
+      "reportArtifactType": "revision_task_report",
+      "requiredArtifactTypes": ["mathematical_audit", "gap_ledger", "revision_task_report"],
+      "dependencies": ["rethlas-research", "math-paper-writing"]
+    },
+    {
+      "schemaVersion": "1.0",
+      "id": "latex-beamer-ppt",
+      "displayName": "PPT 生成",
+      "version": "0.1.1",
+      "ui": { "mode": "presentation", "label": "PPT 生成喵", "description": "根据已有数学材料生成 Beamer 与 PPTX 喵", "inputRequirements": ["论文、讲义、研究报告或数学笔记", "可选：报告时长、语言和重点"], "icon": "cat-board", "order": 6 },
+      "sourceOfTruth": "skills/latex-beamer-ppt",
+      "executors": {
+        "codex": { "status": "implemented", "entrypoint": "skills/latex-beamer-ppt/SKILL.md", "evidence": "test/task-manager.test.mjs" },
+        "deepseek_harness": { "status": "implemented", "pluginVersion": "0.1.2", "entrypoint": "plugins/dsh-latex-beamer-ppt/lib/index.js", "evidence": "test/dsh-latex-beamer-ppt-plugin.test.mjs; test/task-manager.test.mjs; scripts/probe-dsh-capability-plugin.mjs" }
+      },
+      "contracts": {
+        "request": "schemas/capability-request.schema.json",
+        "result": "schemas/capability-result.schema.json",
+        "artifact": "schemas/capability-artifact.schema.json",
+        "lifecycle": "schemas/capability-lifecycle.schema.json"
+      },
+      "operations": ["preflight", "prepare", "run", "status", "stop", "finalize"],
+      "defaultTimeLimitSeconds": 3600,
+      "reportArtifactType": "ppt_task_report",
+      "requiredArtifactTypes": ["slides_tex", "presentation_pdf", "presentation_pptx", "ppt_task_report"],
+      "dependencies": []
+    }
+  ]
+}
