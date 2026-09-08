@@ -5,7 +5,7 @@ MathCat Lab 2.5.1 的核心服务支持 Apple Silicon 与 Intel Mac。平台只�
 ## 准备
 
 1. 安装 Xcode Command Line Tools：`xcode-select --install`。
-2. 安装 Node.js 22 或更高版本，以及包含 Cargo 的 Rust 1.85 或更高版本。
+2. 安装 Node.js 22 或更高版本，以及包含 Cargo 的 Rust 1.88 或更高版本。
 3. 安装并登录 Codex CLI，确认 `codex --version` 可以在终端运行。
 4. 论文/PPT 功能按需安装 Python 3、PyMuPDF、python-pptx 与 MacTeX；研究和白板本身不需要这些可选依赖。
 

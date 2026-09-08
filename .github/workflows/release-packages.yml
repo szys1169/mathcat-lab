@@ -15,7 +15,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.85"
+          toolchain: "1.88"
       - run: cargo build --release --bin mathcat-v2
         working-directory: math-research-mvp
       - shell: pwsh
@@ -32,7 +32,7 @@ jobs:
           body: |
             MathCat Lab 2.5.1 增加 macOS 支持，并保留 Windows 启动方式。
 
-            Windows x64 包内置研究服务；macOS 包在目标机器首次启动时按 Apple Silicon 或 Intel 架构编译。两者都需要 Node.js 22+ 与已登录的 Codex CLI。macOS 另需 Rust 1.85+ 和 Xcode Command Line Tools。
+            Windows x64 包内置研究服务；macOS 包在目标机器首次启动时按 Apple Silicon 或 Intel 架构编译。两者都需要 Node.js 22+ 与已登录的 Codex CLI。macOS 另需 Rust 1.88+ 和 Xcode Command Line Tools。
           files: dist/MathCat-Lab-2.5.1-Windows-x64.zip
 
   macos:
@@ -41,7 +41,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.85"
+          toolchain: "1.88"
       - run: cargo check --workspace
         working-directory: math-research-mvp
       - run: git archive --format=tar.gz --prefix=MathCat-Lab-2.5.1-macOS/ HEAD -o MathCat-Lab-2.5.1-macOS-universal-source.tar.gz

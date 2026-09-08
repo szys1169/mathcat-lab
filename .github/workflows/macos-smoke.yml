@@ -21,7 +21,7 @@ jobs:
           cache-dependency-path: math-lab-platfrom/package-lock.json
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.85"
+          toolchain: "1.88"
       - run: npm ci --ignore-scripts
         working-directory: math-lab-platfrom
       - run: node --check scripts/start-version.mjs && node --check scripts/stop-version.mjs && sh -n scripts/start-version.sh && sh -n scripts/stop-version.sh

@@ -17,7 +17,7 @@ MathCat Lab 是一个在本地运行的数学科研工作台：让研究智能�
 
 ## 环境准备
 
-最低要求为 Node.js 22 与 Rust 1.85。Windows 构建需要 MSVC 工具链；macOS 构建需要 Xcode Command Line Tools（可运行 `xcode-select --install`）。
+最低要求为 Node.js 22 与 Rust 1.88。Windows 构建需要 MSVC 工具链；macOS 构建需要 Xcode Command Line Tools（可运行 `xcode-select --install`）。
 
 基础功能需要：
 
