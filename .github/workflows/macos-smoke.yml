@@ -1,0 +1,31 @@
+name: macOS smoke
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "scripts/**"
+      - "math-lab-platfrom/**"
+      - "math-research-mvp/**"
+      - ".github/workflows/macos-smoke.yml"
+
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: math-lab-platfrom/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+      - run: npm ci --ignore-scripts
+        working-directory: math-lab-platfrom
+      - run: node --check scripts/start-version.mjs && node --check scripts/stop-version.mjs && sh -n scripts/start-version.sh && sh -n scripts/stop-version.sh
+      - run: cargo check --workspace
+        working-directory: math-research-mvp
+      - run: node --test test/research-v2.test.mjs test/workspace-files.test.mjs
+        working-directory: math-lab-platfrom

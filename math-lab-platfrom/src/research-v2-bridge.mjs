@@ -34,7 +34,7 @@ export class ResearchV2Bridge {
     }else{
       const created=await this.client.request(V2_PREFIX+"/projects",{method:"POST",idempotencyKey:conversation.researchStartKey,body:{title:conversation.title,problem:text,...(conversation.workspaceId?{workspace_id:conversation.workspaceId}:{})}});
       project=unwrapProject(created);
-      await this.store.updateConversation(conversationId,row=>{row.researchProjectId=project.id;row.researchContract="mathcat-research/v2";row.researchOutputPath=project.workspace_path||null;row.status="idle";row.messages.push({id:crypto.randomUUID(),role:"user",content:text,createdAt:new Date().toISOString(),executor:"codex",capabilityId:"rethlas-research",researchAgent:"MathCat 2.5.0"});});
+      await this.store.updateConversation(conversationId,row=>{row.researchProjectId=project.id;row.researchContract="mathcat-research/v2";row.researchOutputPath=project.workspace_path||null;row.status="idle";row.messages.push({id:crypto.randomUUID(),role:"user",content:text,createdAt:new Date().toISOString(),executor:"codex",capabilityId:"rethlas-research",researchAgent:"MathCat 2.5.1"});});
     }
     await this.importMaterials(conversation,project.id);
     const options=conversation.researchStartOptions||{durationSeconds,reviewMode,maxPartners,autoDeliver};

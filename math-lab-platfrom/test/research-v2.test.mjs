@@ -62,10 +62,10 @@ test("v2 public event replay deduplicates and sorts without modifying inputs",()
 });
 
 test("v2 proxy only accepts loopback host and same-origin browser requests",()=>{
-  assert.doesNotThrow(()=>assertLocalRequest({headers:{host:"127.0.0.1:4334",origin:"http://127.0.0.1:4334"}},4334));
-  assert.throws(()=>assertLocalRequest({headers:{host:"evil.example:4334"}},4334),/host/);
-  assert.throws(()=>assertLocalRequest({headers:{host:"127.0.0.1:4334",origin:"https://evil.example"}},4334),/origin/);
-  assert.throws(()=>assertLocalRequest({headers:{host:"127.0.0.1:4334","sec-fetch-site":"cross-site"}},4334),/Cross-site/);
+  assert.doesNotThrow(()=>assertLocalRequest({headers:{host:"127.0.0.1:4335",origin:"http://127.0.0.1:4335"}},4335));
+  assert.throws(()=>assertLocalRequest({headers:{host:"evil.example:4335"}},4335),/host/);
+  assert.throws(()=>assertLocalRequest({headers:{host:"127.0.0.1:4335",origin:"https://evil.example"}},4335),/origin/);
+  assert.throws(()=>assertLocalRequest({headers:{host:"127.0.0.1:4335","sec-fetch-site":"cross-site"}},4335),/Cross-site/);
   assert.throws(()=>new ResearchV2Client({baseUrl:"https://example.com"}),/local HTTP/);
   assert.throws(()=>validateV2Path("https://example.com/api/v2/research/projects"),/path/);
   assert.throws(()=>validateV2Path("/api/v2/research/%2e%2e/secrets"),/path/);
@@ -77,7 +77,7 @@ test("v2 server client injects only version-local bearer and keeps it out of res
   let captured;
   const client=new ResearchV2Client({tokenFile,fetchImpl:async(url,options)=>{captured={url,options};return new Response(JSON.stringify({contract:"mathcat-research/v2",project:{id:"p"}}));}});
   const value=await client.request("/api/v2/research/projects",{method:"POST",body:{title:"test"},idempotencyKey:"once"});
-  assert.equal(captured.url,"http://127.0.0.1:8899/api/v2/research/projects");assert.equal(captured.options.headers.authorization,"Bearer private-test-token");assert.equal(captured.options.headers["idempotency-key"],"once");assert.equal(JSON.stringify(value).includes("private-test-token"),false);
+  assert.equal(captured.url,"http://127.0.0.1:8900/api/v2/research/projects");assert.equal(captured.options.headers.authorization,"Bearer private-test-token");assert.equal(captured.options.headers["idempotency-key"],"once");assert.equal(JSON.stringify(value).includes("private-test-token"),false);
   const missing=new ResearchV2Client({tokenFile:path.join(root,"missing"),fetchImpl:()=>{throw new Error("must not fetch");}});await assert.rejects(()=>missing.request("/api/v2/research/projects"),/本版本/);
 });
 
@@ -110,10 +110,10 @@ test("v2 binding reuses project and refuses replacing a conversation's existing 
   assert.throws(()=>unwrapProject({project:{}}),/身份/);
 });
 
-test("2.5.0 keeps the classic transport separate from the new whiteboard renderer",async()=>{
+test("2.5.1 keeps the classic transport separate from the new whiteboard renderer",async()=>{
   const root=path.resolve(import.meta.dirname,"..");const app=await fs.readFile(path.join(root,"public","app.js"),"utf8");const adapter=await fs.readFile(path.join(root,"public","research-v2-classic.js"),"utf8");
   const whiteboard=await fs.readFile(path.join(root,"public","whiteboard-view.js"),"utf8");
-  assert.match(app,/ClassicResearchClient/);assert.match(app,/MathCat Lab 2\.5\.0/);assert.doesNotMatch(app,/ResearchV2View|v2-split|v2RunConfig|v2-intent/);assert.doesNotMatch(adapter,/document\.|createElement|appendChild/);assert.match(adapter,/reply_mode:'explain'/);assert.match(whiteboard,/停止本轮受管研究、伙伴、审核及讨论/);
+  assert.match(app,/ClassicResearchClient/);assert.match(app,/MathCat Lab 2\.5\.1/);assert.doesNotMatch(app,/ResearchV2View|v2-split|v2RunConfig|v2-intent/);assert.doesNotMatch(adapter,/document\.|createElement|appendChild/);assert.match(adapter,/reply_mode:'explain'/);assert.match(whiteboard,/停止本轮受管研究、伙伴、审核及讨论/);
 });
 
 test("v2 materials import exact text before Run and fail clearly on unreadable PDF",async()=>{

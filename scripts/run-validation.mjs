@@ -15,10 +15,11 @@ const jobs=[
   ['rust-release','cargo',['build','--release'],rust],
   ['platform-tests',process.execPath,['--test','--test-isolation=none'],path.join(root,'math-lab-platfrom')],
   ...(process.platform==='win32'?[['launcher-tests','powershell.exe',['-NoProfile','-ExecutionPolicy','Bypass','-File',path.join(root,'tests','launchers.test.ps1')],root]]:[]),
-  // A standalone checkout has no private sibling-version baseline to audit.
+  ['previous-version-isolation',process.execPath,['scripts/audit-previous-version.mjs'],root],
+  ['frontend-isolation',process.execPath,['scripts/audit-frontend.mjs'],root],
   ['research-tools',process.execPath,['--test','tests/research-tools.test.mjs'],root],
 ];
-const report={version:'2.5.0',kind:'offline-engineering',real_model_calls:false,started_at:new Date().toISOString(),build_environment:Object.fromEntries(['CARGO_INCREMENTAL','CARGO_PROFILE_DEV_DEBUG','CARGO_PROFILE_TEST_DEBUG'].map(key=>[key,process.env[key]??'toolchain_default'])),results:[]};
+const report={version:'2.5.1',kind:'offline-engineering',real_model_calls:false,started_at:new Date().toISOString(),build_environment:Object.fromEntries(['CARGO_INCREMENTAL','CARGO_PROFILE_DEV_DEBUG','CARGO_PROFILE_TEST_DEBUG'].map(key=>[key,process.env[key]??'toolchain_default'])),results:[]};
 const selected=process.argv.find(arg=>arg.startsWith('--only='))?.slice(7).split(',');
 if(selected?.some(name=>!jobs.some(job=>job[0]===name)))throw new Error('Unknown validation job; no passing empty receipt is allowed.');
 report.scope=selected?'selected':process.argv.includes('--rust-only')?'rust-only':'full-engineering';

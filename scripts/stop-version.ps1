@@ -8,7 +8,7 @@ function Get-ResearchProjects {
   $items = @()
   $cursor = $null
   do {
-    $url = 'http://127.0.0.1:8899/api/v2/research/projects?limit=100'
+    $url = 'http://127.0.0.1:8900/api/v2/research/projects?limit=100'
     if ($cursor) { $url += '&cursor=' + [uri]::EscapeDataString($cursor) }
     $page = Invoke-RestMethod -Uri $url -Headers $authHeaders -TimeoutSec 5
     $items += @($page.projects)
@@ -24,15 +24,15 @@ if (Test-Path -LiteralPath $tokenFile) {
       foreach ($run in $project.runs) {
         if ($run.state -ne 'ended') {
           $authHeaders['Idempotency-Key'] = [guid]::NewGuid().ToString()
-          $body = @{ type='stop_run';run_id=$run.id;target=@{kind='run';id=$run.id};apply_at='immediate';payload=@{reason='User stopped MathCat Lab 2.5.0'} } | ConvertTo-Json -Depth 5
-          Invoke-RestMethod -Method Post -Uri ('http://127.0.0.1:8899/api/v2/research/projects/' + $project.id + '/commands') -Headers $authHeaders -ContentType 'application/json' -Body $body -TimeoutSec 10 | Out-Null
+          $body = @{ type='stop_run';run_id=$run.id;target=@{kind='run';id=$run.id};apply_at='immediate';payload=@{reason='User stopped MathCat Lab 2.5.1'} } | ConvertTo-Json -Depth 5
+          Invoke-RestMethod -Method Post -Uri ('http://127.0.0.1:8900/api/v2/research/projects/' + $project.id + '/commands') -Headers $authHeaders -ContentType 'application/json' -Body $body -TimeoutSec 10 | Out-Null
         }
       }
       foreach ($interaction in $project.interactions) {
         if ($interaction.state -ne 'ended') {
           $authHeaders['Idempotency-Key'] = [guid]::NewGuid().ToString()
           $interactionBody = @{ expected_revision=$interaction.revision } | ConvertTo-Json
-          Invoke-RestMethod -Method Post -Uri ('http://127.0.0.1:8899/api/v2/research/projects/' + $project.id + '/interaction-executions/' + $interaction.id + '/cancel') -Headers $authHeaders -ContentType 'application/json' -Body $interactionBody -TimeoutSec 10 | Out-Null
+          Invoke-RestMethod -Method Post -Uri ('http://127.0.0.1:8900/api/v2/research/projects/' + $project.id + '/interaction-executions/' + $interaction.id + '/cancel') -Headers $authHeaders -ContentType 'application/json' -Body $interactionBody -TimeoutSec 10 | Out-Null
         }
       }
     }
@@ -80,7 +80,7 @@ if (Test-Path -LiteralPath $tokenFile) {
     }
   }
 }
-if (-not $safeToStop) { throw 'Stop has not been confirmed. Inspect the 2.5.0 whiteboard/logs; do not assume remote billing has stopped.' }
+if (-not $safeToStop) { throw 'Stop has not been confirmed. Inspect the 2.5.1 whiteboard/logs; do not assume remote billing has stopped.' }
 foreach ($pidName in @('platform.pid','research.pid')) {
   $pidFile = Join-Path $runtimeRoot $pidName
   if (-not (Test-Path -LiteralPath $pidFile)) { continue }
@@ -94,4 +94,4 @@ foreach ($pidName in @('platform.pid','research.pid')) {
   }
   Stop-Process -Id $targetProcessId -ErrorAction SilentlyContinue
 }
-Write-Output 'MathCat Lab 2.5.0 stop requested. Other versions were not stopped. No files were deleted.'
+Write-Output 'MathCat Lab 2.5.1 stop requested. Other versions were not stopped. No files were deleted.'

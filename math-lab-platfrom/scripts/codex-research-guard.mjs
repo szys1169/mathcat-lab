@@ -7,7 +7,8 @@ import { authorizedPrompt, executionPolicyAddendum } from './codex-execution-pol
 import { codexRead, weeklyWindow, quotaDecision, quotaReceipt } from './codex-quota.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const binary = path.join(root, 'runtime-tools/codex/node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe');
+const bundledWindows = path.join(root, 'runtime-tools/codex/node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe');
+const binary = process.env.CODEX_BIN || (process.platform === 'win32' ? bundledWindows : 'codex');
 const args = process.argv.slice(2);
 const cwdIndex = args.indexOf('--cd');
 const cwd = path.resolve(cwdIndex >= 0 ? args[cwdIndex + 1] : process.cwd());
@@ -40,7 +41,10 @@ async function terminate(reason) {
   await fs.writeFile(stoppedFile, JSON.stringify({ at: new Date().toISOString(), reason, policy }, null, 2), { flag: 'wx' }).catch(e => { if (e.code !== 'EEXIST') throw e; });
   await log({ event: 'stop', reason });
   // Kill only this wrapper's actual child tree, never a process discovered by name.
-  if (child?.pid) await new Promise(resolve => { const killer = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' }); killer.on('error', resolve); killer.on('exit', resolve); });
+  if (child?.pid) {
+    if (process.platform === 'win32') await new Promise(resolve => { const killer = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' }); killer.on('error', resolve); killer.on('exit', resolve); });
+    else { try { process.kill(-child.pid, 'SIGTERM'); } catch { child.kill('SIGTERM'); } }
+  }
   await stopProject(reason).catch(e => log({event:'stop_command_error',error:e.message}));
   process.stderr.write(`MathCat budget guard stopped this research: ${reason}\n`);
   process.exit(75);
@@ -87,7 +91,7 @@ if (scoped) {
 const attachPolicy = scoped && args.at(-1) === '-' && Boolean(executionPolicyAddendum(policy));
 let promptFailed = false;
 if (attachPolicy) await log({ event: 'execution_policy_attached', projectId: policy.projectId, mode: policy.mode });
-child = spawn(binary, effective, { windowsHide: true, stdio: attachPolicy ? ['pipe', 'inherit', 'inherit'] : 'inherit' });
+child = spawn(binary, effective, { windowsHide: true, detached: process.platform !== 'win32', stdio: attachPolicy ? ['pipe', 'inherit', 'inherit'] : 'inherit' });
 child.on('error', e => { clearInterval(timer); process.stderr.write(e.message + '\n'); process.exit(1); });
 child.on('exit', (code) => { if (!stopping) { clearInterval(timer); process.exit(promptFailed ? 1 : (code ?? 1)); } });
 if (attachPolicy) {

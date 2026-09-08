@@ -28,8 +28,8 @@ function defaultCodexBin() {
 
 export const config = Object.freeze({
   host: process.env.MATH_LAB_HOST || "127.0.0.1",
-  port: Number.parseInt(process.env.MATH_LAB_PORT || "4334", 10),
-  version: "2.5.0",
+  port: Number.parseInt(process.env.MATH_LAB_PORT || "4335", 10),
+  version: "2.5.1",
   appRoot,
   publicRoot: path.join(appRoot, "public"),
   runtimeRoot: path.resolve(process.env.MATH_LAB_RUNTIME_ROOT || path.join(appRoot, "runtime-data")),
@@ -37,12 +37,12 @@ export const config = Object.freeze({
   codexBin: process.env.CODEX_BIN || defaultCodexBin(),
   workspacesRoot: path.resolve(process.env.MATHCAT_V2_WORKSPACES_ROOT || path.join(appRoot,"..","workspaces")),
   researchV2: {
-    baseUrl: (process.env.MATHCAT_V2_API_URL || "http://127.0.0.1:8899").replace(/\/$/, ""),
+    baseUrl: (process.env.MATHCAT_V2_API_URL || "http://127.0.0.1:8900").replace(/\/$/, ""),
     tokenFile: path.resolve(process.env.MATHCAT_V2_TOKEN_FILE || path.join(appRoot,"..","runtime","api-token")),
     timeoutMs: 15000
   },
   mathcat: {
-    baseUrl: (process.env.MATHCAT_API_URL || "http://127.0.0.1:8899").replace(/\/$/, ""),
+    baseUrl: (process.env.MATHCAT_API_URL || "http://127.0.0.1:8900").replace(/\/$/, ""),
     actorId: process.env.MATHCAT_ACTOR_ID || "mathcat-lab",
     token: process.env.MATHCAT_API_TOKEN || "",
     timeoutMs: Number.parseInt(process.env.MATHCAT_API_TIMEOUT_MS || "10000", 10)

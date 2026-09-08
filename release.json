@@ -1,26 +1,43 @@
 {
   "product": "MathCat Lab",
-  "version": "2.5.0",
+  "version": "2.5.1",
   "contract": "mathcat-research/v2",
-  "status": "demo_source_snapshot",
+  "status": "ongoing_product_development_not_a_release",
   "created": "2026-09-08",
-  "based_on": "MathCat Lab 2.4.3",
+  "based_on": "MathCat Lab 2.5.0",
   "runtime": {
-    "web_port": 4334,
-    "research_port": 8899,
+    "web_port": 4335,
+    "research_port": 8900,
     "token_file": "runtime/api-token",
     "database": "runtime/state_v2.sqlite",
     "research_data": "workspaces"
   },
+  "source_baseline": {
+    "manifest": "docs/baselines/2.4.3-source.json",
+    "frontend": "../MathCat-Lab-2.4.3/math-lab-platfrom/public",
+    "backend": "../MathCat-Lab-2.4.3"
+  },
   "validation": {
-    "engineering_regression": "targeted_checks_passed_legacy_regressions_pending",
-    "http_acceptance": "targeted_live_artifact_checks_passed",
-    "browser_acceptance": "targeted_fixture_and_live_checks_passed",
-    "real_research": "short_automatic_and_collaborative_flows_run_not_solved"
+    "engineering_regression": {
+      "status": "targeted_checks_passed_legacy_regressions_pending"
+    },
+    "http_acceptance": {
+      "status": "deferred_by_user"
+    },
+    "browser_acceptance": {
+      "status": "six_fixture_checks_passed"
+    },
+    "macos": {
+      "status": "cross_platform_checks_passed_real_mac_pending"
+    },
+    "real_research": {
+      "status": "not_run_for_this_version"
+    }
   },
+  "legacy_policy": "Previous versions and research runs remain independent. Historical artifacts retain original content and hashes.",
   "build": {
-    "binary": "math-research-mvp/target/release/mathcat-v2.exe",
-    "status": "built_in_development_environment_binary_not_distributed"
+    "binary": "math-research-mvp/target/release/mathcat-v2[.exe]",
+    "status": "not_built_per_user_scope"
   },
-  "validation_report": "docs/VALIDATION.md"
+  "validation_report": "docs/CURRENT-DEVELOPMENT.md"
 }

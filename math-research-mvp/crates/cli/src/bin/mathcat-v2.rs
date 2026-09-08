@@ -1,4 +1,4 @@
-//! Standalone 2.5.0 process. Defaults and all writable paths stay in the new copy.
+//! Standalone 2.5.1 process. Defaults and all writable paths stay in the new copy.
 use std::{
     io::Write,
     net::SocketAddr,
@@ -12,9 +12,9 @@ use research_domain::research_v2::VERSION;
 use research_storage::research_v2::V2Store;
 
 #[derive(Debug, Parser)]
-#[command(name="mathcat-v2", version=VERSION, about="MathCat Lab independent research 2.5.0 server")]
+#[command(name="mathcat-v2", version=VERSION, about="MathCat Lab independent research 2.5.1 server")]
 struct Args {
-    #[arg(long, default_value = "127.0.0.1:8899")]
+    #[arg(long, default_value = "127.0.0.1:8900")]
     bind: SocketAddr,
     #[arg(long)]
     database: Option<PathBuf>,
@@ -87,7 +87,7 @@ fn checked_path(root: &Path, requested: Option<PathBuf>, fallback: &str) -> Resu
     }
     let canonical_root = root.canonicalize().context("Version root must exist")?;
     if !comparable_path(&absolute).starts_with(comparable_path(&canonical_root)) {
-        bail!("Writable paths must remain inside the new MathCat 2.5.0 copy");
+        bail!("Writable paths must remain inside the new MathCat 2.5.1 copy");
     }
     let existing = absolute
         .ancestors()
@@ -201,7 +201,7 @@ mod tests {
     fn default_is_distinct_loopback_port() {
         let args = Args::parse_from(["mathcat-v2"]);
         assert!(args.bind.ip().is_loopback());
-        assert_eq!(args.bind.port(), 8899);
+        assert_eq!(args.bind.port(), 8900);
         assert!(args.database.is_none());
         assert!(args.token_file.is_none());
     }

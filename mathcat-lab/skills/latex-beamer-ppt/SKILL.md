@@ -24,7 +24,7 @@ description: "把论文、讲义、研究报告或笔记整理成中文/英文�
 `PPT/` 下新建 `versions/<task-id>-YYYYMMDD-HHMMSS-ffffff-主题/`，本次全部产物写入该版本
 目录，不覆盖旧版本：
 
-- `slides.tex` + 必要的自定义样式与 `pic/` — 可继续精修的 Beamer 源文件(默认使用通用模板，见 [beamer-conventions.md](references/beamer-conventions.md))
+- `slides.tex` + `Tsinghua.sty` + `pic/` — 可继续精修的 Beamer 源文件(模板见 [beamer-conventions.md](references/beamer-conventions.md))
 - `slides.pdf` — xelatex 编译产物,视觉基准
 - `render_report.json` — 逐页渲染检查的页数与 PDF 哈希证据
 - `speaker_notes.md` — 逐页讲稿

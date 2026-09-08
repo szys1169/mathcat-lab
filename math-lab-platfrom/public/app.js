@@ -46,7 +46,7 @@ function openCodexSettings(projectId=currentCodexProject()){
   codexStatus.setContext(projectId);codexStatus.resetDraft();$('settingsDialog').showModal();void codexStatus.refresh();
 }
 setInterval(()=>{if(!document.hidden)void codexStatus.refresh();},60000);
-document.title = "MathCat Lab 2.5.0";
+document.title = "MathCat Lab 2.5.1";
 let draftContext=null;
 const draftKey=()=>state.conversationId?'conversation:'+state.conversationId:'new:'+(state.workspaceId||'none');
 function persistWorkspace(){

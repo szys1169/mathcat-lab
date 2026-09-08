@@ -32,12 +32,12 @@ mod whiteboard24;
 const ACTOR: &str = "local-owner";
 const MAX_TEXT_BYTES: usize = 1_000_000;
 const ALLOWED_ORIGINS: &[&str] = &[
-    "http://127.0.0.1:4334",
-    "http://localhost:4334",
-    "http://[::1]:4334",
-    "http://127.0.0.1:8899",
-    "http://localhost:8899",
-    "http://[::1]:8899",
+    "http://127.0.0.1:4335",
+    "http://localhost:4335",
+    "http://[::1]:4335",
+    "http://127.0.0.1:8900",
+    "http://localhost:8900",
+    "http://[::1]:8900",
 ];
 
 #[derive(Clone)]

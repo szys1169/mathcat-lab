@@ -44,3 +44,7 @@ tests/results/
 *.fdb_latexmk
 *.synctex.gz
 **/assets/tsinghua-template/
+
+# Local release staging
+release-dist/
+tests/fixtures/long-research-*/

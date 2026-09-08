@@ -1,6 +1,6 @@
 {
   "name": "math-lab-platform",
-  "version": "2.5.0",
+  "version": "2.5.1",
   "private": true,
   "type": "module",
   "description": "Local math agent workspace powered by Codex CLI",

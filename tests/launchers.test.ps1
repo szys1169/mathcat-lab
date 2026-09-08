@@ -4,8 +4,7 @@ $versionRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $backend = Join-Path $versionRoot 'math-research-mvp\target\release\mathcat-v2.exe'
 $server = Join-Path $versionRoot 'math-lab-platfrom\src\server.mjs'
 if (-not (Test-VersionProcess @{ExecutablePath=$backend} 'research.pid' $versionRoot)) { throw 'Own backend rejected' }
-$otherBackend = Join-Path ($versionRoot + '-backup') 'math-research-mvp\target\release\mathcat-v2.exe'
-if (Test-VersionProcess @{ExecutablePath=$otherBackend} 'research.pid' $versionRoot) { throw 'Sibling backend matched' }
+if (Test-VersionProcess @{ExecutablePath=($backend + '.backup')} 'research.pid' $versionRoot) { throw 'Sibling backend matched' }
 if (-not (Test-VersionProcess @{Name='node.exe';CommandLine=('node.exe "'+$server+'"')} 'platform.pid' $versionRoot)) { throw 'Own platform rejected' }
 if (Test-VersionProcess @{Name='node.exe';CommandLine=('node.exe "'+$server+'.bak"')} 'platform.pid' $versionRoot) { throw 'Other entry matched' }
 $fixture = @{runs=@(@{id='r1';state='ended';outstanding_cancellation=$true});interactions=@();sessions=@(@{id='s1';run_id='r1';state='closed'});usage=@(@{session_id='s1';run_id='r1';state='unknown';ended_at='2026-09-05T22:41:03Z'})}

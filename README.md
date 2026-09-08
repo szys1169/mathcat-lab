@@ -2,7 +2,7 @@
 
 MathCat Lab 是一个在本地运行的数学科研工作台：让研究智能体探索问题，让用户通过白板查看进展、审查分工、提出建议，并将已有材料整理成论文或汇报。
 
-当前源码版本为 **2.5.0 demo**，适合在已配置的 Windows 环境中开展小规模、有协助的用户试用。当前采用本地单人实例，不提供多人账号与租户隔离。
+当前源码版本为 **2.5.1 demo**，支持 Windows 10/11 与 macOS（Apple Silicon、Intel）从本机终端启动，适合开展小规模、有协助的用户试用。当前采用本地单人实例，不提供多人账号与租户隔离。
 
 ## 可以做什么
 
@@ -17,22 +17,24 @@ MathCat Lab 是一个在本地运行的数学科研工作台：让研究智能�
 
 ## 环境准备
 
-目前维护的启动入口面向 **Windows 10/11 + PowerShell**。本次检查使用 Node.js 24 和 Rust 1.98；前端声明的最低 Node 版本为 22，建议首次部署采用已验证的工具链。
+最低要求为 Node.js 22 与 Rust 1.85。Windows 构建需要 MSVC 工具链；macOS 构建需要 Xcode Command Line Tools（可运行 `xcode-select --install`）。
 
 基础功能需要：
 
 - Node.js 与 npm。
-- Rust / Cargo；Windows MSVC 工具链还需要 Visual Studio C++ Build Tools。
+- Rust / Cargo；Windows 需 Visual Studio C++ Build Tools，macOS 需 Xcode Command Line Tools。
 - 已安装、完成登录且可以正常调用的 Codex CLI。模型与额度读取依赖本机 CLI 的 app-server 接口。
 
 论文编译、PDF 检查和 PPT 导出另外需要：
 
 - Python 3.10+，以及 `PyMuPDF`、`python-pptx`。
-- MiKTeX 或 TeX Live；确保 `xelatex`、`pdflatex` 和 `latexmk` 可用，安装中文 `ctex`、Beamer 及文献处理所需宏包。
+- MiKTeX、TeX Live 或 MacTeX；确保 `xelatex`、`pdflatex` 和 `latexmk` 可用，安装中文 `ctex`、Beamer 及文献处理所需宏包。
 
 ```powershell
 python -m pip install PyMuPDF python-pptx
 ```
+
+macOS 使用 `python3 -m pip install PyMuPDF python-pptx`。基础研究与白板不依赖 Python 或 TeX；只有论文编译、PDF 检查和 PPT 导出需要这些可选工具。
 
 这些工具不会随仓库一起提交。首次 LaTeX 编译可能需要下载宏包。需要指定可执行文件时，可在启动前设置当前终端的 `CODEX_BIN`、`MATH_LAB_PYTHON` 环境变量。
 
@@ -44,12 +46,23 @@ cd mathcat-lab
 .\scripts\start-version.ps1
 ```
 
-也可双击根目录的 **打开MathCat-Lab-2.5.0.cmd**。启动器会安装缺失的前端依赖、在缺少程序时构建 Rust 后端，并生成本地连接凭据。首次构建可能需要数分钟，不需要自己填写令牌。
+也可双击根目录的 **打开MathCat-Lab-2.5.1.cmd**。启动器会安装缺失的前端依赖、在缺少程序时构建 Rust 后端，并生成本地连接凭据。首次构建可能需要数分钟，不需要自己填写令牌。
 
-- 平台：<http://127.0.0.1:4334/>
-- 研究服务：`http://127.0.0.1:8899`
+macOS：
+
+```bash
+git clone https://github.com/szys1169/mathcat-lab.git
+cd mathcat-lab
+bash scripts/start-version.sh
+```
+
+首次使用若 Finder 阻止直接打开 `.command` 文件，先运行 `chmod +x scripts/*.sh *.command`；之后可双击 **打开MathCat-Lab-2.5.1.command**。启动器只调用已经安装并登录的 `codex`，也可通过 `CODEX_BIN=/完整路径/codex` 指定。
+
+- 平台：<http://127.0.0.1:4335/>
+- 研究服务：`http://127.0.0.1:8900`
 - 不自动打开浏览器：`.\scripts\start-version.ps1 -NoBrowser`
-- 关闭当前实例：`.\scripts\stop-version.ps1`，或双击 **停止MathCat-Lab-2.5.0.cmd**。
+- 关闭当前实例：`.\scripts\stop-version.ps1`，或双击 **停止MathCat-Lab-2.5.1.cmd**。
+- macOS 关闭：`bash scripts/stop-version.sh`，或双击 **停止MathCat-Lab-2.5.1.command**。
 
 更新源码后，先使用停止入口关闭本实例，再执行 `.\scripts\start-version.ps1 -Rebuild`。同一台电脑请勿同时启动两个使用上述相同端口的副本。
 
@@ -86,7 +99,7 @@ cd mathcat-lab
 
 不调用模型的基础检查：
 
-```powershell
+```text
 node scripts/run-validation.mjs --only=rust-format,research-tools,launcher-tests
 
 cd math-lab-platfrom

@@ -648,7 +648,7 @@ async fn health_is_public_but_project_requires_server_auth() {
         .await
         .unwrap();
     let body: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(body["version"], "2.5.0");
+    assert_eq!(body["version"], "2.5.1");
     assert_eq!(body["contract"], CONTRACT);
     assert!(!String::from_utf8_lossy(&bytes).contains(TOKEN));
     let response = f
@@ -669,10 +669,10 @@ async fn health_is_public_but_project_requires_server_auth() {
 async fn current_version_browser_origins_are_accepted_and_previous_ports_are_rejected() {
     let f = Fixture::new().await;
     for (origin, expected) in [
-        ("http://127.0.0.1:4334", StatusCode::OK),
-        ("http://localhost:4334", StatusCode::OK),
-        ("http://[::1]:4334", StatusCode::OK),
-        ("http://127.0.0.1:8899", StatusCode::OK),
+        ("http://127.0.0.1:4335", StatusCode::OK),
+        ("http://localhost:4335", StatusCode::OK),
+        ("http://[::1]:4335", StatusCode::OK),
+        ("http://127.0.0.1:8900", StatusCode::OK),
         ("http://127.0.0.1:4333", StatusCode::FORBIDDEN),
         ("http://127.0.0.1:8898", StatusCode::FORBIDDEN),
     ] {
@@ -682,7 +682,7 @@ async fn current_version_browser_origins_are_accepted_and_previous_ports_are_rej
             .oneshot(
                 Request::builder()
                     .uri("/api/v2/research/projects")
-                    .header(header::HOST, "127.0.0.1:8899")
+                    .header(header::HOST, "127.0.0.1:8900")
                     .header(header::ORIGIN, origin)
                     .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
                     .body(Body::empty())
@@ -699,7 +699,7 @@ async fn hostile_origin_and_rebinding_host_are_rejected_even_with_token() {
     let f = Fixture::new().await;
     for (host, origin) in [
         ("127.0.0.1:8890", "https://attacker.example"),
-        ("attacker.example:8890", "http://localhost:4334"),
+        ("attacker.example:8890", "http://localhost:4335"),
         ("127.0.0.1:8890", "null"),
     ] {
         let response = f

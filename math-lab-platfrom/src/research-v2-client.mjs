@@ -21,7 +21,7 @@ export function assertLocalRequest(req, port) {
 }
 
 export class ResearchV2Client {
-  constructor({baseUrl="http://127.0.0.1:8899", tokenFile, timeoutMs=15000, fetchImpl=fetch}) {
+  constructor({baseUrl="http://127.0.0.1:8900", tokenFile, timeoutMs=15000, fetchImpl=fetch}) {
     const url = new URL(baseUrl);
     if (url.protocol!=="http:" || !["127.0.0.1","localhost","[::1]"].includes(url.hostname) || url.username || url.password || url.pathname!=="/") throw new Error("Research backend must be a local HTTP origin.");
     this.baseUrl=url.origin; this.tokenFile=tokenFile; this.timeoutMs=timeoutMs; this.fetchImpl=fetchImpl;
@@ -29,8 +29,8 @@ export class ResearchV2Client {
   async headers(extra={}) {
     let token;
     try { token=(await fs.readFile(this.tokenFile,"utf8")).trim(); }
-    catch { throw Object.assign(new Error("MathCat 2.5.0 尚未启动：找不到本版本的本地连接凭据。请使用 2.5.0 启动器。"),{status:503}); }
-    if (!token || /[\r\n]/.test(token)) throw Object.assign(new Error("本版本的本地连接凭据无效，请重新启动 MathCat 2.5.0。"),{status:503});
+    catch { throw Object.assign(new Error("MathCat 2.5.1 尚未启动：找不到本版本的本地连接凭据。请使用 2.5.1 启动器。"),{status:503}); }
+    if (!token || /[\r\n]/.test(token)) throw Object.assign(new Error("本版本的本地连接凭据无效，请重新启动 MathCat 2.5.1。"),{status:503});
     return {...extra,authorization:`Bearer ${token}`};
   }
   async request(apiPath,{method="GET",body,idempotencyKey,signal}={}) {
@@ -38,7 +38,7 @@ export class ResearchV2Client {
     const response=await this.fetchImpl(this.baseUrl+validateV2Path(apiPath),{method,headers,body:body===undefined?undefined:JSON.stringify(body),redirect:"error",signal:signal||AbortSignal.timeout(this.timeoutMs)});
     const value=await response.json();
     if(!response.ok)throw Object.assign(new Error(value.error?.message||value.message||(typeof value.error==="string"?value.error:`Research API HTTP ${response.status}`)),{status:response.status,code:value.error?.code,details:value.error?.details});
-    if(value.contract && value.contract!==V2_CONTRACT)throw Object.assign(new Error("研究服务协议不匹配，请检查是否启动了 MathCat 2.5.0。"),{status:502});
+    if(value.contract && value.contract!==V2_CONTRACT)throw Object.assign(new Error("研究服务协议不匹配，请检查是否启动了 MathCat 2.5.1。"),{status:502});
     return value;
   }
   async proxy(req,res) {

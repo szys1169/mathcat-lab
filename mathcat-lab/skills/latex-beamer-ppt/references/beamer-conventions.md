@@ -1,8 +1,8 @@
 # Beamer 排版约定、模板用法与编译审计
 
-## 默认通用模板
+## 模板用法(学堂班 Tsinghua 模板)
 
-公开源码包使用 `assets/generic-template/slides.tex`。将其复制到本次输出目录，不依赖机构主题或校徽。用户明确提供了有权使用的模板时，可以保留其样式；私有学堂班模板不随本仓库提供。
+把 `assets/tsinghua-template/` 中的 `Tsinghua.sty` 与 `pic/` 拷到输出目录,与 `slides.tex` 同级,然后:
 
 ```latex
 \documentclass[aspectratio=169]{beamer}   % 现代投影默认 16:9;旧设备可去掉
@@ -11,7 +11,7 @@
 \usepackage{amsmath,amssymb}
 \usepackage{tikz-cd}
 \usepackage{booktabs,graphicx,multicol}
-\usetheme{Madrid}
+\usepackage{Tsinghua}
 
 \author{作者}
 \title{标题}
@@ -19,10 +19,10 @@
 \date{\today}
 ```
 
-通用模板的内容组织约定:
+参考示例 deck:`assets/tsinghua-template/slide.tex`(层和层上同调)。它的结构约定:
 
-- 标题页使用 `\titlepage`，不自行添加机构标志。
-- 使用清晰的章节结构和页码，不依赖外部主题文件。
+- `\kaishu` 开启楷体正文;标题页放 `\titlepage` + logo。
+- `Tsinghua.sty` 已定义清华紫配色、smoothbars 导航、circles 内层主题、页脚页码,并自动在每个 section 前插入目录页。
 - 数学内容用命名 block:`\begin{block}{Definition 1.1.} ... \end{block}`、`Theorem`、`Proposition`、`Lemma`、`Corollary`、`Example`、`Construction`。
 - 校徽等品牌图片只在本地使用,不随输出公开传播。
 
@@ -30,7 +30,7 @@
 
 ## 颜色与空间
 
-- 使用统一主题色表示结构、标题和中性重点；红色只表示矛盾、风险、反例或必须警示之处，不用红色装饰普通结论。
+- 清华紫用于结构、标题和中性重点；红色只表示矛盾、风险、反例或必须警示之处，不用红色装饰普通结论。
 - 蓝/绿色可用于正向结论或已完成步骤，但同一语义全稿保持一致。
 - 参考文献页正文不小于 `\footnotesize`，优先减少条目或拆页，不用不可读的小字。
 - TikZ 节点文字和连线必须留出间距；标签不得压在线条、箭头、节点边框或其他标签上。
