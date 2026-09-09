@@ -5,7 +5,7 @@ import {explicitProblemEdit} from "../public/problem-edit-intent.js";
 
 export class ResearchV2Bridge {
   constructor({store,client,onRunStarted,resolveModel}={}){this.store=store;this.client=client;this.onRunStarted=onRunStarted;this.resolveModel=resolveModel;this.pending=new Map();}
-  async start(conversationId,text,{durationSeconds=7200,reviewMode="strict",maxPartners=5,autoDeliver=true}={}) {
+  async start(conversationId,text,{durationSeconds=7200,reviewMode="automatic",maxPartners=5,autoDeliver=true}={}) {
     if(!Number.isInteger(durationSeconds)||durationSeconds<=0)throw Object.assign(new Error("研究时长必须是正整数秒。"),{status:422});
     if(!["automatic","strict","balanced"].includes(reviewMode))throw Object.assign(new Error("请选择自动安排分工或每轮由我批准。"),{status:422});
     if(!Number.isInteger(maxPartners)||maxPartners<0||maxPartners>20)throw Object.assign(new Error("伙伴猫上限须为 0 到 20 的整数。"),{status:422});
@@ -34,7 +34,7 @@ export class ResearchV2Bridge {
     }else{
       const created=await this.client.request(V2_PREFIX+"/projects",{method:"POST",idempotencyKey:conversation.researchStartKey,body:{title:conversation.title,problem:text,...(conversation.workspaceId?{workspace_id:conversation.workspaceId}:{})}});
       project=unwrapProject(created);
-      await this.store.updateConversation(conversationId,row=>{row.researchProjectId=project.id;row.researchContract="mathcat-research/v2";row.researchOutputPath=project.workspace_path||null;row.status="idle";row.messages.push({id:crypto.randomUUID(),role:"user",content:text,createdAt:new Date().toISOString(),executor:"codex",capabilityId:"rethlas-research",researchAgent:"MathCat 2.5.1"});});
+      await this.store.updateConversation(conversationId,row=>{row.researchProjectId=project.id;row.researchContract="mathcat-research/v2";row.researchOutputPath=project.workspace_path||null;row.status="idle";row.messages.push({id:crypto.randomUUID(),role:"user",content:text,createdAt:new Date().toISOString(),executor:"codex",capabilityId:"rethlas-research",researchAgent:"MathCat 2.5.3"});});
     }
     await this.importMaterials(conversation,project.id);
     const options=conversation.researchStartOptions||{durationSeconds,reviewMode,maxPartners,autoDeliver};

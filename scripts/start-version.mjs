@@ -4,7 +4,9 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
-import { backendRoot,platformRoot,runtimeRoot,logRoot,dataRoot,tokenFile,backendUrl,platformUrl,expectedVersion,health,assertPortFree,run,waitFor } from "./version-runtime.mjs";
+import {forwardUpdate} from './forward-update.mjs';
+await forwardUpdate(path.resolve(import.meta.dirname,'..'),'start',process.argv.slice(2));
+import { backendRoot,platformRoot,runtimeRoot,logRoot,dataRoot,databasePath,platformDataRoot,tokenFile,backendUrl,platformUrl,expectedVersion,health,assertPortFree,run,waitFor } from "./version-runtime.mjs";
 
 const flags=new Set(process.argv.slice(2));
 if(flags.has("--help")){console.log("用法: node scripts/start-version.mjs [--no-browser] [--rebuild]");process.exit(0);}
@@ -24,7 +26,7 @@ if(!backendHealth){
   const backendBin=path.join(backendRoot,"target","release",process.platform==="win32"?"mathcat-v2.exe":"mathcat-v2");
   if(flags.has("--rebuild")||!fs.existsSync(backendBin))run("cargo",["build","--release","--bin","mathcat-v2"],{cwd:backendRoot});
   const out=fs.openSync(path.join(logRoot,"research.stdout.log"),"a"),err=fs.openSync(path.join(logRoot,"research.stderr.log"),"a");
-  const child=spawn(backendBin,["--bind","127.0.0.1:8900","--database",path.join(runtimeRoot,"state_v2.sqlite"),"--data-root",dataRoot,"--token-file",tokenFile,"--codex-command",codex],{cwd:backendRoot,detached:true,stdio:["ignore",out,err],shell:false});
+  const child=spawn(backendBin,["--bind","127.0.0.1:8900","--database",databasePath,"--data-root",dataRoot,"--token-file",tokenFile,"--codex-command",codex],{cwd:backendRoot,detached:true,stdio:["ignore",out,err],shell:false});
   fs.closeSync(out);fs.closeSync(err);
   await fsp.writeFile(path.join(runtimeRoot,"research.pid"),String(child.pid));backendHealth=await waitFor(`${backendUrl}/health`,child,"研究服务");child.unref();
   if(backendHealth.version!==expectedVersion)throw new Error("新研究服务报告了错误版本，请重新构建。");
@@ -34,7 +36,7 @@ if(platformHealth&&platformHealth.version!==expectedVersion)throw new Error("平
 if(!platformHealth){
   await assertPortFree(4335);
   const out=fs.openSync(path.join(logRoot,"platform.stdout.log"),"a"),err=fs.openSync(path.join(logRoot,"platform.stderr.log"),"a");
-  const child=spawn(process.execPath,[path.join(platformRoot,"src","server.mjs")],{cwd:platformRoot,detached:true,stdio:["ignore",out,err],shell:false,env:{...process.env,CODEX_BIN:codex,MATH_LAB_PORT:"4335",MATH_LAB_RUNTIME_ROOT:path.join(platformRoot,"runtime-data"),MATHCAT_V2_API_URL:backendUrl,MATHCAT_V2_TOKEN_FILE:tokenFile}});
+  const child=spawn(process.execPath,[path.join(platformRoot,"src","server.mjs")],{cwd:platformRoot,detached:true,stdio:["ignore",out,err],shell:false,env:{...process.env,CODEX_BIN:codex,MATH_LAB_PORT:"4335",MATH_LAB_RUNTIME_ROOT:platformDataRoot,MATHCAT_V2_WORKSPACES_ROOT:dataRoot,MATHCAT_V2_API_URL:backendUrl,MATHCAT_V2_TOKEN_FILE:tokenFile}});
   fs.closeSync(out);fs.closeSync(err);
   await fsp.writeFile(path.join(runtimeRoot,"platform.pid"),String(child.pid));platformHealth=await waitFor(`${platformUrl}/api/health`,child,"平台服务");child.unref();
   if(platformHealth.version!==expectedVersion)throw new Error("新平台服务报告了错误版本。");

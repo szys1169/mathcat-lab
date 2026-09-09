@@ -239,7 +239,7 @@ test("a resumed watcher survives repeated reads failing immediately after a comm
 
 test("TaskManager does not create a watcher while another human decision still blocks MathCat", async () => {
   const manager = new TaskManager({
-    store: {},
+    store: {getConversation:()=>null},
     config: {},
     capabilities: [],
     researchBoards: { byConversation: () => ({ agent: "mathcat", remoteProjectId: "project_1" }) }

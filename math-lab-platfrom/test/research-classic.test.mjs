@@ -15,9 +15,13 @@ test('classic browser fetch is called with the global receiver, not the client i
   await client.load(conversation);
 });
 
-test('2.3 retains legacy math rendering and theme assets while adding the new workspace',async()=>{
-  const hashes={'styles.css':'BCA490EECE3F033D4FEF9447E0EE9DCB21BE48B91336B2C599241E98C339A6A6','research-board.css':'46D705BD62A2972D6B3C572A8C87AE3FC47F591E1A81B8D623FE1906328B1B25','icons.js':'EDE61B063DDA9D17360D1D9078D03A0D0875C56CA648DFA7FABC1AA7173E85C0','cat.svg':'2B9D0E250086F118CEA479A61BBC9F643BA412AD05AA7C4E986DD873D384AFED','thinking.css':'4F8E2D854C3D9E1856D57954C969A94E1C3508E8EC8F5F5C23DE6747F4D6F770','math-renderer.js':'2B2F50C1A9F33979CBB16FDA45A97A3FEA41017A29C92E0F8EED34F13560BF07'};
-  for(const [file,hash]of Object.entries(hashes)){const bytes=await fs.readFile(new URL('../public/'+file,import.meta.url));assert.equal(crypto.createHash('sha256').update(bytes).digest('hex').toUpperCase(),hash,file);}
+test('shared rendering retains safe markup and actual mathematical scripts',async()=>{
+  const {renderLatexText}=await import('../public/math-renderer.js');
+  const {default:katex}=await import('katex');
+  const html=renderLatexText('**结论** $J_f$ <script>alert(1)</script>',{escapeHtml,renderFormula:source=>katex.renderToString(source,{throwOnError:true})});
+  assert.match(html,/<strong>结论<\/strong>/);assert.match(html,/class="katex"/);assert.doesNotMatch(html,/<script>|math-fallback/);
+  const index=await fs.readFile(new URL('../public/index.html',import.meta.url),'utf8');
+  for(const name of ['styles.css','whiteboard.css','vendor/katex/katex.min.css'])assert.ok(index.includes(name));
 });
 
 test('classic chat and whiteboard remain mutually exclusive full-page views',async()=>{
@@ -89,7 +93,7 @@ test('classic explicit interaction cancellation clears matching pending explanat
 test('classic critical question is visible and answered explicitly rather than hidden in readonly chat',async()=>{
   const p=project({runs:[{id:'r',state:'waiting_human',question:'是否假设 Noetherian？'}]});const view=classicProjection(conversation,p);assert.match(view.conversation.messages.at(-1).content,/是否假设 Noetherian/);
   const html=renderClassicResearchBoard(view.board,{escapeHtml,renderText:escapeHtml,graphCards:''});assert.match(html,/猫猫提问卡/);assert.match(html,/data-classic-action="answer"/);assert.match(html,/答复并继续研究/);
-  const app=await fs.readFile(new URL('../public/app.js',import.meta.url),'utf8');assert.match(app,/new ResearchWhiteboard/);const newView=await fs.readFile(new URL('../public/whiteboard-view.js',import.meta.url),'utf8');assert.match(newView,/this\.api\.answer\(p,q,/);assert.match(app,/普通发送仍是旁观讨论|classicResearch\.discuss/);assert.match(app,/人工参与/);assert.doesNotMatch(app,/此研究内核暂不支持/);assert.match(app,/option\.disabled=option\.hidden/);assert.match(app,/每轮分工交给你批准后执行/);
+  const app=await fs.readFile(new URL('../public/app.js',import.meta.url),'utf8');assert.match(app,/new ResearchWhiteboard/);const newView=await fs.readFile(new URL('../public/whiteboard-view.js',import.meta.url),'utf8');assert.match(newView,/this\.api\.answer\(p,q,/);assert.match(app,/普通发送仍是旁观讨论|classicResearch\.discuss/);assert.match(app,/人工参与/);assert.doesNotMatch(app,/此研究内核暂不支持/);const {questionsHtml}=await import('../public/whiteboard-lab.js');const current=project({runs:[{id:'r',state:'waiting_human',human_question_id:'q'}],human_questions:[{id:'q',run_id:'r',state:'open',problem_version:1,question:'是否假设 Noetherian？'}]});assert.match(questionsHtml(current,escapeHtml),/回答这条问题/);
 });
 
 test('classic history keeps note metadata stable instead of attaching later unrelated logs',()=>{

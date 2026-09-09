@@ -29,7 +29,7 @@ function defaultCodexBin() {
 export const config = Object.freeze({
   host: process.env.MATH_LAB_HOST || "127.0.0.1",
   port: Number.parseInt(process.env.MATH_LAB_PORT || "4335", 10),
-  version: "2.5.1",
+  version: "2.5.3",
   appRoot,
   publicRoot: path.join(appRoot, "public"),
   runtimeRoot: path.resolve(process.env.MATH_LAB_RUNTIME_ROOT || path.join(appRoot, "runtime-data")),

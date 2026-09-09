@@ -648,7 +648,7 @@ async fn health_is_public_but_project_requires_server_auth() {
         .await
         .unwrap();
     let body: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(body["version"], "2.5.1");
+    assert_eq!(body["version"], "2.5.3");
     assert_eq!(body["contract"], CONTRACT);
     assert!(!String::from_utf8_lossy(&bytes).contains(TOKEN));
     let response = f

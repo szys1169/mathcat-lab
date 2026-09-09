@@ -32,8 +32,8 @@ test("restart preserves running conversations until the task manager reconciles 
   assert.match(recovered.messages.at(-1).content,/得到部分成果/);
 });
 
-test("capability index exposes seven complete capabilities", async () => {
-  const rows=await loadCapabilities(path.resolve(import.meta.dirname,"..","..","capabilities")); assert.equal(rows.length,7); for(const row of rows) { assert.ok(row.skillFile&&row.adapterFile); await fs.access(row.skillFile); await fs.access(row.adapterFile); }
+test("capability index exposes six complete capabilities", async () => {
+  const rows=await loadCapabilities(path.resolve(import.meta.dirname,"..","..","capabilities")); assert.equal(rows.length,6); for(const row of rows) { assert.ok(row.skillFile&&row.adapterFile); await fs.access(row.skillFile); await fs.access(row.adapterFile); }
 });
 
 test("deleting a conversation only removes its record", async () => {

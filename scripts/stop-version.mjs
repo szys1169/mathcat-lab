@@ -2,6 +2,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import {forwardUpdate} from './forward-update.mjs';
+await forwardUpdate(path.resolve(import.meta.dirname,'..'),'stop',process.argv.slice(2));
 import { runtimeRoot,tokenFile,backendUrl,expectedVersion,readPid,ownedUnixProcess,health } from "./version-runtime.mjs";
 
 if(process.argv.includes("--help")){console.log("用法: node scripts/stop-version.mjs");process.exit(0);}

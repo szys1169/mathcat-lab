@@ -23,12 +23,12 @@ test('pending mixed launch prompt never masquerades as normalized mathematics',(
 });
 test('session details show only attributable public CLI returns, with timestamp and history flag',()=>{
   const s={id:'cat-a',run_id:'r',role:'partner'},project=p({events:[
-    {type:'activity.delta',created_at:'2026-09-07T00:00:00Z',payload:{session_id:'cat-a',text:'公开端点论证',stale:true}},
+    {type:'message.completed',created_at:'2026-09-07T00:00:00Z',payload:{session_id:'cat-a',text:'公开端点论证',stale:true}},
     {type:'message.completed',payload:{session_id:'cat-b',text:'OTHER_SESSION'}},
     {type:'discussion.activity',payload:{session_id:'cat-a',text:'DISCUSSION'}},
     {type:'tool.completed',payload:{session_id:'cat-a',tool:'command_execution',status:'completed'}}]});
   assert.equal(sessionActivity(project,s).length,2);
-  const html=sessionHtml(project,s,escapeHtml);assert.match(html,/公开端点论证/);assert.match(html,/历史调用/);assert.doesNotMatch(html,/OTHER_SESSION|DISCUSSION/);
+  const html=sessionHtml(project,s,escapeHtml);assert.match(html,/公开端点论证/);assert.match(html,/历史调用/);assert.doesNotMatch(html,/OTHER_SESSION|DISCUSSION|命令执行|工具完成/);
 });
 test('lab uses actual session focus and candidate review object, never pending task as current work',()=>{
   const project=p({sessions:[{id:'cat',run_id:'r',role:'partner',state:'active',focus:'当前端点焦点'},{id:'review',run_id:'r',role:'reviewer',state:'active',candidate_id:'c'}],candidates:[{id:'c',run_id:'r',status:'submitted',claim:'正在审核的精确命题'}],pending_assignments:[{partner_session_id:'cat',state:'pending',focus:'NEXT_TASK_SHOULD_NOT_LOOK_CURRENT'}]});

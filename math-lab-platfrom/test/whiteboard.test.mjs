@@ -53,11 +53,11 @@ test('feedback completed with no explicit disposition or action refs does not im
   assert.equal(t.hasExplicitDisposition,false);assert.equal(t.results.length,0);
   const html=feedbackHtml({...p,feedback_traces:[t]},escapeHtml);assert.match(html,/尚无明确处置/);assert.match(html,/尚未关联到执行变化/);
 });
-test('same-snapshot projections require no extra reads and retain authoritative revision',async()=>{
-  const classic=new ClassicResearchClient({fetchImpl:()=>{throw new Error('unnecessary request');}});
+test('same-snapshot projections only read independent delivery control and retain revision',async()=>{
+  const calls=[];const classic=new ClassicResearchClient({fetchImpl:async url=>{calls.push(url);assert.match(String(url),/\/delivery$/);return response({control:{state:'running'}});}});
   const client=new WhiteboardClient(classic,{storage:store()});
   const p=project({proof_tree:{revision:7,nodes:[],edges:[]},cycles:[],routes:[],messages:[],advisories:[],pending_assignments:[],proof_checkpoints:[],display_summaries:[],memory_entries:[],background_jobs:[],human_questions:[],feedback_traces:[]});
-  const value=await client.supplement(p);assert.deepEqual(value.board_errors,{});assert.equal(value.board_sources.proof_tree,7);
+  const value=await client.supplement(p);assert.deepEqual(value.board_errors,{});assert.equal(value.board_sources.proof_tree,7);assert.equal(calls.length,1);assert.equal(value.project_control.state,'running');
 });
 test('mismatched supplemental revision and failed reads remain missing, never fake zero data',async()=>{
   const classic=new ClassicResearchClient({fetchImpl:async path=>path.endsWith('/proof-tree')?response({proof_tree:{revision:8,nodes:[]}}):new Response(JSON.stringify({error:'offline'}),{status:503})});
@@ -168,7 +168,7 @@ test('budget form reads authoritative nested Run duration instead of clearing an
 
 test('new annotations and reviews refresh only evidence while fixed proof, page, reference and scroll stay intact',()=>{
   const n=mathNode('n'),other=mathNode('other');let writes=0,html='';
-  const region={get innerHTML(){return html;},set innerHTML(value){html=value;writes++;},querySelectorAll:()=>[]};
+  const region={get innerHTML(){return html;},set innerHTML(value){html=value;writes++;},querySelectorAll:()=>[],querySelector:()=>null};
   const reader={scrollTop:145},status={innerHTML:''};
   const p=project({proof_tree:{nodes:[n,other],edges:[]},annotations:[]});
   const view=new ResearchWhiteboard({querySelector:s=>({'[data-wb-evidence]':region,'[data-wb-reader]':reader,'[data-wb-current-status]':status}[s])},{storage:store(),renderText:escapeHtml});
@@ -179,11 +179,11 @@ test('new annotations and reviews refresh only evidence while fixed proof, page,
   p.annotations.push({id:'a',selection_ref:n.ref,body:'新保存的原文批注'});view.refreshReaderEvidence();assert.equal(writes,2);assert.match(html,/新保存的原文批注/);
   p.reviews=[{candidate_id:'c',verdict:'accepted',report_validated:true}];p.proof_tree.proofs=[{candidate_id:'c',conclusion_ref:n.ref,admission_state:'not_admitted'}];
   p.proof_tree.edges=[{from:other.ref,to:n.ref,relation:'dependency',status:'declared'}];view.model=proofModel(p);view.refreshReaderEvidence();
-  assert.match(html,/独立审核结论：通过/);assert.doesNotMatch(html,/程序结果：已准入/);assert.match(status.innerHTML,/程序准入：尚未准入/);assert.match(html,/声明依赖/);
+  assert.match(html,/独立审核结论：通过/);assert.doesNotMatch(html,/程序结果：已准入/);assert.match(status.innerHTML,/尚未准入/);assert.match(html,/声明依赖/);
   assert.equal(view.detail.statement,statement);assert.equal(view.detail.proof,proof);assert.equal(view.detail.proofPage,2);assert.equal(view.selection,n.ref);assert.equal(view.quote,'选中的文字');assert.equal(reader.scrollTop,145);
 });
-test('new frontend mounts the proof-tree workspace with persistent collaboration and version-safe bounded reading',async()=>{
+test('new frontend mounts the proof-tree workspace with persistent collaboration and version-safe continuous reading',async()=>{
   const app=await fs.readFile(new URL('../public/app.js',import.meta.url),'utf8'),view=await fs.readFile(new URL('../public/whiteboard-view.js',import.meta.url),'utf8');
   assert.match(app,/new ResearchWhiteboard/);assert.match(view,/data-wb-graph/);assert.match(view,/data-wb-input/);assert.match(view,/data-wb-proof-card/);assert.match(view,/data-wb-action="open-proof-page"/);assert.match(view,/data-wb-proof-dialog/);
-  assert.match(view,/sameVersion/);assert.match(view,/pageSize=18000/);assert.match(view,/ticke[t]!==this.readTicket/);assert.match(view,/data-wb-new-version/);
+  assert.match(view,/sameVersion/);assert.doesNotMatch(view,/rawProof\.slice\(/);assert.match(view,/ticke[t]!==this.readTicket/);assert.match(view,/data-wb-new-version/);
 });

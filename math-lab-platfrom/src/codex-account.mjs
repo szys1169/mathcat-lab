@@ -136,7 +136,7 @@ export function createCodexAccount({ config = {}, connect, spawnProcess = spawn,
     let rawModels = [];
     try {
       client = await limit(() => connect ? connect({ config }) : jsonlClient({ config, spawnProcess, terminateProcess }));
-      await limit(() => client.request("initialize", { clientInfo: { name: "mathcat_account_status", title: "MathCat account status", version: String(config.version || "2.5.1") }, capabilities: { experimentalApi: false } }));
+      await limit(() => client.request("initialize", { clientInfo: { name: "mathcat_account_status", title: "MathCat account status", version: String(config.version || "2.5.3") }, capabilities: { experimentalApi: false } }));
       await limit(() => client.notify("initialized"));
       const results = await Promise.allSettled([
         limit(() => client.request("account/rateLimits/read", null)).then(rateLimits),

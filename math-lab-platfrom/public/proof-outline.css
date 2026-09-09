@@ -1,0 +1,49 @@
+/* Reading-first layout; graph geometry and graph interactions remain independent. */
+.wb24 .wb-proof-view-tabs{display:flex;gap:6px;padding:0 0 10px}
+.wb24 .wb-proof-view-tabs [aria-pressed=true]{background:#e5edf9;border-color:#7086a5;color:#203f6a;font-weight:650}
+.wb24 [data-proof-mode=outline] .wb-zoom-controls,.wb24 [data-proof-mode=outline] .wb-tree-toolbar>button,.wb24 [data-proof-mode=outline] .wb-tree-legend,.wb24 [data-proof-mode=outline] .wb-object-list{display:none}
+.wb24 [data-proof-mode=outline] .wb-proof-workspace.has-inspector{grid-template-columns:minmax(280px,30%) minmax(0,1fr)}
+.wb24 [data-proof-mode=outline] .wb-proof-workspace.reader-wide{grid-template-columns:minmax(0,1fr)}
+.wb24 [data-proof-mode=outline] .wb-tree-column{background:#f7f9fc;border:1px solid #dbe2ed;border-radius:12px;overflow:hidden}
+.wb24 [data-wb-outline]{flex:1;min-height:0;overflow:auto;padding:12px 8px;scrollbar-gutter:stable}
+.wb24 .wb-outline ul{list-style:none;margin:0;padding:0}
+.wb24 .wb-outline ul ul{margin-left:14px;padding-left:7px;border-left:1px solid #d4ddeb}
+.wb24 .wb-outline li{margin:4px 0}
+.wb24 .wb-outline-row{display:flex;align-items:center;gap:4px;min-height:48px;padding:4px;border-radius:8px}
+.wb24 .wb-outline-row:hover{background:#edf1f7}
+.wb24 .wb-outline-row.is-selected{background:#e1ebfa;box-shadow:inset 3px 0 #557eaf}
+.wb24 .wb-outline-title{flex:1;min-width:0;text-align:left;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere;border:0;background:transparent;padding:6px 2px;font-size:14px;line-height:1.5;color:#24344b}
+.wb24 .wb-outline-toggle,.wb24 .wb-outline-spacer{flex:none;width:26px;min-width:26px;padding:4px 0;border:0;background:transparent}
+.wb24 .wb-outline-status{font-size:11px;color:#5b687b;white-space:nowrap;flex:none;padding-right:3px}
+.wb24 .wb-outline-help{font-size:12px;line-height:1.7;color:#687489;padding:0 8px;margin:4px 0 12px}
+.wb24 .wb-outline-note,.wb24 .wb-outline-reference{display:block;margin:0 0 7px 34px;font-size:11px;color:#64758f;background:none;border:0;padding:0;text-align:left}
+.wb24 .wb-outline-unlinked{border-top:1px solid #dae1ea;margin-top:18px;padding-top:12px}
+.wb24 .wb-outline-unlinked>summary{cursor:pointer;font-size:13px;padding:7px;color:#485a73}
+.wb24 [data-proof-mode=outline] .wb-proof-inspector{background:#fff;border-color:#dbe2ed}
+.wb24 [data-proof-mode=outline] .wb-reader{padding:24px clamp(18px,3vw,54px);line-height:1.85;scrollbar-gutter:stable}
+.wb24 .wb-reader h4{margin:26px 0 12px;font-size:16px}
+.wb24 .wb-reader details{margin:14px 0;padding:10px 0;border-top:1px solid #e4e9f0}
+.wb24 .wb-reader details>summary{cursor:pointer;color:#4b5f7a;font-size:13px}
+.wb24 .wb-reader [data-wb-proof-text]{white-space:pre-wrap;overflow-wrap:anywhere}
+.wb24 .wb-reader [data-wb-proof-text] pre{white-space:pre-wrap}
+.wb24 .wb-reader .wb-direct-relations{display:block}
+.wb24 .wb-reader .wb-direct-link{margin:6px 0;background:#f8fafc;border-color:#e1e7ef}
+.wb24 .wb-reader-feedback .wb-actions{padding-top:10px}
+.wb24 .wb-reader-assumptions{padding:10px 14px;background:#f7f9fc;border-left:3px solid #c0cddd;margin:10px 0}
+.wb24 .wb-reader-assumptions{white-space:pre-wrap}
+.wb24 .wb-reader-assumptions>strong{display:block;margin-bottom:6px}
+.wb24 .wb-review-issue{padding:12px;margin:10px 0;background:#fff7ed;border-left:3px solid #bc8952;white-space:pre-wrap}
+.wb24 [data-proof-mode=outline] .wb-inspector-toolbar{display:none}
+.wb24 [data-proof-mode=outline] [data-wb-graph-summary]{font-size:11px;padding:8px}
+.wb24 [data-proof-mode=outline] [data-wb-tree-warning]:not(:empty){font-size:12px;padding:6px 10px;color:#865824}
+@media(max-width:1050px){
+ .wb24 [data-proof-mode=outline] .wb-proof-workspace.has-inspector{grid-template-columns:minmax(230px,32%) minmax(0,1fr)}
+ .wb24 [data-proof-mode=outline] .wb-tree-column{max-height:72dvh;min-height:300px}
+ .wb24 [data-proof-mode=outline] .wb-proof-workspace.reader-wide{grid-template-columns:minmax(0,1fr)}
+}
+@media(max-width:700px){
+ .wb24 [data-proof-mode=outline] .wb-proof-workspace.has-inspector{grid-template-columns:minmax(0,1fr)}
+ .wb24 [data-proof-mode=outline] .wb-tree-column{height:32dvh;max-height:32dvh;min-height:180px}
+ .wb24 [data-proof-mode=outline] .wb-proof-inspector{height:65dvh;min-height:360px}
+ .wb24 [data-proof-mode=outline] .wb-reader{padding:18px}
+}

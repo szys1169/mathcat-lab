@@ -16,7 +16,7 @@ test('relative deliverables and version directories link to the originating conv
 });
 test('external links, unsafe schemes, formulas and literal code retain correct boundaries',()=>{
   const html=render('[文献](https://arxiv.org/abs/2509.16933?x=1&y=2) [坏链接](javascript:alert(1)) `x [样例](paper.md)` \\(J_f:f\\)');
-  assert.match(html,/href="https:\/\/arxiv.org\/abs\/2509.16933\?x=1&amp;y=2"/);assert.doesNotMatch(html,/href="javascript:/);assert.match(html,/`x \[样例\]\(paper.md\)`/);assert.match(html,/<math>J_f:f<\/math>/);
+  assert.match(html,/href="https:\/\/arxiv.org\/abs\/2509.16933\?x=1&amp;y=2"/);assert.doesNotMatch(html,/href="javascript:/);assert.match(html,/<code>x \[样例\]\(paper.md\)<\/code>/);assert.match(html,/<math>J_f:f<\/math>/);
   assert.equal(classifyMessageLink('https://example.com/a.pdf').kind,'external');assert.equal(classifyMessageLink('data:text/html,bad').kind,'invalid');
 });
 test('Windows paths, percent encoded names and nested parentheses are preserved',()=>{

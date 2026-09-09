@@ -1,3 +1,4 @@
+import {mountProductUpdate} from "./product-update.js";
 import {WhiteboardClient} from './whiteboard-client.js';
 import {chooseResearchStart} from './research-start.js';
 import {normalizeLocalPath,workspaceFileUrl,workspaceRevealUrl,prepareMessageLinks} from './workspace-links.js';
@@ -25,6 +26,7 @@ const workspaceMemory=createWorkspaceMemory(),savedWorkspace=workspaceMemory.ses
 state.capabilityId=savedWorkspace.capabilityId||'';state.capabilityNeedsChoice=Boolean(savedWorkspace.capabilityNeedsChoice);state.workspaceId=savedWorkspace.workspaceId||null;
 state.expanded=new Set(savedWorkspace.expanded||[]);
 const $ = (id) => document.getElementById(id);
+mountProductUpdate({button:$("updateButton"),dialog:$("updateDialog")});
 const sidebarNavigation=bindSidebarNavigation({sidebar:$("conversationSidebar"),main:document.querySelector("main"),trigger:$("sidebarToggle"),closeButton:$("sidebarClose"),backdrop:$("sidebarBackdrop")});
 const classicResearch = new ClassicResearchClient({chooseStart:chooseStartWithModel});
 const whiteboardClient = new WhiteboardClient(classicResearch);
@@ -46,7 +48,7 @@ function openCodexSettings(projectId=currentCodexProject()){
   codexStatus.setContext(projectId);codexStatus.resetDraft();$('settingsDialog').showModal();void codexStatus.refresh();
 }
 setInterval(()=>{if(!document.hidden)void codexStatus.refresh();},60000);
-document.title = "MathCat Lab 2.5.1";
+document.title = "MathCat Lab 2.5.3";
 let draftContext=null;
 const draftKey=()=>state.conversationId?'conversation:'+state.conversationId:'new:'+(state.workspaceId||'none');
 function persistWorkspace(){

@@ -27,5 +27,5 @@ test('desktop sidebar remains normal and conversation selection closes drawer be
   const app=await fs.readFile(new URL('../public/app.js',import.meta.url),'utf8'),html=await fs.readFile(new URL('../public/index.html',import.meta.url),'utf8');
   assert.match(html,/id="sidebarToggle"[^>]+aria-controls="conversationSidebar"/);
   assert.match(app,/sidebarNavigation\.close\(\); clearTimeout\(state\.poll\)/);
-  assert.match(app,/state\.conversationId===selectedId&&state\.currentBoard\?\.classicV2\)setResearchView\("board",\{refresh:false\}\)/);
+  assert.match(app,/state\.conversationId===selectedId&&state\.currentBoard\?\.classicV2\)setResearchView\(workspaceMemory.view\(selectedId\).activeView\|\|"board",\{refresh:false\}\)/);
 });

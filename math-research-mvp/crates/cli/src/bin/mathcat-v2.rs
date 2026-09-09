@@ -1,4 +1,4 @@
-//! Standalone 2.5.1 process. Defaults and all writable paths stay in the new copy.
+//! Standalone 2.5.3 process. Defaults and all writable paths stay in the new copy.
 use std::{
     io::Write,
     net::SocketAddr,
@@ -12,7 +12,7 @@ use research_domain::research_v2::VERSION;
 use research_storage::research_v2::V2Store;
 
 #[derive(Debug, Parser)]
-#[command(name="mathcat-v2", version=VERSION, about="MathCat Lab independent research 2.5.1 server")]
+#[command(name="mathcat-v2", version=VERSION, about="MathCat Lab independent research 2.5.3 server")]
 struct Args {
     #[arg(long, default_value = "127.0.0.1:8900")]
     bind: SocketAddr,
@@ -32,12 +32,21 @@ struct Args {
     turn_timeout_seconds: u64,
 }
 
-fn version_root() -> Result<PathBuf> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+fn root_from_executable(executable: &Path) -> Result<PathBuf> {
+    let root = executable
         .ancestors()
-        .nth(3)
-        .context("Cannot locate the version-isolated root")?;
-    root.canonicalize().context("Version root must exist")
+        .skip(1)
+        .find(|candidate| {
+            candidate.join("VERSION").is_file()
+                && candidate.join("math-research-mvp").is_dir()
+                && candidate.join("math-lab-platfrom").is_dir()
+        })
+        .context("Cannot locate the installation root beside the executable")?;
+    root.canonicalize().context("Installation root must exist")
+}
+
+fn version_root() -> Result<PathBuf> {
+    root_from_executable(&std::env::current_exe().context("Cannot locate the running executable")?)
 }
 
 // canonicalize() adds Windows' extended-length prefix; launchers use the equivalent
@@ -87,7 +96,7 @@ fn checked_path(root: &Path, requested: Option<PathBuf>, fallback: &str) -> Resu
     }
     let canonical_root = root.canonicalize().context("Version root must exist")?;
     if !comparable_path(&absolute).starts_with(comparable_path(&canonical_root)) {
-        bail!("Writable paths must remain inside the new MathCat 2.5.1 copy");
+        bail!("Writable paths must remain inside the new MathCat 2.5.3 copy");
     }
     let existing = absolute
         .ancestors()
@@ -297,5 +306,28 @@ mod tests {
         std::fs::remove_file(&linked).unwrap();
         std::fs::remove_dir(root).unwrap();
         std::fs::remove_dir(temporary).unwrap();
+    }
+    #[test]
+    fn installation_root_follows_relocated_executable() {
+        let root = std::env::temp_dir().join(format!("mathcat-relocate-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(root.join("math-research-mvp/target/release")).unwrap();
+        std::fs::create_dir(root.join("math-lab-platfrom")).unwrap();
+        std::fs::write(root.join("VERSION"), "2.5.3").unwrap();
+        assert_eq!(
+            root_from_executable(&root.join("math-research-mvp/target/release/mathcat-v2.exe"))
+                .unwrap(),
+            root.canonicalize().unwrap()
+        );
+        assert!(root_from_executable(&root.join("unrelated/file")).is_ok());
+        std::fs::remove_file(root.join("VERSION")).unwrap();
+        assert!(
+            root_from_executable(&root.join("math-research-mvp/target/release/mathcat-v2.exe"))
+                .is_err()
+        );
+        std::fs::remove_dir(root.join("math-research-mvp/target/release")).unwrap();
+        std::fs::remove_dir(root.join("math-research-mvp/target")).unwrap();
+        std::fs::remove_dir(root.join("math-research-mvp")).unwrap();
+        std::fs::remove_dir(root.join("math-lab-platfrom")).unwrap();
+        std::fs::remove_dir(root).unwrap();
     }
 }

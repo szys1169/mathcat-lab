@@ -8,7 +8,11 @@ const stamp=new Date().toISOString().replaceAll(':','-').replaceAll('.','-');
 const results=path.join(root,'tests','results',`offline-${stamp}`);
 await fs.mkdir(results,{recursive:true});
 const rust=path.join(root,'math-research-mvp');
+const isolationAvailable=await fs.access(path.join(root,'docs/baselines/2.4.3-source.json')).then(()=>fs.access(path.join(root,'..','MathCat-Lab-2.4.3'))).then(()=>true).catch(()=>false);
 const jobs=[
+  ['proof-tests',process.execPath,['--test','test/proof-outline.test.mjs','test/proof-graph.test.mjs','test/proof-material.test.mjs'],path.join(root,'math-lab-platfrom')],
+  ['update-tests',process.execPath,['--test','test/product-update.test.mjs','test/research-deletion-guard.test.mjs','../tests/cross-platform-runtime.test.mjs'],path.join(root,'math-lab-platfrom')],
+  ['update-http',process.execPath,['tests/update-http-smoke.mjs'],root],
   ['rust-format','cargo',['fmt','--all','--','--check'],rust],
   ['rust-clippy','cargo',['clippy','--workspace','--all-targets','--','-D','warnings'],rust],
   ['rust-tests','cargo',['test','--workspace'],rust],
@@ -19,11 +23,12 @@ const jobs=[
   ['frontend-isolation',process.execPath,['scripts/audit-frontend.mjs'],root],
   ['research-tools',process.execPath,['--test','tests/research-tools.test.mjs'],root],
 ];
-const report={version:'2.5.1',kind:'offline-engineering',real_model_calls:false,started_at:new Date().toISOString(),build_environment:Object.fromEntries(['CARGO_INCREMENTAL','CARGO_PROFILE_DEV_DEBUG','CARGO_PROFILE_TEST_DEBUG'].map(key=>[key,process.env[key]??'toolchain_default'])),results:[]};
+const report={version:'2.5.3',kind:'offline-engineering',real_model_calls:false,started_at:new Date().toISOString(),build_environment:Object.fromEntries(['CARGO_INCREMENTAL','CARGO_PROFILE_DEV_DEBUG','CARGO_PROFILE_TEST_DEBUG'].map(key=>[key,process.env[key]??'toolchain_default'])),results:[]};
 const selected=process.argv.find(arg=>arg.startsWith('--only='))?.slice(7).split(',');
 if(selected?.some(name=>!jobs.some(job=>job[0]===name)))throw new Error('Unknown validation job; no passing empty receipt is allowed.');
 report.scope=selected?'selected':process.argv.includes('--rust-only')?'rust-only':'full-engineering';
-report.complete_suite=report.scope==='full-engineering';
+report.complete_suite=report.scope==='full-engineering'&&isolationAvailable;
+report.unavailable_checks=isolationAvailable?[]:['historical source isolation requires the local archived baseline'];
 for(const [name,bin,args,cwd] of jobs){
   if(selected&&!selected.includes(name))continue;
   if(process.argv.includes('--rust-only')&&!name.startsWith('rust-'))continue;

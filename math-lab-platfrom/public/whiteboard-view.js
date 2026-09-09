@@ -1,7 +1,9 @@
 import {escapeHtml as h,latestRun,label,readable} from './research-v2-state.js';
+import {outlineHtml,outlineStatus} from './proof-outline.js';
+import {registeredBodyDraft} from './proof-material.js';
 import {proofModel,rows,short,timeLabel,selectionReference,currentStatus,reviewStatus,quoteReference,controlReference} from './whiteboard-model.js';
 import {visibleGraph,focusGraphBranch,fitGraphScale} from './research-graph.js';
-import {layoutProofGraph,routeProofGraphEdges,directProofRelations,proofTextLines} from './proof-graph.js';
+import {layoutProofGraph,routeProofGraphEdges,directProofRelations} from './proof-graph.js';
 import {headerHtml,overviewHtml,recordsHtml,feedbackHtml,empty,badge,action,dataDetails} from './whiteboard-render.js';
 import {laboratoryHtml,planningHtml,questionsHtml,doubtsHtml,failuresHtml,timelineHtml,reframeHistoryHtml,sessionHtml,statementsHtml,mathematicalStatements,mathKind,replacePreservingView} from './whiteboard-lab.js';
 import {explicitProblemEdit} from './problem-edit-intent.js';
@@ -27,6 +29,7 @@ export class ResearchWhiteboard {
     if(!input)return;
     if(this.restoringView){try{const saved=this.restoreView||JSON.parse(this.storage?.getItem(storageKey(this.project.id))||'{}');this.storage?.setItem(storageKey(this.project.id),JSON.stringify({...saved,draft:input.value,modalDrafts:this.modalDrafts||{}}));}catch{}return;}
     try{this.storage?.setItem(storageKey(this.project.id),JSON.stringify({
+      proofMode:this.ui.proofMode,outlineExpanded:[...(this.ui.outlineExpanded||[])],outlineInitialized:this.ui.outlineInitialized,unlinkedOpen:this.ui.unlinkedOpen,
       tab:this.ui.tab,side:this.ui.side,selected:this.ui.selected,scale:this.ui.scale,graphViewVersion:242,
       modalDrafts:this.modalDrafts||{},boardScroll:this.element.scrollTop,graphScroll:{top:this.element.querySelector('[data-wb-graph]')?.scrollTop||0,left:this.element.querySelector('[data-wb-graph]')?.scrollLeft||0},readerScroll:this.element.querySelector('[data-wb-reader]')?.scrollTop||0,proofPage:this.detail?.proofPage||0,proofOpen:Boolean(this.element.querySelector('[data-wb-proof-dialog]')?.open),proofSidebar:this.ui.proofSidebar,readerWide:this.element.querySelector('.wb-proof-workspace')?.classList.contains('reader-wide'),direct:this.ui.direct,focus:this.ui.focus,
       collapsed:[...this.ui.collapsed],positions:[...this.ui.positions],query:this.ui.query,filter:this.ui.filter,
@@ -38,12 +41,12 @@ export class ResearchWhiteboard {
     this.persist();this.dismiss();this.project=project;this.readTicket++;
     let saved={};try{saved=JSON.parse(this.storage?.getItem(storageKey(project.id))||'{}');}catch{}
     this.restoringView=true;this.restoreView=saved;this.modalDrafts=saved.modalDrafts||{};
-    this.ui={tab:validTabs.has(saved.tab)?saved.tab:'timeline',side:saved.side==='feedback'?'feedback':'discussion',selected:saved.selected||null,scale:saved.graphViewVersion===242?Math.max(.15,Math.min(2,saved.scale||1)):1,filter:saved.filter||'all',query:saved.query||'',focus:Boolean(saved.focus),direct:Boolean(saved.direct),proofSidebar:['none','reader','discussion'].includes(saved.proofSidebar)?saved.proofSidebar:'none',collapsed:new Set(saved.collapsed||[]),positions:new Map(saved.graphViewVersion===242?saved.positions||[]:[]),recordsLimit:30};
+    this.ui={proofMode:saved.proofMode==='graph'?'graph':'outline',outlineExpanded:new Set(saved.outlineExpanded||[]),outlineInitialized:Boolean(saved.outlineInitialized),unlinkedOpen:saved.unlinkedOpen??null,tab:validTabs.has(saved.tab)?saved.tab:'timeline',side:saved.side==='feedback'?'feedback':'discussion',selected:saved.selected||null,scale:saved.graphViewVersion===242?Math.max(.15,Math.min(2,saved.scale||1)):1,filter:saved.filter||'all',query:saved.query||'',focus:Boolean(saved.focus),direct:Boolean(saved.direct),proofSidebar:saved.proofMode&&['none','reader','discussion'].includes(saved.proofSidebar)?saved.proofSidebar:'reader',collapsed:new Set(saved.collapsed||[]),positions:new Map(saved.graphViewVersion===242?saved.positions||[]:[]),recordsLimit:30};
     this.selection=null;this.detail=null;this.error='';this.notice='';this.graphMarkup=null;this.centerPending=true;
     this.restoreSelection={ref:saved.selectionRef,quote:saved.quote||'',quoteArtifactId:saved.quoteArtifactId,referenceCleared:Boolean(saved.referenceCleared)};
     this.element.classList.add('wb23','wb24');
     this.element.innerHTML='<div data-wb-header></div><div data-wb-connection class="wb-connection"></div>'+
-      '<div data-wb-attention></div><div class="wb-workspace"><section class="wb-main"><div data-wb-delivery></div><div data-wb-laboratory></div><div data-wb-planning></div><div data-wb-questions></div><div data-wb-reframe-history></div><div data-wb-proof-card></div><nav class="wb-tabs wb-content-tabs" aria-label="白板页面">'+action('tab','时间线','data-tab="timeline"')+action('tab','开放疑点','data-tab="doubts"')+action('tab','失败路线','data-tab="failures"')+action('tab','更多记录','data-tab="records"')+'</nav>'+
+      '<div data-wb-attention></div><div class="wb-workspace"><section class="wb-main"><div data-wb-laboratory></div><div class="wb-research-shortcuts"><div data-wb-proof-card></div><div data-wb-questions></div></div><div data-wb-planning></div><div data-wb-delivery></div><div data-wb-reframe-history></div><nav class="wb-tabs wb-content-tabs" aria-label="白板页面">'+action('tab','时间线','data-tab="timeline"')+action('tab','开放疑点','data-tab="doubts"')+action('tab','失败路线','data-tab="failures"')+action('tab','更多记录','data-tab="records"')+'</nav>'+
       '<section data-wb-overview hidden></section><section data-wb-records hidden></section><section data-wb-doubts hidden></section><section data-wb-failures hidden></section><section data-wb-timeline hidden></section></section>'+
       '<div data-wb-collaboration-home hidden></div><aside class="wb-collaboration"><nav class="wb-tabs" aria-label="人机协作">'+action('side','讨论','data-side="discussion"')+action('side','我的意见','data-side="feedback"')+'</nav>'+
       '<div data-wb-side-content class="wb-side-history"></div><section class="wb-composer"><div data-wb-reference class="wb-reference">未引用对象</div>'+
@@ -52,8 +55,8 @@ export class ResearchWhiteboard {
       '<textarea data-wb-input rows="6" placeholder="围绕原文提问，或选择建议模式…"></textarea>'+
       '<p data-wb-intent-help class="wb-muted"></p><div data-wb-send-status aria-live="polite"></div><div class="wb-actions">'+action('clear-ref','移除引用')+action('send','发送')+'</div>'+
       '<div data-wb-pending></div></section></aside></div>'+
-      '<dialog class="wb-proof-dialog" data-wb-proof-dialog aria-labelledby="wb-proof-title"><div class="wb-proof-shell"><header class="wb-proof-heading"><div><span class="wb-eyebrow">数学成果与前后依赖</span><h2 id="wb-proof-title">证明树</h2><p data-wb-proof-context></p></div><div class="wb-actions">'+action('proof-reader','成果详情','aria-expanded="false" aria-controls="wb-proof-inspector"')+action('proof-discussion','讨论与建议','aria-expanded="false" aria-controls="wb-proof-inspector"')+action('close-proof','返回白板','autofocus')+'</div></header><div class="wb-proof-page-body"><section data-wb-proof><div class="wb-tree-toolbar"><label>搜索成果<input data-wb-search type="search" placeholder="陈述、引理或目标"></label><select data-wb-filter aria-label="筛选成果"><option value="all">全部成果</option><option value="unverified">待审成果</option><option value="problems">争议与缺口</option></select><div class="wb-zoom-controls">'+action('zoom-out','−','aria-label="缩小证明树"')+action('zoom-reset','100%','aria-label="恢复可读比例" data-wb-scale')+action('zoom-in','＋','aria-label="放大证明树"')+action('fit','概览全树')+'</div>'+action('arrange','自动整理')+action('direct','仅看直接关系','aria-pressed="false"')+action('focus','完整上下游','aria-pressed="false"')+action('collapse','折叠／展开分支')+'</div>'+
-      '<p class="wb-tree-legend"><span class="wb-legend-dependency">箭头：前提 → 成果</span><span class="wb-legend-planned">虚线箭头：拟依赖</span><span class="wb-legend-ownership">灰线无箭头：目标归属</span><span>点击成果突出直接关系；拖动空白平移，滚轮浏览，Ctrl + 滚轮缩放。</span></p><div data-wb-tree-warning></div><div class="wb-proof-workspace"><div class="wb-tree-column"><div data-wb-graph class="wb-graph" tabindex="0" aria-label="数学证明树"></div><div data-wb-graph-summary class="wb-graph-summary" aria-live="polite"></div><details class="wb-object-list"><summary>成果列表（与树相同的对象）</summary><div data-wb-list></div></details></div><aside class="wb-proof-inspector" id="wb-proof-inspector" hidden><header class="wb-inspector-toolbar"><div class="wb-actions">'+action('proof-reader','成果详情')+action('proof-discussion','讨论与建议')+'</div>'+action('close-inspector','收起','aria-label="收起侧栏"')+'</header><div class="wb-reader-tools" data-wb-reader-tools>'+action('reader-toggle','展开阅读')+'</div><article data-wb-reader class="wb-reader" tabindex="0">'+empty('在证明树中选择数学成果，读取固定版本。')+'</article><div data-wb-proof-discussion hidden></div></aside></div></section></div></div></dialog>'+
+      '<dialog class="wb-proof-dialog" data-wb-proof-dialog aria-labelledby="wb-proof-title"><div class="wb-proof-shell"><header class="wb-proof-heading"><div><span class="wb-eyebrow">数学成果与前后依赖</span><h2 id="wb-proof-title">证明树</h2><p data-wb-proof-context></p></div><div class="wb-actions">'+action('proof-reader','成果详情','aria-expanded="false" aria-controls="wb-proof-inspector"')+action('proof-discussion','讨论与建议','aria-expanded="false" aria-controls="wb-proof-inspector"')+action('close-proof','返回白板','autofocus')+'</div></header><div class="wb-proof-page-body"><section data-wb-proof><nav class="wb-proof-view-tabs" aria-label="证明树视图">'+action('proof-outline','证明目录')+action('proof-graph','依赖图')+'</nav><div class="wb-tree-toolbar"><label>搜索成果<input data-wb-search type="search" placeholder="陈述、引理或目标"></label><select data-wb-filter aria-label="筛选成果"><option value="all">全部成果</option><option value="unverified">待审成果</option><option value="problems">争议与缺口</option></select><div class="wb-zoom-controls">'+action('zoom-out','−','aria-label="缩小证明树"')+action('zoom-reset','100%','aria-label="恢复可读比例" data-wb-scale')+action('zoom-in','＋','aria-label="放大证明树"')+action('fit','概览全树')+'</div>'+action('arrange','自动整理')+action('direct','仅看直接关系','aria-pressed="false"')+action('focus','完整上下游','aria-pressed="false"')+action('collapse','折叠／展开分支')+'</div>'+
+      '<p class="wb-tree-legend"><span class="wb-legend-dependency">箭头：前提 → 成果</span><span class="wb-legend-planned">虚线箭头：拟依赖</span><span class="wb-legend-ownership">灰线无箭头：目标归属</span><span>点击成果突出直接关系；拖动空白平移，滚轮浏览，Ctrl + 滚轮缩放。</span></p><div data-wb-tree-warning></div><div class="wb-proof-workspace"><div class="wb-tree-column"><div data-wb-outline hidden></div><div data-wb-graph class="wb-graph" tabindex="0" aria-label="数学证明树"></div><div data-wb-graph-summary class="wb-graph-summary" aria-live="polite"></div><details class="wb-object-list"><summary>成果列表（与树相同的对象）</summary><div data-wb-list></div></details></div><aside class="wb-proof-inspector" id="wb-proof-inspector" hidden><header class="wb-inspector-toolbar"><div class="wb-actions">'+action('proof-reader','成果详情')+action('proof-discussion','讨论与建议')+'</div>'+action('close-inspector','收起','aria-label="收起侧栏"')+'</header><div class="wb-reader-tools" data-wb-reader-tools>'+action('reader-toggle','展开阅读')+'</div><article data-wb-reader class="wb-reader" tabindex="0">'+empty('在证明树中选择数学成果，读取固定版本。')+'</article><div data-wb-proof-discussion hidden></div></aside></div></section></div></div></dialog>'+
       '<dialog class="wb-dialog" data-wb-dialog><form data-wb-modal-form><div data-wb-modal-content></div><p data-wb-modal-error class="wb-error" aria-live="assertive"></p><div class="wb-actions">'+action('close-dialog','取消')+'<button class="primary" type="submit" data-wb-modal-submit>确认提交</button></div></form></dialog>';
     this.element.querySelector('[data-wb-input]').value=saved.draft||'';
     this.element.querySelector('[data-wb-intent]').value=['discussion','normal','urgent','annotation','edit-math','edit-description'].includes(saved.intent)?saved.intent:'discussion';
@@ -129,7 +132,7 @@ export class ResearchWhiteboard {
     }else if(this.selection){
       const object=this.model.objects.find(o=>o.ref?.id===this.selection.id&&o.ref?.kind===this.selection.kind||o.id===this.selection.id&&o.kind===this.selection.kind);
       const status=this.element.querySelector('[data-wb-current-status]');
-      if(status&&object&&object.revision===this.selection.revision)status.innerHTML=this.objectStatus(object);
+      if(status&&object&&object.revision===this.selection.revision)status.innerHTML=badge(outlineStatus(object));
       const newer=this.element.querySelector('[data-wb-new-version]');
       if(newer)newer.innerHTML=object&&object.revision!==this.selection.revision?'当前已有 v'+h(object.revision)+'；你仍在阅读 v'+h(this.selection.revision)+'。'+action('latest-version','打开新版'):'';
     }
@@ -157,6 +160,20 @@ export class ResearchWhiteboard {
   }
   renderGraph(){
     if(this.dragging||!this.model)return;
+    const section=this.element.querySelector('[data-wb-proof]'),outline=this.ui.proofMode!=='graph';
+    section.dataset.proofMode=outline?'outline':'graph';
+    this.element.querySelector('[data-wb-outline]').hidden=!outline;
+    this.element.querySelector('[data-wb-graph]').hidden=outline;
+    this.element.querySelectorAll('.wb-proof-view-tabs button').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.wbAction===(outline?'proof-outline':'proof-graph'))));
+    if(outline){
+      const region=this.element.querySelector('[data-wb-outline]');
+      replacePreservingView(region,outlineHtml(this.model,this.ui,this.renderText));
+      const unlinked=region.querySelector('.wb-outline-unlinked');
+      if(unlinked)unlinked.ontoggle=()=>{this.ui.unlinkedOpen=unlinked.open;this.persist();};
+      this.element.querySelector('[data-wb-graph-summary]').textContent=this.model.nodes.length+' 项成果 · 仅按已保存的数学依赖分层';
+      this.element.querySelector('[data-wb-tree-warning]').textContent=[...(this.model.warnings||[]).map(w=>typeof w==='string'?w:readable(w)),...(this.model.cycleIds?.size?['存在循环依赖，请检查标记的关系。']:[])].join(' ');
+      return;
+    }
     // Filtering follows the tree hierarchy; drawing keeps the actual premise → result direction.
     let placement={...this.model,edges:this.model.edges.map(e=>e.mathematical?{...e,from:e.to,to:e.from}:e)};
     placement=visibleGraph(placement,{filter:this.ui.filter,query:this.ui.query,collapsed:this.ui.collapsed});
@@ -180,8 +197,7 @@ export class ResearchWhiteboard {
       const statements=mathematicalStatements(o),kinds=[...new Set(statements.map(s=>mathKind(s.math_kind||s.kind||o.math_kind)))];
       const selected=this.ui.selected===n.id,prerequisite=relations.prerequisiteIds.has(n.id),consequence=relations.consequenceIds.has(n.id);
       const related=visibleRelated.has(n.id),role=selected?'当前所选':prerequisite&&consequence?'前提与后续':prerequisite?'直接前提':consequence?'后续成果':'';
-      const titleLines=proofTextLines(o.title,{maxUnits:32,maxLines:2}),previewLines=proofTextLines(o.statement,{maxUnits:40,maxLines:2});
-      return '<g class="wb-node '+h(n.status)+(selected?' selected':'')+(prerequisite?' is-prerequisite':'')+(consequence?' is-consequence':'')+(hasSelection&&!related?' is-muted':'')+'" data-wb-node="'+h(n.id)+'" transform="translate('+p.x+' '+p.y+')" tabindex="0" role="button" aria-pressed="'+selected+'" aria-label="'+h(o.title)+'"><title>'+h(o.title+'\n'+o.statement)+'</title><rect width="'+p.width+'" height="'+p.height+'" rx="12"/><text x="16" y="25" class="wb-node-kind">'+h(kinds.join(' / '))+(statements.length>1?' · '+statements.length+' 条':'')+' · v'+h(o.revision)+'</text><text x="'+(p.width-16)+'" y="25" text-anchor="end" class="wb-node-role">'+h(role)+'</text>'+titleLines.map((t,i)=>'<text x="16" y="'+(51+i*22)+'" class="wb-node-title">'+h(t)+'</text>').join('')+previewLines.map((t,i)=>'<text x="16" y="'+(96+i*17)+'" class="wb-node-preview">'+h(t)+'</text>').join('')+'<text x="16" y="136" class="wb-node-state">'+h(o.admission_state==='accepted'||o.admission_state==='admitted'?'已准入 · '+label(o.validity):o.kind==='problem'||o.math_kind==='problem'?'目标，完成须有覆盖证据':'已保存 · '+reviewCaption)+'</text></g>';
+      return '<g class="wb-node '+h(n.status)+(selected?' selected':'')+(prerequisite?' is-prerequisite':'')+(consequence?' is-consequence':'')+(hasSelection&&!related?' is-muted':'')+'" data-wb-node="'+h(n.id)+'" transform="translate('+p.x+' '+p.y+')" tabindex="0" role="button" aria-pressed="'+selected+'" aria-label="'+h(o.title)+'"><title>'+h(o.title+'\n'+o.statement)+'</title><rect width="'+p.width+'" height="'+p.height+'" rx="12"/><text x="16" y="25" class="wb-node-kind">'+h(kinds.join(' / '))+(statements.length>1?' · '+statements.length+' 条':'')+' · v'+h(o.revision)+'</text><text x="'+(p.width-16)+'" y="25" text-anchor="end" class="wb-node-role">'+h(role)+'</text>'+'<foreignObject x="16" y="34" width="'+(p.width-32)+'" height="94"><div xmlns="http://www.w3.org/1999/xhtml" class="wb-node-math"><div class="wb-node-math-title">'+this.renderText(o.title)+'</div><div class="wb-node-math-preview">'+this.renderText(o.statement)+'</div></div></foreignObject>'+'<text x="16" y="136" class="wb-node-state">'+h(o.admission_state==='accepted'||o.admission_state==='admitted'?'已准入 · '+label(o.validity):o.kind==='problem'||o.math_kind==='problem'?'目标，完成须有覆盖证据':'已保存 · '+reviewCaption)+'</text></g>';
     }).join('');
     const graph=this.element.querySelector('[data-wb-graph]'),oldScroll={top:graph.scrollTop,left:graph.scrollLeft};
     const markup=graphModel.nodes.length?'<svg width="'+Math.ceil(routed.width*scale)+'" height="'+Math.ceil(routed.height*scale)+'" viewBox="0 0 '+routed.width+' '+routed.height+'" xmlns="http://www.w3.org/2000/svg"><defs>'+[['math','#35694f'],['planned','#956927']].map(([id,color])=>'<marker id="wb-arrow-'+id+'" markerWidth="12" markerHeight="12" refX="10" refY="5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 Z" fill="'+color+'"/></marker>').join('')+'</defs>'+lines+nodes+'</svg>':empty('没有匹配的成果。清除搜索或筛选可恢复。');
@@ -203,14 +219,14 @@ export class ResearchWhiteboard {
     this.element.querySelector('[data-wb-action="direct"]').setAttribute('aria-pressed',String(this.ui.direct));
     this.element.querySelector('[data-wb-action="focus"]').setAttribute('aria-pressed',String(this.ui.focus));
     const selectedObject=this.model.objects.find(o=>o.key===this.ui.selected);
-    replacePreservingView(this.element.querySelector('[data-wb-graph-summary]'),'<span>'+h(graphModel.nodes.length+' / '+this.model.nodes.length+' 个数学对象')+'</span><span>'+(selectedObject?h(short(selectedObject.title,36))+' · '+relations.incoming.length+' 个直接前提 · '+relations.outgoing.length+' 个后续成果':'选择成果，查看直接关系')+'</span>');
+    replacePreservingView(this.element.querySelector('[data-wb-graph-summary]'),'<span>'+h(graphModel.nodes.length+' / '+this.model.nodes.length+' 个数学对象')+'</span><span>'+(selectedObject?this.renderText(selectedObject.title)+' · '+relations.incoming.length+' 个直接前提 · '+relations.outgoing.length+' 个后续成果':'选择成果，查看直接关系')+'</span>');
     if(this.centerPending&&graph.clientWidth){this.centerGraphSelection();this.centerPending=false;}
     const warnings=[...rows(this.model.warnings).map(readable)];
     if(this.project.board_errors?.proof_tree)warnings.unshift('权威证明树读取失败：'+this.project.board_errors.proof_tree+'；当前仅显示已有记录，请勿据此推断完整关系。');
     if(this.model.cycleIds.size)warnings.push('存在循环依赖，不能视为有效证明链；详情保留原关系。');
     if(this.model.missing.length)warnings.push(this.model.missing.length+' 条关系的目标或版本未能完整定位。');
     replacePreservingView(this.element.querySelector('[data-wb-tree-warning]'),warnings.length?'<div class="wb-warning">'+warnings.map(w=>'<p>'+h(w)+'</p>').join('')+'</div>':'');
-    replacePreservingView(this.element.querySelector('[data-wb-list]'),graphModel.nodes.map(n=>'<button data-wb-select="'+h(n.id)+'"><strong>'+h(n.object.title)+' · v'+h(n.object.revision)+'</strong><span>'+h(short(n.object.statement,180))+'</span></button>').join(''));
+    replacePreservingView(this.element.querySelector('[data-wb-list]'),graphModel.nodes.map(n=>'<button data-wb-select="'+h(n.id)+'"><strong>'+this.renderText(n.object.title)+' · v'+h(n.object.revision)+'</strong><span>'+h(short(n.object.statement,180))+'</span></button>').join(''));
   }
   showProofSidebar(mode){
     this.ui.proofSidebar=mode;
@@ -223,9 +239,10 @@ export class ResearchWhiteboard {
     this.element.querySelector('[data-wb-proof-discussion]').hidden=mode!=='discussion';
     this.element.querySelectorAll('[data-wb-action="proof-reader"]').forEach(b=>b.setAttribute('aria-expanded',String(mode==='reader')));
     this.element.querySelectorAll('[data-wb-action="proof-discussion"]').forEach(b=>b.setAttribute('aria-expanded',String(mode==='discussion')));
-    this.element.querySelector('[data-wb-action="reader-toggle"]').textContent=workspace.classList.contains('reader-wide')?'返回图与原文':'展开阅读';
+    this.element.querySelector('[data-wb-action="reader-toggle"]').textContent=workspace.classList.contains('reader-wide')?'返回证明目录':'专注阅读';
   }
   centerGraphSelection(){
+    if(this.ui.proofMode!=='graph')return;
     const graph=this.element.querySelector('[data-wb-graph]'),p=this.layout?.positions.get(this.ui.selected)||this.layout?.positions.values().next().value;
     if(!p||!graph?.clientWidth)return;
     graph.scrollLeft=Math.max(0,(p.x+p.width/2)*this.ui.scale-graph.clientWidth/2);
@@ -272,11 +289,17 @@ export class ResearchWhiteboard {
         const boundProof=rows(this.model.proofs).find(proof=>proof.conclusion_ref?.kind===reference.kind&&proof.conclusion_ref?.id===reference.id&&proof.conclusion_ref?.revision===reference.revision);
         const drafts=rows(statement.draft_artifact_refs).length?statement.draft_artifact_refs:sameVersion?rows(object.draft_artifact_refs):[];
         const lastDraft=drafts.at(-1);
-        const proofId=statement.proof_artifact_id||boundProof?.proof_artifact_id||
+        let proofId=statement.proof_artifact_id||boundProof?.proof_artifact_id||
           (sameVersion?object.proof_artifact_id:null)||reference.artifact_id||lastDraft?.artifact_id||lastDraft?.id||statement.body_artifact_id||
           (sameVersion?object.body_artifact_id:null);
-        const proof=proofId?await this.api.artifact(project,proofId):null;
-        content={statement,proof,proofId};this.readCache.set(key,content);
+        let proof=proofId?await this.api.artifact(project,proofId):null,sourceMaterial=null,proofLabel=null;
+        if(ticket!==this.readTicket||this.project.id!==project.id)return;
+        if(proofId&&!statement.proof_artifact_id&&!boundProof?.proof_artifact_id&&!(sameVersion&&object.proof_artifact_id)&&(proofId===statement.body_artifact_id||(sameVersion&&proofId===object.body_artifact_id))){
+          const draftId=registeredBodyDraft(proof,project);
+          if(draftId&&draftId!==proofId){sourceMaterial=proof;proof=await this.api.artifact(project,draftId);proofId=draftId;proofLabel='研究草稿 · 来自此版本登记的文件';}
+        }
+        if(ticket!==this.readTicket||this.project.id!==project.id)return;
+        content={statement,proof,proofId,sourceMaterial,proofLabel};this.readCache.set(key,content);
       }
       if(ticket!==this.readTicket||this.project.id!==project.id)return;
       let selectedObject=object;
@@ -293,21 +316,22 @@ export class ResearchWhiteboard {
     const d=this.detail;if(!d?.statement)return;
     const o=d.object,ref=d.reference;
     const exact=d.statement.exact_statement||d.statement.statement||d.statement.text||readable(d.statement.body);
-    const rawProof=d.proof?.text||'',pageSize=18000,pages=Math.max(1,Math.ceil(rawProof.length/pageSize));
-    const page=Math.min(d.proofPage||0,pages-1),proofSlice=rawProof.slice(page*pageSize,(page+1)*pageSize);
+    const rawProof=d.proof?.text||'',pages=1;
+    const page=Math.min(d.proofPage||0,pages-1),proofSlice=rawProof;
     this.element.querySelector('[data-wb-reader]').innerHTML=
-      '<div class="wb-reader-heading"><h3 title="'+h(o.title)+'">'+h(short(o.title,80))+'</h3>'+badge(ref.revision?'固定 v'+ref.revision:'固定原始制品')+'</div><div data-wb-current-status>'+this.objectStatus(o)+'</div><div data-wb-new-version></div><div data-wb-direct-relations></div>'+
-      '<h4>精确陈述</h4><div class="wb-math-text" data-wb-exact>'+statementsHtml({...d.statement,title:o.title,math_kind:d.statement.math_kind||o.math_kind,review_state:o.review_state,assurance:o.assurance,exact_statement:exact,mathematical_statements:d.statement.mathematical_statements||(ref.revision===o.ref?.revision?o.mathematical_statements:[])},this.renderText)+'</div>'+
-      '<div class="wb-actions">'+action('quote','引用所选原文')+action('discuss','围绕此版本讨论')+action('annotate','批注此版本')+
+      '<div class="wb-reader-heading"><h3 title="'+h(o.title)+'">'+this.renderText(o.title)+'</h3>'+badge(ref.revision?'固定 v'+ref.revision:'固定原始制品')+'</div><div data-wb-current-status>'+badge(outlineStatus(o))+'</div><div data-wb-new-version></div>'+
+      '<h4>精确陈述</h4><div class="wb-math-text" data-wb-exact>'+mathematicalStatements({...d.statement,title:o.title,exact_statement:exact}).map(statement=>'<section class="wb-statement"><div class="wb-math-text">'+this.renderText(statement.exact_statement||statement.statement||statement.text||'尚未提供精确陈述')+'</div>'+(statement.assumptions?'<div class="wb-reader-assumptions"><strong>假设与适用条件</strong>'+this.renderText(readable(statement.assumptions))+'</div>':'')+'</section>').join('')+((d.statement.assumptions||o.assumptions)?'<div class="wb-reader-assumptions"><strong>假设与适用条件</strong>'+this.renderText(readable(d.statement.assumptions||o.assumptions))+'</div>':'')+'</div>'+
+      '<div data-wb-direct-relations></div><details class="wb-reader-feedback"><summary>讨论与批注此版本</summary><div class="wb-actions">'+action('quote','引用所选原文')+action('discuss','围绕此版本讨论')+action('annotate','批注此版本')+
       (o.kind==='candidate'?action('review','请求独立审核'):'')+
-      (['node','fact'].includes(ref.kind)&&!o.synthetic_view_root?action('challenge','正式标记争议'):'')+'</div>'+
-      '<h4>证明或原始材料</h4>'+
+      (['node','fact'].includes(ref.kind)&&!o.synthetic_view_root?action('challenge','正式标记争议'):'')+'</div></details>'+
+      '<h4>'+h(d.proofLabel||'证明正文／原始材料')+'</h4>'+
       (pages>1?'<p class="wb-muted">长原文分段阅读，第 '+(page+1)+' / '+pages+' 段；边界可能切开公式，可打开原始文件连续阅读。</p><div class="wb-actions">'+action('proof-prev','上一段')+action('proof-next','下一段')+'</div>':'')+
       (d.proof?.text!==null&&d.proof?.text!==undefined?'<div class="wb-math-text" data-wb-proof-text>'+this.renderText(proofSlice)+'</div>':
         d.proof?'<a href="'+h(d.proof.url)+'" target="_blank" rel="noopener">打开原始文件 · '+h(d.proof.media_type)+'</a>':empty('此对象未关联可读取的证明制品；陈述本身不是完整证明。'))+
       (d.proof?.url?'<p><a href="'+h(d.proof.url)+'" target="_blank" rel="noopener">查看／保存原文</a></p>':'')+
       '<div data-wb-evidence></div>'+
-      dataDetails('来源与固定对象引用',{reference:ref,statement:d.statement});
+      dataDetails('来源与固定对象引用',{reference:ref,statement:d.statement})+
+      (d.sourceMaterial?dataDetails('原始结构化材料',d.sourceMaterial.text):'');
     this.refreshReaderEvidence({force:true});
     this.renderReference();
   }
@@ -329,29 +353,30 @@ export class ResearchWhiteboard {
     const links=this.element.querySelector('[data-wb-direct-relations]');
     if(links){
       const rel=directProofRelations(this.model,o.key);
-      const group=(title,edges,incoming)=>'<section><h4>'+title+' <span>'+edges.length+'</span></h4>'+(edges.length?edges.map(e=>{const key=e.mathematical?(incoming?e.from:e.to):(e.from===o.key?e.to:e.from),other=this.model.objects.find(x=>x.key===key);return '<button class="wb-direct-link" data-wb-select="'+h(key)+'"><strong>'+h(short(other?.title||'对象未定位',58))+'</strong><small>'+h(e.relationLabel)+' · v'+h(other?.revision||'?')+'</small></button>';}).join(''):'<p class="wb-muted">未记录'+title+'。</p>')+'</section>';
-      replacePreservingView(links,'<div class="wb-direct-relations">'+group('直接前提',rel.incoming,true)+group('直接后续',rel.outgoing,false)+(rel.ownership.length?group('目标归属',rel.ownership,false):'')+'</div>');
+      const group=(title,edges,incoming)=>'<section><h4>'+title+' <span>'+edges.length+'</span></h4>'+(edges.length?edges.map(e=>{const key=e.mathematical?(incoming?e.from:e.to):(e.from===o.key?e.to:e.from),other=this.model.objects.find(x=>x.key===key);return '<button class="wb-direct-link" data-wb-select="'+h(key)+'"><strong>'+this.renderText(other?.title||'对象未定位')+'</strong><small>'+h(e.relationLabel)+' · v'+h(other?.revision||'?')+'</small></button>';}).join(''):'<p class="wb-muted">未记录'+title+'。</p>')+'</section>';
+      replacePreservingView(links,'<div class="wb-direct-relations">'+group('直接前提',rel.incoming,true)+(rel.outgoing.length?'<details data-wb-shared-relations><summary>被 '+new Set(rel.outgoing.map(e=>e.to)).size+' 项成果引用</summary>'+group('直接后续',rel.outgoing,false)+'</details>':'')+(rel.ownership.length?'<details><summary>目标归属（非证明依赖）</summary>'+group('目标归属',rel.ownership,false)+'</details>':'')+'</div>');
     }
     const reader=this.element.querySelector('[data-wb-reader]'),scrollTop=reader.scrollTop;
     const expanded=[...region.querySelectorAll('details[open]')].map(e=>e.querySelector('summary')?.textContent);
     region.innerHTML=
-      '<h4>前提与后续成果</h4><p class="wb-muted">同一证明组的前提需同时满足；不同证明分别核对。已读来源不自动成为逻辑前提。</p>'+
+      '<details class="wb-reader-history"><summary>来源、证明版本与执行详情</summary>'+this.objectStatus(o)+'<h4>前提与后续成果</h4><p class="wb-muted">同一证明组的前提需同时满足；不同证明分别核对。已读来源不自动成为逻辑前提。</p>'+
       (related.length?related.map(e=>{const other=this.model.objects.find(x=>x.key===(e.to===o.key?e.from:e.to));return '<article class="wb-entry"><span>'+h(e.relationLabel)+' · '+(e.mathematical?(e.to===o.key?'前置依据':'后续成果'):'目标关系')+'</span> <button data-wb-select="'+h(other?.key||'')+'">'+h(short(other?.title||'对象未定位',70))+' · v'+h(other?.revision)+'</button>'+dataDetails('绑定版本、前提组与原始依据',e.record)+'</article>';}).join(''):empty('尚无明确保存的前后置关系。'))+
       dataDetails('假设、符号和适用范围',{assumptions:o.assumptions,symbols:o.symbols,scope:o.scope})+
       dataDetails('声明前提与适用条件',d.statement.declared_premises||o.declared_premises||[])+
       '<h4>该成果的不同证明</h4>'+proofs.map((proof,i)=>'<article class="wb-entry"><strong>证明 '+(i+1)+' · '+h(proof.admission_state==='accepted'?'已准入':'尚未准入')+'</strong><p>各证明的前提分别成组，同组需同时满足。</p>'+action('open-proof','打开这份冻结证明','data-candidate="'+h(proof.candidate_id)+'"')+dataDetails('证明版本与共同前提组',proof)+'</article>').join('')+
       (rows(o.draft_artifact_refs).length?'<h4>保存的研究草稿</h4>'+rows(o.draft_artifact_refs).map(r=>'<p>'+action('open-draft','读取草稿原文','data-artifact="'+h(r.id||r.artifact_id)+'"')+' · '+h(r.filename||r.id||r.artifact_id)+'</p>').join(''):'')+
-      '<h4>独立审核与准入</h4>'+ (reviews.length?reviews.map(r=>'<article class="wb-entry"><strong>独立审核结论：'+h(r.verdict==='accepted'?'通过':r.verdict==='inconclusive'?'未形成确定结论':r.verdict||r.state)+'</strong><p>审核报告校验：'+h(r.report_validated===true?'通过':r.report_validated===false?'未通过':'未记录')+'</p>'+dataDetails('原始意见、问题与准入原因',r)+'</article>').join(''):empty('尚无关联审核记录。'))+
-      '<h4>版本与原文批注</h4>'+rows(o.historical_versions).map((v,i)=>action('version','打开历史 v'+(v.revision||v.ref?.revision||'?'),'data-index="'+i+'"')).join('')+
+      '</details><details class="wb-reader-reviews" '+(reviews.some(r=>r.verdict!=='accepted'||rows(r.issues).some(i=>!['resolved','closed'].includes(i.state)))?'open':'')+'><summary>审查意见 · '+reviews.length+' 条</summary>'+ (reviews.length?reviews.map(r=>'<article class="wb-entry"><strong>独立审核结论：'+h(r.verdict==='accepted'?'通过':r.verdict==='inconclusive'?'未形成确定结论':r.verdict||r.state)+'</strong><p>审核报告校验：'+h(r.report_validated===true?'通过':r.report_validated===false?'未通过':'未记录')+'</p>'+rows(r.issues).map(issue=>'<div class="wb-review-issue">'+(issue.location?'<small>'+h(issue.location)+'</small>':'')+this.renderText(typeof issue==='string'?issue:issue.issue||issue.message||issue.description||readable(issue))+'</div>').join('')+dataDetails('原始意见、问题与准入原因',r)+'</article>').join(''):empty('尚无关联审核记录。'))+
+      '</details><details><summary>历史版本与原文批注</summary>'+rows(o.historical_versions).map((v,i)=>action('version','打开历史 v'+(v.revision||v.ref?.revision||'?'),'data-index="'+i+'"')).join('')+
       annotations.map(a=>'<article class="wb-entry"><small>'+h(a.author||a.author_kind||'人类')+' · v'+h(a.selection_ref?.revision||a.anchor?.node_revision)+' · '+h(timeLabel(a.created_at))+'</small>'+
-        (a.selection_ref?.quote?'<blockquote>'+h(a.selection_ref.quote)+'</blockquote>':'')+'<div>'+this.renderText(a.body)+'</div>'+action('annotation-feedback','转为给领研猫的建议','data-id="'+h(a.id)+'"')+'</article>').join('');
+        (a.selection_ref?.quote?'<blockquote>'+h(a.selection_ref.quote)+'</blockquote>':'')+'<div>'+this.renderText(a.body)+'</div>'+action('annotation-feedback','转为给领研猫的建议','data-id="'+h(a.id)+'"')+'</article>').join('')+'</details>';
+    const reviewSection=region.querySelector('.wb-reader-reviews');if(reviewSection)region.prepend(reviewSection);
     region.querySelectorAll('details').forEach(e=>{if(expanded.includes(e.querySelector('summary')?.textContent))e.open=true;});
     reader.scrollTop=scrollTop;
-    const status=this.element.querySelector('[data-wb-current-status]');if(status)status.innerHTML=this.objectStatus(o);
+    const status=this.element.querySelector('[data-wb-current-status]');if(status)status.innerHTML=badge(outlineStatus(o));
   }
   renderReference(){
     const ref=this.selection;
-    this.element.querySelector('[data-wb-reference]').innerHTML=ref&&!this.referenceCleared?'<strong>'+h(short(this.detail?.object.title||ref.id,65))+' · '+(ref.revision?'固定 v'+h(ref.revision):'固定原始制品')+'</strong>'+(this.quote?'<blockquote>'+h(this.quote)+'</blockquote>':''):'未引用对象；讨论围绕当前项目';
+    this.element.querySelector('[data-wb-reference]').innerHTML=ref&&!this.referenceCleared?'<strong>'+this.renderText(this.detail?.object.title||ref.id)+' · '+(ref.revision?'固定 v'+h(ref.revision):'固定原始制品')+'</strong>'+(this.quote?'<blockquote>'+h(this.quote)+'</blockquote>':''):'未引用对象；讨论围绕当前项目';
   }
   intentHelp(){
     const intent=this.element.querySelector('[data-wb-intent]').value,run=latestRun(this.project);
@@ -454,7 +479,12 @@ export class ResearchWhiteboard {
     finally{this.busy=false;const send=this.element.querySelector('[data-wb-action="send"]');if(send)send.disabled=false;if(this.project.id===project.id){this.renderSide();this.renderPending();}}
   }
   async click(event){
-    const select=event.target.closest('[data-wb-select]');if(select){this.clearGraphFilters();void this.select(select.dataset.wbSelect);return;}
+    const expand=event.target.closest('[data-wb-expand]');if(expand){
+      if(!this.ui.outlineInitialized){this.ui.outlineExpanded.add(this.model.rootId);this.ui.outlineInitialized=true;}
+      const id=expand.dataset.wbExpand;if(this.ui.outlineExpanded.has(id))this.ui.outlineExpanded.delete(id);else this.ui.outlineExpanded.add(id);
+      this.renderGraph();this.persist();return;
+    }
+    const select=event.target.closest('[data-wb-select]');if(select){if(this.ui.proofMode==='graph')this.clearGraphFilters();await this.select(select.dataset.wbSelect);if(select.hasAttribute('data-wb-show-relations')){const relations=this.element.querySelector('[data-wb-shared-relations]');if(relations){relations.open=true;relations.scrollIntoView({block:'nearest'});}}return;}
     const linked=event.target.closest('[data-wb-linked-ref]');if(linked){try{await this.openLinkedReference(JSON.parse(linked.dataset.wbLinkedRef));}catch(error){this.error=error.message;this.renderSide();}return;}
     const result=event.target.closest('[data-wb-result-ref]');if(result){
       const id=result.dataset.wbResultRef,collection=result.dataset.collection,o=this.model.byRef.get(id);
@@ -479,9 +509,10 @@ export class ResearchWhiteboard {
     if(a==='delivery-start'){this.openModal('整理当前成果','<p>以当前已保存的数学成果建立一份新的交付记录。完整成果整理为中英文稿；未完成的问题保留在阶段报告中。既有研究不会重新运行。</p>','开始整理',()=>this.api.deliveryStart(p));return;}
     if(a==='delivery-retry'){const regenerate=button.dataset.state==='completed';this.openModal(regenerate?'重新生成英文稿':'局部重试','<p>'+h(regenerate?'使用本次冻结的中文主稿，重新生成英文稿并更新英文后续检查；中文稿与已完成的研究保留。':'使用本次交付冻结的来源，只重试选中步骤；已完成的研究和其他成功步骤不会重新运行。')+'</p>',regenerate?'重新生成英文稿':'重试这一步',()=>this.api.deliveryRetry(p,button.dataset.step));return;}
     if(a==='reveal-folder'){try{await this.api.reveal(p,button.dataset.folder);}catch(error){this.error=error.message;this.renderSide();}return;}
+    if(a==='proof-outline'||a==='proof-graph'){this.ui.proofMode=a==='proof-graph'?'graph':'outline';this.showProofSidebar('reader');this.renderGraph();this.persist();return;}
     if(a==='open-proof-page'){this.openProof();return;}
     if(a==='close-proof'){this.closeProof();return;}
-    if(a==='proof-reader'||a==='proof-discussion'){const mode=a==='proof-reader'?'reader':'discussion';this.showProofSidebar(this.ui.proofSidebar===mode&&button.closest('.wb-proof-heading')?'none':mode);this.centerGraphSelection();return;}
+    if(a==='proof-reader'||a==='proof-discussion'){const mode=a==='proof-reader'?'reader':'discussion';this.showProofSidebar(this.ui.proofMode==='graph'&&this.ui.proofSidebar===mode&&button.closest('.wb-proof-heading')?'none':mode);this.centerGraphSelection();return;}
     if(a==='close-inspector'){this.showProofSidebar('none');this.element.querySelector('[data-wb-action="proof-reader"]').focus();return;}
     if(a==='edit-problem'||a==='edit-description'){this.openProblemEditor(a==='edit-problem'?'math_statement':'research_description');return;}
     if(a==='session-detail'){

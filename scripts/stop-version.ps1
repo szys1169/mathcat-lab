@@ -1,4 +1,6 @@
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'forward-update.ps1')
+if (Invoke-InstalledUpdate 'stop') { return }
 $versionRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $runtimeRoot = Join-Path $versionRoot 'runtime'
 $tokenFile = Join-Path $runtimeRoot 'api-token'
@@ -24,7 +26,7 @@ if (Test-Path -LiteralPath $tokenFile) {
       foreach ($run in $project.runs) {
         if ($run.state -ne 'ended') {
           $authHeaders['Idempotency-Key'] = [guid]::NewGuid().ToString()
-          $body = @{ type='stop_run';run_id=$run.id;target=@{kind='run';id=$run.id};apply_at='immediate';payload=@{reason='User stopped MathCat Lab 2.5.1'} } | ConvertTo-Json -Depth 5
+          $body = @{ type='stop_run';run_id=$run.id;target=@{kind='run';id=$run.id};apply_at='immediate';payload=@{reason='User stopped MathCat Lab 2.5.3'} } | ConvertTo-Json -Depth 5
           Invoke-RestMethod -Method Post -Uri ('http://127.0.0.1:8900/api/v2/research/projects/' + $project.id + '/commands') -Headers $authHeaders -ContentType 'application/json' -Body $body -TimeoutSec 10 | Out-Null
         }
       }
@@ -80,7 +82,7 @@ if (Test-Path -LiteralPath $tokenFile) {
     }
   }
 }
-if (-not $safeToStop) { throw 'Stop has not been confirmed. Inspect the 2.5.1 whiteboard/logs; do not assume remote billing has stopped.' }
+if (-not $safeToStop) { throw 'Stop has not been confirmed. Inspect the 2.5.3 whiteboard/logs; do not assume remote billing has stopped.' }
 foreach ($pidName in @('platform.pid','research.pid')) {
   $pidFile = Join-Path $runtimeRoot $pidName
   if (-not (Test-Path -LiteralPath $pidFile)) { continue }
@@ -94,4 +96,4 @@ foreach ($pidName in @('platform.pid','research.pid')) {
   }
   Stop-Process -Id $targetProcessId -ErrorAction SilentlyContinue
 }
-Write-Output 'MathCat Lab 2.5.1 stop requested. Other versions were not stopped. No files were deleted.'
+Write-Output 'MathCat Lab 2.5.3 stop requested. Other versions were not stopped. No files were deleted.'

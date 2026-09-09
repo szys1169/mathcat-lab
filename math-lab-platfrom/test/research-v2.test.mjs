@@ -110,10 +110,10 @@ test("v2 binding reuses project and refuses replacing a conversation's existing 
   assert.throws(()=>unwrapProject({project:{}}),/身份/);
 });
 
-test("2.5.1 keeps the classic transport separate from the new whiteboard renderer",async()=>{
+test("2.5.2 keeps the classic transport separate from the new whiteboard renderer",async()=>{
   const root=path.resolve(import.meta.dirname,"..");const app=await fs.readFile(path.join(root,"public","app.js"),"utf8");const adapter=await fs.readFile(path.join(root,"public","research-v2-classic.js"),"utf8");
   const whiteboard=await fs.readFile(path.join(root,"public","whiteboard-view.js"),"utf8");
-  assert.match(app,/ClassicResearchClient/);assert.match(app,/MathCat Lab 2\.5\.1/);assert.doesNotMatch(app,/ResearchV2View|v2-split|v2RunConfig|v2-intent/);assert.doesNotMatch(adapter,/document\.|createElement|appendChild/);assert.match(adapter,/reply_mode:'explain'/);assert.match(whiteboard,/停止本轮受管研究、伙伴、审核及讨论/);
+  assert.match(app,/ClassicResearchClient/);assert.match(app,/MathCat Lab 2\.5\.3/);assert.doesNotMatch(app,/ResearchV2View|v2-split|v2RunConfig|v2-intent/);assert.doesNotMatch(adapter,/document\.|createElement|appendChild/);assert.match(adapter,/reply_mode:'explain'/);assert.match(whiteboard,/停止本项目本轮研究与论文整理/);
 });
 
 test("v2 materials import exact text before Run and fail clearly on unreadable PDF",async()=>{
@@ -139,9 +139,9 @@ test("v2 real Node proxy guards activity deletion, routes cancel and preserves u
   let stopped=false;const calls=[];const backend=http.createServer(async(req,res)=>{
     calls.push({url:req.url,authorization:req.headers.authorization});let body="";for await(const chunk of req)body+=chunk;
     res.setHeader("content-type","application/json");
-    if(req.url.includes("/commands")){const command=JSON.parse(body);assert.equal(command.type,"stop_run");stopped=true;res.end(JSON.stringify({contract:"mathcat-research/v2",command:{id:"cmd",status:"completed"}}));return;}
+    if(req.url.includes("/project-control")){const command=JSON.parse(body);assert.equal(command.type,"stop");stopped=true;res.end(JSON.stringify({contract:"mathcat-research/v2",command:{id:"cmd",status:"completed"}}));return;}
     if(req.url.includes("unavailable")){res.writeHead(503);res.end(JSON.stringify({contract:"mathcat-research/v2",error:{message:"test unavailable"}}));return;}
-    res.end(JSON.stringify({contract:"mathcat-research/v2",project:{id:"p",problem_version:1,runs:[{id:"r",control_epoch:0,state:stopped?"ended":"running"}]}}));
+    res.end(JSON.stringify({contract:"mathcat-research/v2",project:{id:"p",workspace_path:root,problem_version:1,runs:[{id:"r",control_epoch:0,state:stopped?"ended":"running"}]}}));
   });
   await new Promise(resolve=>backend.listen(0,"127.0.0.1",resolve));t.after(()=>backend.close());const backendPort=backend.address().port;
   const portProbe=http.createServer();await new Promise(resolve=>portProbe.listen(0,"127.0.0.1",resolve));const port=portProbe.address().port;await new Promise(resolve=>portProbe.close(resolve));

@@ -35,18 +35,16 @@ export function deliveryHtml(project) {
   if(!data)return '<section class="wb-card wb-delivery">'+heading+'<p class="wb-warning">'+h(project.board_errors?.delivery||'正在读取已保存的成果状态。')+'</p>'+folders+'</section>';
   const byLanguage=['zh','en'].map(language=>{
     const relevant=files.filter(f=>f.language===language),pdf=relevant.find(f=>f.kind==='pdf'),tex=relevant.find(f=>f.kind==='tex');
-    return '<article class="wb-delivery-language"><h4>'+(language==='zh'?'中文稿':'English manuscript')+'</h4><div class="wb-actions">'+(pdf?fileLink(project,pdf,false,'预览 PDF')+fileLink(project,pdf,true,'下载 PDF'):'<span class="wb-muted">PDF 尚未就绪</span>')+(tex?fileLink(project,tex,true,'下载 LaTeX 源文件'):'')+'</div>'+relevant.filter(f=>!['pdf','tex'].includes(f.kind)).map(f=>fileLink(project,f,true)).join(' ')+'</article>';
+    return '<article class="wb-delivery-language"><h4>'+(language==='zh'?'中文阶段报告':'英文阶段报告')+'</h4><div class="wb-actions">'+(pdf?fileLink(project,pdf,false,'预览 PDF')+fileLink(project,pdf,true,'下载 PDF'):'<span class="wb-muted">PDF 尚未就绪</span>')+(tex?fileLink(project,tex,true,'下载 LaTeX 源文件'):'')+'</div>'+relevant.filter(f=>!['pdf','tex'].includes(f.kind)).map(f=>fileLink(project,f,true)).join(' ')+'</article>';
   }).join('');
-  const steps=rows(current?.steps).map(step=>'<li class="wb-delivery-step '+h(step.state)+'"><div><strong>'+h(step.label||step.id)+'</strong><span>'+h(deliveryStateLabel(step.state))+'</span></div>'+(step.error?'<p class="wb-error">'+h(step.error)+'</p>':'')+(step.retryable?action('delivery-retry',step.state==='completed'?'重新生成英文稿':'仅重试这一步','data-step="'+h(step.id)+'" data-state="'+h(step.state)+'" '+(paused?'disabled title="先恢复本项目，才能重试模型任务"':'')):'')+'</li>').join('');
   return '<section class="wb-card wb-delivery">'+heading+
     '<p>'+(current?.kind==='stage_report'?'本轮按实际完成程度保存阶段报告，未解决的问题会明确保留。':current?'中英文稿基于同一份冻结成果整理；排版通过不改变原始数学可信状态。':'研究成功且已选择自动整理时，会开始准备中英文稿；也可明确整理当前成果。')+'</p>'+
     (current?.source_changed?'<p class="wb-warning">研究来源已有更新。当前稿件对应之前冻结的成果，不能当作最新研究结果。</p>':'')+
     (paused?'<p class="wb-pause-note">本项目已暂停新的模型任务，已保存的文件仍可预览与下载。</p>':'')+
-    (steps?'<ol class="wb-delivery-steps">'+steps+'</ol>':'')+
     (current?.kind==='paper'?'<div class="wb-delivery-languages">'+byLanguage+'</div>':'')+
-    '<div class="wb-delivery-files">'+files.filter(f=>!f.language||current?.kind!=='paper').map(f=>fileLink(project,f,f.kind!=='pdf')).join(' ')+'</div>'+
+    '<div class="wb-actions wb-delivery-primary">'+files.filter(f=>!f.language||current?.kind!=='paper').map(f=>fileLink(project,f,f.kind!=='pdf',f.language==='zh'?'中文阶段报告':f.language==='en'?'英文阶段报告':f.label||f.name)).join(' ')+
+    ((!current||['completed','failed','stopped','interrupted'].includes(current.state))?action('delivery-start','根据现有成果整理论文',''+(paused?'disabled title="本项目暂停中"':'')) :'')+'</div>'+
     rows(current?.warnings).map(w=>'<p class="wb-warning">'+h(w)+'</p>').join('')+
-    ((!current||['completed','failed','stopped','interrupted'].includes(current.state))?'<div class="wb-actions">'+action('delivery-start',current?'按当前成果重新整理':'整理当前成果',''+(paused?'disabled title="本项目暂停中"':''))+'</div>':'')+
     '<details class="wb-delivery-records"><summary>研究资料与审查记录（'+rows(data.records).length+'）</summary>'+rows(data.records).map(f=>'<p>'+fileLink(project,f,f.kind!=='pdf')+'</p>').join('')+'</details>'+
     (rows(data.history).length?'<details><summary>此前交付 · '+data.history.length+' 次</summary>'+data.history.map(item=>'<article class="wb-entry"><strong>'+h(deliveryStateLabel(item.state))+'</strong><small>'+h(item.created_at||'')+'</small><p>'+rows(item.files).map(f=>fileLink(project,f,f.kind!=='pdf')).join(' ')+'</p></article>').join('')+'</details>':'')+folders+'</section>';
 }

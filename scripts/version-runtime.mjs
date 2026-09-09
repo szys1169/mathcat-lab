@@ -9,11 +9,15 @@ export const backendRoot=path.join(versionRoot,"math-research-mvp");
 export const platformRoot=path.join(versionRoot,"math-lab-platfrom");
 export const runtimeRoot=path.join(versionRoot,"runtime");
 export const logRoot=path.join(runtimeRoot,"logs");
-export const dataRoot=path.join(versionRoot,"workspaces");
+let inherited={};
+try{inherited=JSON.parse(await fs.readFile(path.join(versionRoot,'update-data.json'),'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;}
+export const dataRoot=inherited.workspacesRoot||path.join(versionRoot,"workspaces");
+export const databasePath=inherited.databasePath||path.join(runtimeRoot,'state_v2.sqlite');
+export const platformDataRoot=inherited.platformDataRoot||path.join(platformRoot,'runtime-data');
 export const tokenFile=path.join(runtimeRoot,"api-token");
 export const backendUrl="http://127.0.0.1:8900";
 export const platformUrl="http://127.0.0.1:4335";
-export const expectedVersion="2.5.1";
+export const expectedVersion="2.5.3";
 
 export async function health(url,token="") {
   try { const response=await fetch(url,{headers:token?{authorization:`Bearer ${token}`}:{},signal:AbortSignal.timeout(2000)});return response.ok?await response.json():null; }

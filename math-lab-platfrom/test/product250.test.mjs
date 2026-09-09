@@ -29,7 +29,7 @@ test('attention includes only current-run approvals, questions and delivery fail
 });
 test('paused delivery keeps downloads available and disables model retries',()=>{
   const p=project(),html=deliveryHtml(p);assert.equal(projectModelsPaused(p),true);
-  assert.match(html,/预览 PDF/);assert.match(html,/下载 LaTeX/);assert.match(html,/data-step="compile_en" data-state="failed" disabled/);
+  assert.match(html,/预览 PDF/);assert.match(html,/下载 LaTeX/);assert.match(html,/data-wb-action="delivery-start" disabled/);
   assert.doesNotMatch(html,/javascript:/);assert.match(html,/files\?path=/);assert.match(html,/download=1/);
 });
 test('project control and local retry preserve idempotency after lost response',async()=>{

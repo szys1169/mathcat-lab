@@ -1,5 +1,7 @@
 param([switch]$NoBrowser, [switch]$Rebuild)
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'forward-update.ps1')
+if (Invoke-InstalledUpdate 'start' $NoBrowser.IsPresent $Rebuild.IsPresent) { return }
 $versionRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $backendRoot = Join-Path $versionRoot 'math-research-mvp'
 $platformRoot = Join-Path $versionRoot 'math-lab-platfrom'
@@ -7,6 +9,15 @@ $runtimeRoot = Join-Path $versionRoot 'runtime'
 $logRoot = Join-Path $runtimeRoot 'logs'
 $dataRoot = Join-Path $versionRoot 'workspaces'
 $tokenFile = Join-Path $runtimeRoot 'api-token'
+$databasePath = Join-Path $runtimeRoot 'state_v2.sqlite'
+$platformDataRoot = Join-Path $platformRoot 'runtime-data'
+$updateDataFile = Join-Path $versionRoot 'update-data.json'
+if (Test-Path -LiteralPath $updateDataFile) {
+  $updateData = Get-Content -LiteralPath $updateDataFile -Raw | ConvertFrom-Json
+  $dataRoot = $updateData.workspacesRoot
+  $databasePath = $updateData.databasePath
+  $platformDataRoot = $updateData.platformDataRoot
+}
 $backendUrl = 'http://127.0.0.1:8900'
 $platformUrl = 'http://127.0.0.1:4335'
 New-Item -ItemType Directory -Force -Path $runtimeRoot,$logRoot,$dataRoot | Out-Null
@@ -57,7 +68,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $platformRoot 'node_modules\katex'))
   finally { Pop-Location }
 }
 $backendHealth = Get-Health ($backendUrl + '/health')
-if ($backendHealth -and $backendHealth.version -ne '2.5.1') { throw 'Research port belongs to another version. No old version was changed.' }
+if ($backendHealth -and $backendHealth.version -ne '2.5.3') { throw 'Research port belongs to another version. No old version was changed.' }
 if (-not $backendHealth) {
   Assert-PortFree 8900
   $backendBin = Join-Path $backendRoot 'target\release\mathcat-v2.exe'
@@ -67,7 +78,7 @@ if (-not $backendHealth) {
     try { & cargo.exe build --release --bin mathcat-v2; if ($LASTEXITCODE -ne 0) { throw 'Research backend build failed.' } }
     finally { Pop-Location }
   }
-  $backendArguments = @('--bind','127.0.0.1:8900','--database',('"' + (Join-Path $runtimeRoot 'state_v2.sqlite') + '"'),'--data-root',('"' + $dataRoot + '"'),'--token-file',('"' + $tokenFile + '"'),'--codex-command',('"' + $codexCommand + '"'))
+  $backendArguments = @('--bind','127.0.0.1:8900','--database',('"' + $databasePath + '"'),'--data-root',('"' + $dataRoot + '"'),'--token-file',('"' + $tokenFile + '"'),'--codex-command',('"' + $codexCommand + '"'))
   $backendProcess = Start-Process -FilePath $backendBin -ArgumentList $backendArguments -WorkingDirectory $backendRoot -WindowStyle Hidden -RedirectStandardOutput (Join-Path $logRoot 'research.stdout.log') -RedirectStandardError (Join-Path $logRoot 'research.stderr.log') -PassThru
   $backendProcess.Id | Out-File -LiteralPath (Join-Path $runtimeRoot 'research.pid') -Encoding ascii
   for ($attempt=0; $attempt -lt 60; $attempt++) {
@@ -78,14 +89,15 @@ if (-not $backendHealth) {
   }
   $startedBackendHealth = Get-Health ($backendUrl + '/health')
   if (-not $startedBackendHealth) { throw "Research startup failed. Logs: $logRoot" }
-  if ($startedBackendHealth.version -ne '2.5.1') { throw 'New research process reports the wrong version. Rebuild this version before using it.' }
+  if ($startedBackendHealth.version -ne '2.5.3') { throw 'New research process reports the wrong version. Rebuild this version before using it.' }
 }
 $platformHealth = Get-Health ($platformUrl + '/api/health')
-if ($platformHealth -and $platformHealth.version -ne '2.5.1') { throw 'Web port belongs to another version. No old version was changed.' }
+if ($platformHealth -and $platformHealth.version -ne '2.5.3') { throw 'Web port belongs to another version. No old version was changed.' }
 if (-not $platformHealth) {
   Assert-PortFree 4335
   $env:MATH_LAB_PORT = '4335'
-  $env:MATH_LAB_RUNTIME_ROOT = Join-Path $platformRoot 'runtime-data'
+  $env:MATH_LAB_RUNTIME_ROOT = $platformDataRoot
+  $env:MATHCAT_V2_WORKSPACES_ROOT = $dataRoot
   $env:MATHCAT_V2_API_URL = $backendUrl
   $env:MATHCAT_V2_TOKEN_FILE = $tokenFile
   $platformProcess = Start-Process -FilePath 'node.exe' -ArgumentList @(('"' + (Join-Path $platformRoot 'src\server.mjs') + '"')) -WorkingDirectory $platformRoot -WindowStyle Hidden -RedirectStandardOutput (Join-Path $logRoot 'platform.stdout.log') -RedirectStandardError (Join-Path $logRoot 'platform.stderr.log') -PassThru
@@ -98,7 +110,7 @@ if (-not $platformHealth) {
   }
   $startedPlatformHealth = Get-Health ($platformUrl + '/api/health')
   if (-not $startedPlatformHealth) { throw "Platform startup failed. Logs: $logRoot" }
-  if ($startedPlatformHealth.version -ne '2.5.1') { throw 'New web process reports the wrong version. Check this version before using it.' }
+  if ($startedPlatformHealth.version -ne '2.5.3') { throw 'New web process reports the wrong version. Check this version before using it.' }
 }
-Write-Output "MathCat Lab 2.5.1: $platformUrl"
+Write-Output "MathCat Lab 2.5.3: $platformUrl"
 if (-not $NoBrowser) { Start-Process -FilePath $platformUrl }

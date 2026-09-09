@@ -18,12 +18,9 @@ test("sidebar exposes a normal settings button and controls live in its dialog",
   assert.doesNotMatch(sidebar, /id="executor"|id="permission"/);
   assert.match(settings, /id="executor"/);
   assert.match(settings, /id="permission"/);
-  assert.match(settings, /id="reviewMode"/);
-  assert.match(settings, /自动运行/);
-  assert.match(settings, /关键节点审核/);
-  assert.match(settings, /全程审核/);
+  assert.match(settings, /id="codexSettingsPanel"/);
   assert.doesNotMatch(composer, /id="executor"|id="permission"/);
-  assert.match(app, /\$\("settingsButton"\)\.onclick = \(\) => \$\("settingsDialog"\)\.showModal\(\)/);
+  assert.match(app, /\$\("settingsButton"\)\.onclick = \(\) => openCodexSettings\(\)/);
 });
 
 test("workspace ownership is hidden after a conversation is established", () => {
@@ -38,12 +35,12 @@ test("permission choice is stored for later messages", () => {
   assert.match(app, /localStorage\.setItem\("mathcat\.permission", state\.permission\)/);
 });
 
-test("MathCat review level is persisted and sent with new research", () => {
-  assert.match(app, /localStorage\.getItem\("mathcat\.reviewMode"\)/);
-  assert.match(app, /localStorage\.setItem\("mathcat\.reviewMode", state\.reviewMode\)/);
-  assert.match(app, /mathcatReviewMode:\s*state\.reviewMode/);
-  assert.match(app, /boardReviewMode/);
-  assert.match(statusLabels, /function boardReviewMode\(value\)/);
+test('research start validates explicit per-run collaboration options',async()=>{
+  const {researchStartOptions}=await import('../public/research-start.js');
+  assert.equal(researchStartOptions({mode:'collaborative'}).mode,'collaborative');
+  assert.equal(researchStartOptions({mode:'delegated'}).mode,'delegated');
+  assert.throws(()=>researchStartOptions({mode:'invalid'}));
+  assert.match(app,/mathcatReviewMode:startOptions.mode==='collaborative'/);
 });
 
 test("MathCat whiteboard has a persistent human collaboration console with real forms", () => {
@@ -269,6 +266,6 @@ test("local startup launches and health-checks the MathCat backend", () => {
   assert.match(startScript, /mathcat-v2\.exe/);
   assert.match(startScript, /Get-Health/);
   assert.match(startScript, /platformHealth\.version/);
-  assert.match(startScript, /127\.0\.0\.1:4334/);
-  assert.match(startScript, /127\.0\.0\.1:8899/);
+  assert.match(startScript, /127\.0\.0\.1:4335/);
+  assert.match(startScript, /127\.0\.0\.1:8900/);
 });

@@ -48,3 +48,7 @@ tests/results/
 # Local release staging
 release-dist/
 tests/fixtures/long-research-*/
+
+# Machine-local update pointers
+update-data.json
+update-state.json

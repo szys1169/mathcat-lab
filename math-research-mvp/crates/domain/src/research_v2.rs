@@ -67,7 +67,7 @@ mod tests {
     #[test]
     fn identifiers_are_distinct_and_versioned() {
         assert_ne!(new_id(), new_id());
-        assert_eq!(VERSION, "2.5.1");
+        assert_eq!(VERSION, "2.5.3");
         assert_eq!(CONTRACT, "mathcat-research/v2");
     }
     #[test]

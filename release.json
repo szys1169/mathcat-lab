@@ -1,10 +1,10 @@
 {
   "product": "MathCat Lab",
-  "version": "2.5.1",
+  "version": "2.5.3",
   "contract": "mathcat-research/v2",
-  "status": "ongoing_product_development_not_a_release",
-  "created": "2026-09-08",
-  "based_on": "MathCat Lab 2.5.0",
+  "status": "source_update_demo",
+  "created": "2026-09-09",
+  "based_on": "MathCat Lab 2.5.2",
   "runtime": {
     "web_port": 4335,
     "research_port": 8900,
@@ -12,32 +12,19 @@
     "database": "runtime/state_v2.sqlite",
     "research_data": "workspaces"
   },
-  "source_baseline": {
-    "manifest": "docs/baselines/2.4.3-source.json",
-    "frontend": "../MathCat-Lab-2.4.3/math-lab-platfrom/public",
-    "backend": "../MathCat-Lab-2.4.3"
-  },
   "validation": {
-    "engineering_regression": {
-      "status": "targeted_checks_passed_legacy_regressions_pending"
-    },
-    "http_acceptance": {
-      "status": "deferred_by_user"
-    },
-    "browser_acceptance": {
-      "status": "six_fixture_checks_passed"
-    },
-    "macos": {
-      "status": "cross_platform_checks_passed_real_mac_pending"
-    },
-    "real_research": {
-      "status": "not_run_for_this_version"
-    }
+    "platform_tests": "374 passed, 0 failed",
+    "proof_update_runtime_tests": "passed",
+    "isolated_http": "passed",
+    "relocation_tests": "5 passed",
+    "rust_workspace": "not passed: 2 unchanged core unknown-delivery tests time out",
+    "real_model_calls": false,
+    "macos": "not run"
   },
   "legacy_policy": "Previous versions and research runs remain independent. Historical artifacts retain original content and hashes.",
   "build": {
-    "binary": "math-research-mvp/target/release/mathcat-v2[.exe]",
-    "status": "not_built_per_user_scope"
+    "status": "relocated binary HTTP smoke passed; no package release"
   },
-  "validation_report": "docs/CURRENT-DEVELOPMENT.md"
+  "validation_report": "docs/UPDATE-2.5.3.md",
+  "updaterProtocol": 1
 }

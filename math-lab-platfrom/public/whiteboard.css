@@ -130,7 +130,7 @@
 .wb24 .wb-direct-relations{border:1px solid #9db29f;border-radius:9px;background:#f2f6ee;padding:10px;margin:14px 0}
 .wb24 .wb-direct-relations section+section{border-top:1px solid #b7c6b6;margin-top:10px;padding-top:10px}
 .wb24 .wb-direct-relations h4{margin:0 0 7px;font-size:13px;display:flex;gap:7px;align-items:center}
-.wb24 .wb-direct-relations h4 span{background:#dfebdb;border-radius:4px;min-width:21px;text-align:center}
+.wb24 .wb-direct-relations h4>span{background:#dfebdb;border-radius:4px;min-width:21px;text-align:center}
 .wb24 .wb-direct-relations p{margin:3px 0;font-size:12px}
 .wb24 .wb-direct-link{display:block;text-align:left;width:100%;margin:6px 0;background:#fffef9;padding:8px 10px}
 .wb24 .wb-direct-link strong{display:block;font-size:13px;line-height:1.6;font-weight:500}
@@ -159,7 +159,7 @@
 .research-start-dialog fieldset{border:1px solid #969daf;border-radius:12px;padding:16px;margin:16px 0;min-width:0}
 .research-start-choice{display:flex!important;gap:12px;align-items:flex-start;margin:10px 0;padding:14px;background:#f7f8fb;border:1px solid #a5aabe;border-radius:10px;cursor:pointer}
 .research-start-choice input{width:auto!important;margin-top:4px;flex:0 0 auto}
-.research-start-choice span{display:grid;gap:7px;line-height:1.55}
+.research-start-choice>span{display:grid;gap:7px;line-height:1.55}
 .research-start-choice small{color:#535d71}
 .research-start-limits{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:18px}
 .research-start-limits label{display:grid;gap:8px;min-width:0}
@@ -193,3 +193,51 @@
 .wb-folder-actions{padding-top:12px;margin-top:16px;border-top:1px solid #a7afbf}
 .wb-pause-note{padding:9px 12px;background:#eff2f7;border-left:3px solid #7888a3;line-height:1.6}
 @media(max-width:600px){.research-start-limits,.wb-delivery-languages{grid-template-columns:1fr}.wb-attention{padding:12px}.research-start-dialog{padding:18px}.research-start-choice{padding:10px}.wb-delivery-language .wb-actions{align-items:stretch}.wb-delivery-language .wb-actions a{flex:1;text-align:center}}
+/* Compact laboratory and paired research entry points. */
+.wb-laboratory .wb-cat-grid{display:flex;flex-direction:column;gap:0}
+.wb-laboratory .wb-cat-row{padding:0;border:0;border-bottom:1px solid #dce4de;border-radius:0;background:transparent;min-width:0}
+.wb-cat-row>summary{display:grid;grid-template-columns:128px minmax(0,1fr) auto;align-items:center;gap:16px;padding:14px 4px;cursor:pointer;list-style:none}
+.wb-cat-row>summary::-webkit-details-marker{display:none}
+.wb-cat-row>summary:hover{background:#f0f5ef}
+.wb-cat-row .wb-cat-heading{margin:0;display:flex;gap:9px;align-items:center}
+.wb-cat-row .wb-cat-heading small{display:block;margin-top:4px}
+.wb-cat-preview{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.65;font-size:13px;color:#4e6258;max-height:3.3em;overflow-wrap:anywhere}
+.wb-cat-expand{font-size:12px;color:#376b56;white-space:nowrap}
+.wb-cat-row[open]>summary .wb-cat-expand{font-size:0}
+.wb-cat-row[open]>summary .wb-cat-expand:after{content:'收起任务';font-size:12px}
+.wb-cat-expanded{padding:4px 16px 18px 48px}
+.wb-cat-row.is-working>summary{border-left:3px solid #478368;padding-left:8px}
+.wb-research-shortcuts{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:16px 0;align-items:stretch}
+.wb-research-shortcuts>div{min-width:0}
+.wb-research-shortcuts .wb-proof-card,.wb-research-shortcuts .wb-question-box{margin:0;min-height:185px;height:100%;box-sizing:border-box}
+.wb-research-shortcuts .wb-proof-card{padding:20px;gap:14px}
+.wb-research-shortcuts .wb-proof-card-art{display:none}
+.wb-question-status{font-size:16px;line-height:1.6;color:#355f4e}
+.wb-question-box details>summary{cursor:pointer;color:#376b56}
+@media(max-width:700px){.wb-research-shortcuts{grid-template-columns:1fr}.wb-cat-row>summary{grid-template-columns:1fr auto;gap:8px}.wb-cat-preview{grid-column:1/-1;grid-row:2}.wb-cat-expanded{padding-left:12px}}
+.wb-delivery-primary{display:flex;align-items:center;gap:10px;flex-wrap:nowrap;overflow-x:auto;margin:12px 0}
+.wb-delivery-primary>a,.wb-delivery-primary>button{flex:0 0 auto;white-space:nowrap}
+/* HTML math inside SVG nodes keeps KaTeX scripts intact; clamp only whole lines. */
+.wb-node-math{color:#294333;font-family:Arial,"Microsoft YaHei",sans-serif;pointer-events:none;overflow:hidden}
+.wb-node-math-title,.wb-node-math-preview{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden;overflow-wrap:anywhere}
+.wb-node-math-title{font-size:16px;font-weight:600;line-height:22px;max-height:44px}
+.wb-node-math-preview{font-size:12px;line-height:19px;max-height:38px;margin-top:4px;color:#647265}
+.wb-node-math .rendered-math{max-width:none}
+.wb24 .wb-graph-summary>span:last-child{max-width:70%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* The start dialog is attached to body, outside the whiteboard theme scope. */
+.research-start-dialog{--wb-ink:#233e31;--wb-paper:#fffef9;--wb-muted:#647369;color:var(--wb-ink);background:var(--wb-paper);padding:26px;overflow:auto;overscroll-behavior:contain}
+.research-start-dialog *{box-sizing:border-box}
+.research-start-dialog>form{width:100%;max-height:none;overflow:visible;padding:0;margin:0}
+.research-start-dialog h2{margin:0 0 12px;font-size:22px}
+.research-start-dialog p{line-height:1.65;overflow-wrap:anywhere}
+.research-start-dialog .research-start-model{padding:12px 14px;border-radius:9px;background:#edf3ee}
+.research-start-dialog .research-start-choice{background:#f8faf6;border-color:#b9cbbd}
+.research-start-dialog .research-start-choice:has(input:checked){background:#eaf3e9;border-color:#51785d}
+.research-start-dialog input[type=radio],.research-start-dialog input[type=checkbox]{accent-color:#285b46;padding:0;width:16px!important;height:16px}
+.research-start-dialog .wb-actions{display:flex;flex-wrap:wrap;gap:10px;justify-content:flex-end}
+.research-start-dialog button{border:1px solid #9db5a5;border-radius:8px;padding:10px 18px;background:#fff;color:#294d3a;cursor:pointer}
+.research-start-dialog button.primary{background:#285b46;border-color:#285b46;color:white}
+.research-start-dialog button:focus-visible,.research-start-dialog input:focus-visible{outline:3px solid #87ac94;outline-offset:3px}
+.research-start-dialog [data-start-error]:empty{display:none}
+.research-start-dialog .wb-error{color:#a33131}
+@media(max-width:600px){.research-start-dialog{padding:18px;width:calc(100vw - 24px);max-height:calc(100dvh - 24px)}.research-start-dialog fieldset{padding:10px}.research-start-dialog .research-start-limits{gap:4px}.research-start-dialog .wb-actions button{flex:1}}
