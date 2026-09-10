@@ -2,7 +2,7 @@
   "product": "MathCat Lab",
   "version": "2.5.3",
   "contract": "mathcat-research/v2",
-  "status": "source_update_demo",
+  "status": "prerelease_demo",
   "created": "2026-09-09",
   "based_on": "MathCat Lab 2.5.2",
   "runtime": {
@@ -23,7 +23,7 @@
   },
   "legacy_policy": "Previous versions and research runs remain independent. Historical artifacts retain original content and hashes.",
   "build": {
-    "status": "relocated binary HTTP smoke passed; no package release"
+    "status": "Windows prebuilt research service; macOS source package builds on first launch"
   },
   "validation_report": "docs/UPDATE-2.5.3.md",
   "updaterProtocol": 1

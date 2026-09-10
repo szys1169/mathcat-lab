@@ -20,20 +20,20 @@ jobs:
         working-directory: math-research-mvp
       - shell: pwsh
         run: |
-          New-Item -ItemType Directory -Path dist/MathCat-Lab-2.5.1-Windows-x64/math-research-mvp/target/release -Force | Out-Null
+          New-Item -ItemType Directory -Path dist/MathCat-Lab-2.5.3-Windows-x64/math-research-mvp/target/release -Force | Out-Null
           git archive --format=tar HEAD -o dist/source.tar
-          tar -xf dist/source.tar -C dist/MathCat-Lab-2.5.1-Windows-x64
-          Copy-Item math-research-mvp/target/release/mathcat-v2.exe dist/MathCat-Lab-2.5.1-Windows-x64/math-research-mvp/target/release/mathcat-v2.exe -Force
-          Compress-Archive -Path dist/MathCat-Lab-2.5.1-Windows-x64 -DestinationPath dist/MathCat-Lab-2.5.1-Windows-x64.zip
+          tar -xf dist/source.tar -C dist/MathCat-Lab-2.5.3-Windows-x64
+          Copy-Item math-research-mvp/target/release/mathcat-v2.exe dist/MathCat-Lab-2.5.3-Windows-x64/math-research-mvp/target/release/mathcat-v2.exe -Force
+          Compress-Archive -Path dist/MathCat-Lab-2.5.3-Windows-x64 -DestinationPath dist/MathCat-Lab-2.5.3-Windows-x64.zip
       - uses: softprops/action-gh-release@v2
         with:
           prerelease: true
           generate_release_notes: false
           body: |
-            MathCat Lab 2.5.1 增加 macOS 支持，并保留 Windows 启动方式。
+            MathCat Lab 2.5.3 更新研究白板、数学渲染、软件更新入口与使用说明。已知验证边界见 docs/UPDATE-2.5.3.md。
 
             Windows x64 包内置研究服务；macOS 包在目标机器首次启动时按 Apple Silicon 或 Intel 架构编译。两者都需要 Node.js 22+ 与已登录的 Codex CLI。macOS 另需 Rust 1.88+ 和 Xcode Command Line Tools。
-          files: dist/MathCat-Lab-2.5.1-Windows-x64.zip
+          files: dist/MathCat-Lab-2.5.3-Windows-x64.zip
 
   macos:
     runs-on: macos-14
@@ -44,9 +44,9 @@ jobs:
           toolchain: "1.88"
       - run: cargo check --workspace
         working-directory: math-research-mvp
-      - run: git archive --format=tar.gz --prefix=MathCat-Lab-2.5.1-macOS/ HEAD -o MathCat-Lab-2.5.1-macOS-universal-source.tar.gz
+      - run: git archive --format=tar.gz --prefix=MathCat-Lab-2.5.3-macOS/ HEAD -o MathCat-Lab-2.5.3-macOS-universal-source.tar.gz
       - uses: softprops/action-gh-release@v2
         with:
           prerelease: true
           generate_release_notes: false
-          files: MathCat-Lab-2.5.1-macOS-universal-source.tar.gz
+          files: MathCat-Lab-2.5.3-macOS-universal-source.tar.gz
